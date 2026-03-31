@@ -1,6 +1,6 @@
 # Auto Trade
 
-An automated stock trading system that day-trades and swing-trades US (NYSE/NASDAQ) and Turkish (BIST) equities through Interactive Brokers. The system uses a two-stage pipeline: a fast technical screener filters thousands of stocks down to ~20 candidates, then an LLM (Claude or GPT) performs deep analysis on only those candidates. A risk manager gates every trade before execution through IBKR.
+An automated stock trading system that day-trades and swing-trades US (NYSE/NASDAQ) and Turkish (BIST) equities through Interactive Brokers. The system uses a two-stage pipeline: a fast technical screener filters thousands of stocks down to ~20 candidates, then a local AI model (via Ollama) performs deep analysis on only those candidates. A risk manager gates every trade before execution through IBKR.
 
 Financial sector stocks (banks, insurance, lending companies) are automatically excluded from all trading.
 
@@ -34,8 +34,8 @@ Financial sector stocks (banks, insurance, lending companies) are automatically 
 ## Features
 
 - **Multi-market support**: Trades both US (NYSE/NASDAQ) and Turkish (BIST) equities through a single IBKR account
-- **Two-stage screening pipeline**: Technical screener (fast, free) filters thousands of stocks, then AI analyst (Claude/GPT) performs deep analysis on ~20 candidates per market
-- **AI-powered analysis**: Structured LLM integration with Claude and GPT-4 support, using tool_use/function_calling for reliable JSON output
+- **Two-stage screening pipeline**: Technical screener (fast, free) filters thousands of stocks, then AI analyst performs deep analysis on ~20 candidates per market
+- **AI-powered analysis**: Local LLM via Ollama (Qwen 2.5 7B by default) -- no API keys, no cost, fully offline
 - **Comprehensive risk management**: Position sizing, daily loss limits, sector concentration limits, mandatory stop-losses, and duplicate position prevention
 - **Bracket order execution**: Automatic stop-loss and take-profit orders attached to every trade via IBKR bracket orders
 - **Day and swing trading**: Automatic end-of-day position closing for day trades, trailing stops for swing trades
@@ -46,7 +46,7 @@ Financial sector stocks (banks, insurance, lending companies) are automatically 
 - **Paper trading by default**: Live mode requires explicit opt-in with confirmation prompt
 - **Market hours awareness**: Respects BIST (10:00-18:00 TRT) and US (16:30-23:00 TRT) trading hours with overlap handling
 - **Connection resilience**: Automatic reconnection to IBKR on connection drops with retry logic
-- **Cost tracking**: Monitors daily LLM API spending with alerts when costs exceed thresholds
+- **Zero AI cost**: Runs AI analysis locally via Ollama -- no cloud API fees
 
 ---
 
@@ -81,7 +81,7 @@ Financial sector stocks (banks, insurance, lending companies) are automatically 
   └────────────────┘          │              │
                        ┌──────▼──────┐        │
                        │  AI Analyst  │        │
-                       │  (Claude/GPT │        │
+                       │  (Ollama     │        │
                        │   + News)    │        │
                        └──────┬──────┘        │
                               │               │
@@ -115,7 +115,7 @@ Each scan cycle (every 15 minutes by default) executes the following pipeline:
 2. **Universe building** -- Build/load the tradeable stock list (cached daily), filtering out financial sector stocks and applying liquidity thresholds
 3. **Data fetching** -- Fetch historical OHLCV data for all stocks in the universe from IBKR (or YFinance fallback)
 4. **Technical screening** -- Run 6 technical indicators on every stock, score candidates, and select the top ~10-20 per market
-5. **AI analysis** -- Send each candidate to Claude or GPT with price action, indicators, and news context; receive structured trade recommendations with confidence scores
+5. **AI analysis** -- Send each candidate to the local LLM (via Ollama) with price action, indicators, and news context; receive structured trade recommendations with confidence scores
 6. **Risk evaluation** -- Pass every AI-approved signal through 6 risk checks (position size, daily loss, max positions, stop-loss, sector concentration, no duplicates)
 7. **Order execution** -- Place bracket orders (entry + stop-loss + take-profit) through IBKR for approved signals
 8. **Logging and notifications** -- Record everything to SQLite and CSV, send Telegram alerts, update terminal dashboard
@@ -137,7 +137,7 @@ auto-trade/
 │   ├── portfolio.py             # SQLite portfolio tracker
 │   ├── universe.py              # Stock universe builder
 │   ├── screener.py              # Technical indicator screener (pure functions)
-│   ├── analyst.py               # LLM-powered trade analyst
+│   ├── analyst.py               # LLM-powered trade analyst (Ollama)
 │   ├── risk.py                  # Risk manager (pure functions)
 │   ├── executor.py              # IBKR order execution
 │   ├── scheduler.py             # Main orchestration loop
@@ -225,15 +225,25 @@ You need either TWS (Trader Workstation) or IB Gateway running on the same machi
    ```
 5. Find your **chat_id** in the response JSON under `result[0].message.chat.id`
 
-### 4. API Keys
+### 4. Ollama (Local AI)
+
+The AI analyst runs locally via Ollama -- no cloud API keys needed.
+
+```bash
+# Install Ollama
+curl -fsSL https://ollama.com/install.sh | sh
+
+# Pull the default model
+ollama pull qwen2.5:7b
+```
+
+Ollama must be running whenever the trading system is active. It starts automatically as a system service after installation.
+
+### 5. API Keys (Optional)
 
 | Service | Purpose | Where to get |
 |---------|---------|-------------|
-| **Anthropic (Claude)** | AI analyst (primary) | https://console.anthropic.com/ |
-| **OpenAI (GPT-4)** | AI analyst (alternative) | https://platform.openai.com/ |
 | **Tavily** | News headlines for AI context | https://tavily.com/ (free tier: 1000 searches/month) |
-
-You only need **one** of Anthropic or OpenAI. The system auto-selects based on which API key is configured.
 
 ---
 
@@ -254,7 +264,7 @@ pip install -r requirements.txt
 
 # Set up environment variables
 cp .env.example .env
-# Edit .env with your actual API keys and configuration
+# Edit .env with your configuration (Telegram token, Tavily key)
 ```
 
 ### Dependencies
@@ -265,8 +275,6 @@ cp .env.example .env
 | `yfinance` | >= 0.2.31 | Fallback historical data (backtesting) |
 | `pandas` | >= 2.1.0 | Data manipulation and analysis |
 | `pandas-ta` | >= 0.3.14b | Technical indicators (RSI, MACD, Bollinger, etc.) |
-| `anthropic` | >= 0.39.0 | Claude API for AI analysis |
-| `openai` | >= 1.50.0 | GPT-4 API for AI analysis (alternative) |
 | `python-telegram-bot` | >= 20.7 | Telegram notification bot |
 | `python-dotenv` | >= 1.0.0 | Environment variable loading |
 | `apscheduler` | >= 3.10.4 | Job scheduling for scan cycles |
@@ -282,14 +290,14 @@ cp .env.example .env
 ### Environment Variables (.env)
 
 ```bash
-# IBKR Connection (no API key needed - connects via socket)
+# IBKR Connection (no API key needed - connects via socket to running TWS/Gateway)
 IBKR_HOST=127.0.0.1
 IBKR_PORT=7497                    # 7497 = paper trading, 7496 = live
 IBKR_CLIENT_ID=1
 
-# AI Model (configure at least one)
-ANTHROPIC_API_KEY=sk-ant-...
-# OPENAI_API_KEY=sk-...           # Uncomment to use GPT-4 instead
+# AI Model (Ollama local - no API key needed)
+AI_MODEL=qwen2.5:7b
+OLLAMA_HOST=http://localhost:11434
 
 # Telegram Notifications
 TELEGRAM_BOT_TOKEN=123456:ABC-DEF...
@@ -324,7 +332,7 @@ All trading parameters are configured in `config/settings.py`. Key settings:
 |-----------|---------|-------------|
 | `SCAN_INTERVAL_MINUTES` | `15` | Minutes between scan cycles |
 | `AI_CONFIDENCE_THRESHOLD` | `70` | Minimum AI confidence to act (0-100) |
-| `AI_MODEL` | `claude-sonnet-4-6` | LLM model for analysis |
+| `AI_MODEL` | `qwen2.5:7b` | Ollama model for analysis |
 
 #### Risk Settings
 | Parameter | Default | Description |
@@ -472,7 +480,7 @@ Stop-loss and take-profit levels are calculated using ATR (Average True Range) f
 
 ## AI Analyst
 
-The AI analyst performs deep analysis on each screener candidate using Claude or GPT-4.
+The AI analyst performs deep analysis on each screener candidate using a local LLM via Ollama (Qwen 2.5 7B by default).
 
 ### Context Provided to the LLM
 
@@ -484,7 +492,7 @@ For each candidate, the analyst gathers:
 
 ### Structured Output
 
-The LLM returns a structured JSON response via tool_use (Claude) or function_calling (GPT):
+The LLM returns a structured JSON response:
 
 ```json
 {
@@ -501,11 +509,9 @@ The LLM returns a structured JSON response via tool_use (Claude) or function_cal
 
 Only signals with `confidence >= AI_CONFIDENCE_THRESHOLD` (default: 70) are forwarded to the risk manager. Lower-confidence signals are logged but not acted upon.
 
-### Cost Control
+### Cost
 
-- The two-stage pipeline keeps daily LLM costs under ~$1 (only ~20 candidates per market analyzed)
-- Token usage is tracked per call
-- An alert triggers if daily AI spending exceeds $2
+Zero. The AI runs locally via Ollama -- no cloud API fees. Each analysis takes ~30-60 seconds on CPU hardware.
 
 ---
 
@@ -829,14 +835,15 @@ This system is designed with multiple layers of safety:
 
 ### AI Analyst Issues
 
-**"No API key configured"**
-- Set either `ANTHROPIC_API_KEY` or `OPENAI_API_KEY` in your `.env` file
-- The system auto-selects based on which key is present (Anthropic takes priority)
+**"LLM call failed" or connection refused**
+- Make sure Ollama is running: `ollama serve` (or it runs as a system service)
+- Verify the model is downloaded: `ollama list` should show `qwen2.5:7b`
+- Check `OLLAMA_HOST` in `.env` matches the Ollama address (default: `http://localhost:11434`)
 
-**High API costs**
-- The system tracks daily spending and alerts at $2
-- Reduce `AI_CONFIDENCE_THRESHOLD` to filter more aggressively (fewer candidates reach AI)
-- Or increase the screener score threshold in settings
+**Slow analysis**
+- Each analysis takes ~30-60 seconds on CPU-only hardware -- this is normal
+- With a GPU, responses are 5-10x faster
+- You can try a smaller model (`qwen2.5:3b`) for faster but lower quality results
 
 ### Backtest Issues
 

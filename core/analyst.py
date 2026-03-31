@@ -1,23 +1,20 @@
-"""AI Analyst — LLM-powered deep analysis of screener candidates."""
+"""AI Analyst — LLM-powered deep analysis of screener candidates via Ollama."""
 
 import json
 import logging
+import urllib.request
 from datetime import datetime
 from typing import Optional
 
 import pandas as pd
 
-from config.settings import (
-    ANTHROPIC_API_KEY, OPENAI_API_KEY, AI_MODEL,
-    AI_CONFIDENCE_THRESHOLD, DEFAULT_STOP_LOSS_PCT, DEFAULT_TAKE_PROFIT_PCT,
-)
+from config.settings import AI_MODEL, AI_CONFIDENCE_THRESHOLD, OLLAMA_HOST
 from core.models import Signal, Action, TradeType
 
 logger = logging.getLogger(__name__)
 
-# Token usage tracking for cost control
+# Token usage tracking
 _daily_token_usage = {"input": 0, "output": 0, "date": None}
-_DAILY_COST_ALERT = 2.0  # USD
 
 
 def _reset_daily_usage_if_needed() -> None:
@@ -26,14 +23,6 @@ def _reset_daily_usage_if_needed() -> None:
         _daily_token_usage["input"] = 0
         _daily_token_usage["output"] = 0
         _daily_token_usage["date"] = today
-
-
-def _estimate_cost() -> float:
-    """Rough cost estimate based on token usage."""
-    # Approximate pricing (varies by model)
-    input_cost = _daily_token_usage["input"] / 1_000_000 * 3.0
-    output_cost = _daily_token_usage["output"] / 1_000_000 * 15.0
-    return input_cost + output_cost
 
 
 # ---------------------------------------------------------------------------
@@ -114,123 +103,46 @@ def _build_prompt(
 
 
 # ---------------------------------------------------------------------------
-# LLM calls
+# Ollama LLM call
 # ---------------------------------------------------------------------------
 
-def _call_claude(prompt: str) -> Optional[dict]:
-    """Call Claude API with structured output via tool_use."""
-    if not ANTHROPIC_API_KEY:
-        logger.error("No ANTHROPIC_API_KEY configured")
-        return None
+def _call_ollama(prompt: str) -> Optional[dict]:
+    """Call a local model via Ollama HTTP API with JSON output."""
+    payload = json.dumps({
+        "model": AI_MODEL,
+        "prompt": prompt,
+        "format": "json",
+        "stream": False,
+        "options": {"num_predict": 1024},
+    }).encode()
 
-    import anthropic
-
-    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-
-    tool_schema = {
-        "name": "trading_recommendation",
-        "description": "Provide a structured trading recommendation",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "action": {"type": "string", "enum": ["buy", "sell", "hold"]},
-                "confidence": {"type": "integer", "minimum": 0, "maximum": 100},
-                "entry_price": {"type": "number"},
-                "stop_loss": {"type": "number"},
-                "take_profit": {"type": "number"},
-                "trade_type": {"type": "string", "enum": ["day", "swing"]},
-                "reasoning": {"type": "string"},
-            },
-            "required": [
-                "action", "confidence", "entry_price",
-                "stop_loss", "take_profit", "trade_type", "reasoning",
-            ],
-        },
-    }
-
-    response = client.messages.create(
-        model=AI_MODEL,
-        max_tokens=1024,
-        tools=[tool_schema],
-        tool_choice={"type": "tool", "name": "trading_recommendation"},
-        messages=[{"role": "user", "content": prompt}],
+    req = urllib.request.Request(
+        f"{OLLAMA_HOST}/api/generate",
+        data=payload,
+        headers={"Content-Type": "application/json"},
     )
+
+    response = urllib.request.urlopen(req, timeout=300)
+    result = json.loads(response.read())
 
     # Track usage
     _reset_daily_usage_if_needed()
-    _daily_token_usage["input"] += response.usage.input_tokens
-    _daily_token_usage["output"] += response.usage.output_tokens
+    if "prompt_eval_count" in result:
+        _daily_token_usage["input"] += result["prompt_eval_count"]
+    if "eval_count" in result:
+        _daily_token_usage["output"] += result["eval_count"]
 
-    # Extract tool use result
-    for block in response.content:
-        if block.type == "tool_use":
-            return block.input
+    duration = result.get("total_duration", 0) / 1e9
+    logger.info("Ollama response in %.1fs (%s)", duration, AI_MODEL)
 
-    return None
-
-
-def _call_openai(prompt: str) -> Optional[dict]:
-    """Call OpenAI API with structured output via function calling."""
-    if not OPENAI_API_KEY:
-        logger.error("No OPENAI_API_KEY configured")
-        return None
-
-    import openai
-
-    client = openai.OpenAI(api_key=OPENAI_API_KEY)
-
-    function_schema = {
-        "name": "trading_recommendation",
-        "description": "Provide a structured trading recommendation",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "action": {"type": "string", "enum": ["buy", "sell", "hold"]},
-                "confidence": {"type": "integer", "minimum": 0, "maximum": 100},
-                "entry_price": {"type": "number"},
-                "stop_loss": {"type": "number"},
-                "take_profit": {"type": "number"},
-                "trade_type": {"type": "string", "enum": ["day", "swing"]},
-                "reasoning": {"type": "string"},
-            },
-            "required": [
-                "action", "confidence", "entry_price",
-                "stop_loss", "take_profit", "trade_type", "reasoning",
-            ],
-        },
-    }
-
-    response = client.chat.completions.create(
-        model="gpt-4o",
-        max_tokens=1024,
-        functions=[function_schema],
-        function_call={"name": "trading_recommendation"},
-        messages=[{"role": "user", "content": prompt}],
-    )
-
-    # Track usage
-    _reset_daily_usage_if_needed()
-    if response.usage:
-        _daily_token_usage["input"] += response.usage.prompt_tokens
-        _daily_token_usage["output"] += response.usage.completion_tokens
-
-    msg = response.choices[0].message
-    if msg.function_call:
-        return json.loads(msg.function_call.arguments)
-
-    return None
+    return json.loads(result["response"])
 
 
 def _call_llm(prompt: str, max_retries: int = 3) -> Optional[dict]:
-    """Call the configured LLM with retry logic."""
-    use_claude = ANTHROPIC_API_KEY and ("claude" in AI_MODEL.lower() or not OPENAI_API_KEY)
-
+    """Call Ollama with retry logic."""
     for attempt in range(1, max_retries + 1):
         try:
-            if use_claude:
-                result = _call_claude(prompt)
-            else:
-                result = _call_openai(prompt)
+            result = _call_ollama(prompt)
 
             if result and _validate_response(result):
                 return result
@@ -277,11 +189,6 @@ def analyze_candidate(
 
     Returns a Signal if confidence >= threshold, else None.
     """
-    # Check cost
-    estimated_cost = _estimate_cost()
-    if estimated_cost > _DAILY_COST_ALERT:
-        logger.warning("Daily AI cost estimate: $%.2f (alert at $%.2f)", estimated_cost, _DAILY_COST_ALERT)
-
     prompt = _build_prompt(ticker, exchange, df, indicator_values, news)
     result = _call_llm(prompt)
 
@@ -350,13 +257,13 @@ def analyze_batch(
             )
 
     logger.info(
-        "AI analysis complete: %d/%d candidates approved (est. cost: $%.2f)",
-        len(signals), len(candidates), _estimate_cost(),
+        "AI analysis complete: %d/%d candidates approved",
+        len(signals), len(candidates),
     )
     return signals
 
 
-def get_daily_cost_estimate() -> float:
-    """Return the estimated AI cost for today."""
+def get_daily_token_usage() -> dict:
+    """Return today's token usage stats."""
     _reset_daily_usage_if_needed()
-    return _estimate_cost()
+    return dict(_daily_token_usage)

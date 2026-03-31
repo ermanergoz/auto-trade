@@ -39,7 +39,8 @@ MARKET_HOURS = {
 # ---------------------------------------------------------------------------
 SCAN_INTERVAL_MINUTES = 15
 AI_CONFIDENCE_THRESHOLD = 70
-AI_MODEL = os.getenv("AI_MODEL", "claude-sonnet-4-6")
+AI_MODEL = os.getenv("AI_MODEL", "qwen2.5:7b")
+OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
 
 # ---------------------------------------------------------------------------
 # Risk Management
@@ -76,8 +77,6 @@ SUPPORT_RESISTANCE_PCT = 2.0
 # ---------------------------------------------------------------------------
 # API Keys
 # ---------------------------------------------------------------------------
-ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 TAVILY_API_KEY = os.getenv("TAVILY_API_KEY", "")
 
 # ---------------------------------------------------------------------------
