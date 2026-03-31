@@ -1,0 +1,13 @@
+ib_insync>=0.9.86
+yfinance>=0.2.31
+pandas>=2.1.0
+pandas-ta>=0.3.14b
+anthropic>=0.39.0
+openai>=1.50.0
+python-telegram-bot>=20.7
+python-dotenv>=1.0.0
+apscheduler>=3.10.4
+rich>=13.7.0
+tavily-python>=0.3.0
+pytest>=7.4.0
+pytest-asyncio>=0.23.0
