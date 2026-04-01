@@ -599,18 +599,21 @@ The Telegram bot sends real-time alerts for all trading activity.
 
 | Event | Content |
 |-------|---------|
+| **System Started** | Mode, portfolio value, cash balance |
+| **Scan Summary** | Per-cycle summary: candidates found, AI-approved signals, risk-approved trades, orders placed |
 | **Trade Opened** | Ticker, action (BUY/SELL), quantity, price, stop-loss, take-profit, confidence score, AI reasoning |
 | **Trade Closed** | Ticker, exit price, P&L percentage, profit/loss amount |
 | **Daily Summary** | End-of-day report with portfolio value, daily P&L, number of trades, open positions |
 | **Risk Warning** | Alerts when daily loss limit is approached, positions rejected by risk manager |
-| **Scan Summary** | Per-cycle summary: candidates found, AI-approved signals, risk-approved trades, orders placed |
 | **System Error** | Connection failures, API errors, unexpected exceptions |
+| **System Stopped** | Notification when the trader shuts down |
 
 ### Setup
 
 1. Create a Telegram bot via @BotFather (see [Prerequisites](#3-telegram-bot-for-notifications))
 2. Add `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` to your `.env` file
 3. Notifications are fire-and-forget -- Telegram failures will not crash the trading system
+4. **Interactive status**: Send "Whatsup" (or "status") to the bot to get a real-time status update of what the system is currently doing
 
 ---
 

@@ -27,6 +27,10 @@ from core.portfolio import (
     get_portfolio_value,
 )
 from core.models import StockInfo
+from notifications.telegram import (
+    notify_scan_summary, notify_trade, notify_error, notify_shutdown,
+    update_status,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -103,11 +107,13 @@ def run_scan_cycle(
         ensure_connected(ib)
     except ConnectionError:
         logger.error("Cannot run scan — IBKR not connected")
+        notify_error("Cannot run scan — IBKR not connected")
         return summary
 
     active_markets = get_active_markets(markets)
     if not active_markets:
         logger.info("No markets currently open")
+        update_status("waiting", "No markets currently open")
         return summary
 
     # Get account info
@@ -137,9 +143,11 @@ def run_scan_cycle(
             continue
 
         # Step 1: Fetch data for all stocks
+        update_status("fetching_data", f"{len(market_stocks)} stocks for {market}")
         stock_data = _fetch_market_data(ib, market_stocks)
 
         # Step 2: Run screener
+        update_status("screening", f"{len(stock_data)} stocks")
         candidates = screen_stocks(stock_data)
         summary["candidates_found"] += len(candidates)
         logger.info("Screener found %d candidates for %s", len(candidates), market)
@@ -165,10 +173,12 @@ def run_scan_cycle(
                 "news": news,
             })
 
+        update_status("ai_analysis", f"{len(ai_input)} candidates for {market}")
         ai_signals = analyze_batch(ai_input)
         summary["ai_approved"] += len(ai_signals)
 
         # Step 4: Risk check + execution
+        update_status("risk_check", f"{len(ai_signals)} AI-approved signals")
         for signal in ai_signals:
             record_signal(signal)
 
@@ -186,6 +196,7 @@ def run_scan_cycle(
             if trades:
                 summary["orders_placed"] += 1
                 handle_fill(signal, result.position_size, signal.entry_price)
+                notify_trade(signal, result.position_size)
                 # Refresh positions for subsequent risk checks
                 open_positions = get_open_positions()
 
@@ -194,6 +205,11 @@ def run_scan_cycle(
         summary["candidates_found"], summary["ai_approved"],
         summary["risk_approved"], summary["orders_placed"],
     )
+    notify_scan_summary(
+        summary["candidates_found"], summary["ai_approved"],
+        summary["risk_approved"], summary["orders_placed"],
+    )
+    update_status("scan_complete", f"Next scan in {SCAN_INTERVAL_MINUTES} min")
     return summary
 
 
@@ -278,4 +294,5 @@ def start_scheduler(
             close_all_day_trades(ib, positions, dry_run=dry_run)
         except Exception:
             pass
+        notify_shutdown()
         disconnect(ib)

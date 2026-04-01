@@ -180,6 +180,12 @@ def main() -> None:
         summary = get_account_summary(ib)
         display_account_summary(summary)
 
+        # Start Telegram notifications + listener
+        from notifications.telegram import notify_startup, start_listener, update_status
+        notify_startup(args.mode, summary)
+        start_listener()
+        update_status("startup_complete")
+
         tz = ZoneInfo(TIMEZONE)
         now = datetime.now(tz)
         console.print(f"\nLocal time ({TIMEZONE}): {now.strftime('%Y-%m-%d %H:%M:%S')}")

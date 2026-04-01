@@ -901,12 +901,25 @@ Sends alerts to your phone via Telegram. You create a Telegram bot (using @BotFa
 
 ### Notification Types
 
-- **Trade opened** — "BUY 100 AAPL @ $175.50 | SL: $170.00 | TP: $185.00"
+- **System started** — Mode, portfolio value, cash balance. Sent once at startup.
+- **Scan summary** — After each 15-min scan cycle: candidates found, AI approved, risk approved, orders placed.
+- **Trade opened** — "BUY 100 AAPL @ $175.50 | SL: $170.00 | TP: $185.00" with AI reasoning.
 - **Trade closed** — "SOLD 100 AAPL @ $183.20 | P&L: +$770.00 (+4.4%)"
 - **Daily summary** — End-of-day report with total P&L, trades, win rate
 - **Risk warning** — "Daily loss limit reached. Trading halted."
 - **Error** — "IBKR connection lost. Attempting reconnect."
-- **Scan summary** — "Scanned 287 stocks → 12 candidates → 3 AI approved → 2 orders placed"
+- **System stopped** — Sent when the trader shuts down (Ctrl+C or signal).
+
+### Interactive Status ("Whatsup")
+
+The system runs a background listener thread that polls for incoming Telegram messages. When you send **"Whatsup"** (or "status", "what's up", "/status") to the bot, it replies with:
+
+- Current phase (fetching data, AI analyzing, waiting, etc.)
+- Mode (paper/live)
+- Last scan summary
+- Current time
+
+This runs on a daemon thread so it doesn't interfere with trading. The polling uses Telegram's long-polling with a 10-second timeout, so responses come within seconds.
 
 ### Design
 
