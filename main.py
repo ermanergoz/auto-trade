@@ -61,6 +61,11 @@ def parse_args() -> argparse.Namespace:
         help="Run a single scan cycle then exit",
     )
     parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Bypass market hours check (orders queue for next open)",
+    )
+    parser.add_argument(
         "--backtest-tickers",
         nargs="+",
         default=None,
@@ -197,12 +202,12 @@ def main() -> None:
         if args.once:
             console.print("\n[cyan]Running single scan cycle...[/cyan]")
             from core.scheduler import run_scan_cycle
-            summary = run_scan_cycle(ib, markets, mode=args.mode)
+            summary = run_scan_cycle(ib, markets, mode=args.mode, force=args.force)
             console.print(f"\nScan complete: {summary}")
         else:
             console.print("\n[cyan]Starting scheduler...[/cyan]")
             from core.scheduler import start_scheduler
-            start_scheduler(ib, markets, mode=args.mode)
+            start_scheduler(ib, markets, mode=args.mode, force=args.force)
 
     except KeyboardInterrupt:
         console.print("\n[yellow]Shutting down...[/yellow]")

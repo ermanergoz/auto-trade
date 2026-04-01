@@ -187,6 +187,22 @@ def notify_shutdown() -> bool:
     return _send_sync("<b>System Stopped</b>\n\nTrader has been shut down.")
 
 
+def notify_ai_signal(signal: Signal) -> bool:
+    """Notify when AI recommends a buy/sell (before risk check)."""
+    emoji = "\U0001f4a1"  # lightbulb
+    action = signal.action.value.upper()
+    text = (
+        f"{emoji} <b>AI Signal: {action} {signal.ticker}</b>\n\n"
+        f"Confidence: {signal.confidence:.0f}%\n"
+        f"Entry: ${signal.entry_price:.2f}\n"
+        f"Stop-Loss: ${signal.stop_loss:.2f}\n"
+        f"Take-Profit: ${signal.take_profit:.2f}\n"
+        f"Type: {signal.trade_type.value}\n\n"
+        f"<i>{signal.reasoning[:200]}</i>"
+    )
+    return _send_sync(text)
+
+
 def notify_trade(signal: Signal, quantity: int, action_type: str = "OPENED") -> bool:
     """Send a formatted trade notification."""
     emoji = "\U0001f7e2" if signal.action.value == "buy" else "\U0001f534"

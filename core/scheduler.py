@@ -29,8 +29,8 @@ from core.portfolio import (
 )
 from core.models import StockInfo
 from notifications.telegram import (
-    notify_scan_summary, notify_trade, notify_error, notify_shutdown,
-    update_status,
+    notify_scan_summary, notify_trade, notify_ai_signal, notify_error,
+    notify_shutdown, update_status,
 )
 
 logger = logging.getLogger(__name__)
@@ -89,8 +89,12 @@ def run_scan_cycle(
     ib: IB,
     markets: list[str],
     mode: str = "paper",
+    force: bool = False,
 ) -> dict:
     """Run one full scan cycle across all active markets.
+
+    Args:
+        force: If True, bypass market hours check (orders queue for next open).
 
     Returns a summary dict with counts of actions taken.
     """
@@ -111,11 +115,15 @@ def run_scan_cycle(
         notify_error("Cannot run scan — IBKR not connected")
         return summary
 
-    active_markets = get_active_markets(markets)
-    if not active_markets:
-        logger.info("No markets currently open")
-        update_status("waiting", "No markets currently open")
-        return summary
+    if force:
+        active_markets = [m.upper() for m in markets]
+        logger.info("Force mode — bypassing market hours check")
+    else:
+        active_markets = get_active_markets(markets)
+        if not active_markets:
+            logger.info("No markets currently open")
+            update_status("waiting", "No markets currently open")
+            return summary
 
     # Get account info
     from core.connection import get_account_summary
@@ -185,6 +193,10 @@ def run_scan_cycle(
         update_status("ai_analysis", f"{len(ai_input)} candidates for {market}")
         ai_signals = analyze_batch(ai_input)
         summary["ai_approved"] += len(ai_signals)
+
+        # Notify AI signals
+        for signal in ai_signals:
+            notify_ai_signal(signal)
 
         # Step 4: Risk check + execution
         update_status("risk_check", f"{len(ai_signals)} AI-approved signals")
@@ -262,6 +274,7 @@ def start_scheduler(
     ib: IB,
     markets: list[str],
     mode: str = "paper",
+    force: bool = False,
 ) -> None:
     """Start the scan loop using ib_insync's event loop.
 
@@ -288,7 +301,7 @@ def start_scheduler(
 
     try:
         while not _shutting_down:
-            run_scan_cycle(ib, markets, mode)
+            run_scan_cycle(ib, markets, mode, force=force)
             if not _shutting_down:
                 ib.sleep(SCAN_INTERVAL_MINUTES * 60)
     except (KeyboardInterrupt, SystemExit):
