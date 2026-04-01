@@ -116,7 +116,7 @@ Each scan cycle (every 15 minutes by default) executes the following pipeline:
 3. **Data fetching** -- Fetch historical OHLCV data for all stocks in the universe from IBKR (or YFinance fallback)
 4. **Technical screening** -- Run 6 technical indicators on every stock, score candidates, and pass all qualifying stocks (above min_score) to AI analysis
 5. **AI analysis** -- Send each candidate to the local LLM (via Ollama) with price action, indicators, and news context; receive structured trade recommendations with confidence scores
-6. **Risk evaluation** -- Pass every AI-approved signal through 6 risk checks (position size, daily loss, max positions, stop-loss, sector concentration, no duplicates)
+6. **Risk evaluation** -- Pass every AI-approved signal through 11 risk checks (short selling block, position size, daily loss, max positions, stop-loss, sector concentration, no duplicates, excluded sector, risk/reward, anti-momentum, trend confirmation)
 7. **Order execution** -- Place bracket orders (entry + stop-loss + take-profit) through IBKR for approved signals
 8. **Logging and notifications** -- Record everything to SQLite and CSV, send Telegram alerts, update terminal dashboard
 
@@ -341,6 +341,7 @@ All trading parameters are configured in `config/settings.py`. Key settings:
 | `MAX_OPEN_POSITIONS` | `10` | Maximum concurrent positions |
 | `DEFAULT_STOP_LOSS_PCT` | `3.0` | Default stop-loss percentage |
 | `MAX_SECTOR_CONCENTRATION_PCT` | `25.0` | Max portfolio % in one sector |
+| `ALLOW_SHORT_SELLING` | `False` | Allow sell signals for stocks not held |
 
 #### Technical Indicator Settings
 | Parameter | Default | Description |
@@ -513,12 +514,13 @@ Zero. The AI runs locally via Ollama -- no cloud API fees. Each analysis takes ~
 
 ## Risk Management
 
-Every trade must pass through **all 6 risk checks** before execution. If any check fails, the trade is rejected and the reasons are logged.
+Every trade must pass through **all 11 risk checks** before execution. If any check fails, the trade is rejected and the reasons are logged.
 
 ### Risk Checks
 
 | Check | Rule | Default |
 |-------|------|---------|
+| **Short Selling Block** | Sell signals for stocks not currently held are blocked | Blocked (configurable) |
 | **Position Size** | Single position cannot exceed X% of portfolio value | 5% |
 | **Daily Loss Limit** | Halt all trading if daily P&L drops below -X% | 2% |
 | **Max Open Positions** | Cannot exceed N concurrent open positions | 10 |
@@ -703,7 +705,7 @@ pytest tests/ --cov=core --cov=backtest --cov=notifications
 | `test_universe.py` | Universe building, financial sector filtering, caching |
 | `test_screener.py` | Technical indicator calculations, scoring, signal generation |
 | `test_analyst.py` | LLM integration, response validation, cost tracking |
-| `test_risk.py` | All 6 risk checks, position sizing calculations |
+| `test_risk.py` | All 11 risk checks, position sizing calculations |
 | `test_backtest.py` | Backtesting engine, simulated portfolio, no look-ahead bias |
 
 ---

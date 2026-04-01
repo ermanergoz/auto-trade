@@ -17,6 +17,7 @@ from config.settings import (
     ANTI_MOMENTUM_PCT,
     TREND_CONFIRMATION,
     MIN_RISK_REWARD_RATIO,
+    ALLOW_SHORT_SELLING,
 )
 
 logger = logging.getLogger(__name__)
@@ -147,6 +148,25 @@ def check_no_duplicate(
                 f"({pos.quantity} shares @ ${pos.entry_price:.2f})"
             )
     return True, ""
+
+
+def check_short_selling(
+    signal: Signal,
+    open_positions: list[Position],
+) -> tuple[bool, str]:
+    """Block sell signals for stocks not currently held (short selling)."""
+    if ALLOW_SHORT_SELLING:
+        return True, ""
+
+    if signal.action != Action.SELL:
+        return True, ""
+
+    # Check if we hold this stock
+    for pos in open_positions:
+        if pos.ticker == signal.ticker:
+            return True, ""
+
+    return False, f"Short selling blocked for {signal.ticker} (not currently held)"
 
 
 _FINANCIAL_KEYWORDS = [
@@ -345,6 +365,7 @@ def evaluate(
     indicator_values = getattr(signal, "indicator_values", {}) or {}
 
     checks = [
+        check_short_selling(signal, open_positions),
         check_position_size(signal, portfolio_value),
         check_daily_loss_limit(daily_pnl, portfolio_value),
         check_max_positions(open_positions),

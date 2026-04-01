@@ -1,0 +1,1282 @@
+# Auto-Trade: Complete Code Documentation
+
+A plain-English guide to every part of this automated stock trading system — what it does, how it works, why it was built this way, and the challenges we hit along the way.
+
+---
+
+## Table of Contents
+
+1. [What Is This Project?](#1-what-is-this-project)
+2. [The Big Picture — How a Trade Happens](#2-the-big-picture--how-a-trade-happens)
+3. [Project Structure](#3-project-structure)
+4. [The Data Models (core/models.py)](#4-the-data-models--coremodelspy)
+5. [Configuration (config/settings.py)](#5-configuration--configsettingspy)
+6. [Connecting to the Broker (core/connection.py)](#6-connecting-to-the-broker--coreconnectionpy)
+7. [Getting Market Data (core/data.py)](#7-getting-market-data--coredatapy)
+8. [Building the Stock Universe (core/universe.py)](#8-building-the-stock-universe--coreuniversepy)
+9. [The Technical Screener (core/screener.py)](#9-the-technical-screener--corescreenerpy)
+10. [The AI Analyst (core/analyst.py)](#10-the-ai-analyst--coreanalystpy)
+11. [The Risk Manager (core/risk.py)](#11-the-risk-manager--coreriskpy)
+12. [Executing Trades (core/executor.py)](#12-executing-trades--coreexecutorpy)
+13. [The Scheduler — Tying It All Together (core/scheduler.py)](#13-the-scheduler--tying-it-all-together--coreschedulerpy)
+14. [Portfolio Tracking (core/portfolio.py)](#14-portfolio-tracking--coreportfoliopy)
+15. [Logging & Dashboard (core/logger.py)](#15-logging--dashboard--coreloggerpy)
+16. [Notifications (notifications/telegram.py)](#16-notifications--notificationstelegramy)
+17. [Backtesting Engine (backtest/engine.py)](#17-backtesting-engine--backtestenginepy)
+18. [Backtest Reporting (backtest/report.py)](#18-backtest-reporting--backtestreportpy)
+19. [The Entry Point (main.py)](#19-the-entry-point--mainpy)
+20. [Testing Strategy](#20-testing-strategy)
+21. [Challenges We Faced & How We Solved Them](#21-challenges-we-faced--how-we-solved-them)
+22. [Architecture Decisions & Why](#22-architecture-decisions--why)
+23. [The Complete Data Flow](#23-the-complete-data-flow)
+
+---
+
+## 1. What Is This Project?
+
+This is an **automated stock trading bot** that trades US stocks (NYSE and NASDAQ) through Interactive Brokers (IBKR). It runs on your own computer, makes its own decisions, and places real orders.
+
+Think of it like a 3-person trading desk, automated:
+
+1. **The Screener** — A fast number-cruncher that scans hundreds of stocks every 15 minutes, looking for interesting patterns in prices, volume, and technical indicators. It's like a junior analyst who flags "hey, these 15 stocks look interesting right now."
+
+2. **The AI Analyst** — A local AI model (Qwen 2.5 7B running on Ollama) that takes those 15 candidates and does deep analysis. It looks at price trends, momentum, volume, news headlines, and a strict 6-point checklist. It's the senior analyst who says "of those 15, I'd actually buy these 3."
+
+3. **The Risk Manager** — A paranoid rule-checker that gates every trade with 11 different safety checks. Position too big? Rejected. Already lost too much today? Rejected. Chasing a stock that already moved 5%? Rejected. It's the compliance officer who makes sure we never blow up.
+
+Only after all three agree does an order actually get placed.
+
+---
+
+## 2. The Big Picture — How a Trade Happens
+
+Here's the complete journey of a trade, step by step:
+
+```
+Every 15 minutes during market hours:
+
+  1. CONNECT — Make sure we're connected to IBKR
+                    ↓
+  2. UNIVERSE — Get today's list of tradeable stocks (~100-350 stocks)
+               (cached after first build — it doesn't change during the day)
+                    ↓
+  3. DATA — Download 60 days of price history for every stock in the universe
+                    ↓
+  4. SCREEN — Run 6 technical indicators on each stock
+             Score them. Keep stocks scoring above the minimum threshold.
+             Typical result: ~10-20 candidates out of hundreds
+                    ↓
+  5. ANALYZE — Send each candidate to the local AI model with:
+              - Recent price action (last 5 days)
+              - Indicator values (RSI, MACD, etc.)
+              - News headlines
+              The AI returns: BUY/SELL/HOLD + confidence + prices + reasoning
+              Only signals with confidence >= 70 pass through
+                    ↓
+  6. RISK CHECK — For each AI-approved signal, run 11 safety checks:
+                  Position size, daily loss limit, sector concentration,
+                  duplicate positions, stop-loss validity, and more.
+                  Calculate exact number of shares to buy.
+                    ↓
+  7. EXECUTE — Place a bracket order on IBKR:
+              - Entry order (the buy/sell)
+              - Take-profit limit order (auto-sell when price target hit)
+              - Stop-loss order (auto-sell when max loss hit)
+              These three are linked — when one TP/SL fills, the other cancels
+                    ↓
+  8. RECORD — Save position to SQLite database
+             Send Telegram notification
+             Log to CSV trade journal
+             Update terminal dashboard
+```
+
+And 15 minutes before market close, the system auto-closes all day trades (swing trades stay open overnight).
+
+---
+
+## 3. Project Structure
+
+```
+auto-trade/
+│
+├── main.py                  # The front door. Parse arguments, pick mode, start.
+├── requirements.txt         # Python packages we depend on
+├── CLAUDE.md                # Instructions for AI assistants working on this code
+├── README.md                # User-facing guide
+│
+├── config/
+│   └── settings.py          # Every number the system uses: thresholds, ports,
+│                             # intervals, indicator periods. One file, no magic.
+│
+├── core/                    # Where the actual trading logic lives
+│   ├── models.py            # Data shapes: Signal, Position, Trade, etc.
+│   ├── connection.py        # Talk to IBKR (connect, disconnect, reconnect)
+│   ├── data.py              # Get price data and news
+│   ├── universe.py          # Build the list of stocks we're allowed to trade
+│   ├── screener.py          # Technical indicator checks (the fast filter)
+│   ├── analyst.py           # AI-powered analysis (the deep filter)
+│   ├── risk.py              # Safety checks and position sizing
+│   ├── executor.py          # Actually place and manage orders on IBKR
+│   ├── scheduler.py         # The main loop that orchestrates everything
+│   ├── portfolio.py         # SQLite database for tracking positions and trades
+│   └── logger.py            # Pretty terminal output and CSV trade journals
+│
+├── backtest/                # Historical testing
+│   ├── engine.py            # Replay historical data day-by-day
+│   └── report.py            # Calculate performance metrics (Sharpe, drawdown, etc.)
+│
+├── notifications/
+│   └── telegram.py          # Send alerts to your phone via Telegram
+│
+├── tests/                   # Automated tests for every module
+│   ├── test_screener.py
+│   ├── test_risk.py
+│   ├── test_analyst.py
+│   ├── test_data.py
+│   ├── test_connection.py
+│   ├── test_portfolio.py
+│   ├── test_models.py
+│   ├── test_universe.py
+│   └── test_backtest.py
+│
+├── data/                    # Runtime data (gitignored)
+│   ├── portfolio.db         # SQLite database
+│   └── universe_us_*.json   # Cached daily stock lists
+│
+├── logs/                    # Log files (gitignored)
+│   ├── trader_*.log         # Daily system logs
+│   └── trades_*.csv         # Daily trade journals
+│
+└── docs/
+    ├── DESIGN.md            # Architecture spec
+    └── IMPLEMENTATION-PLAN.md  # Build roadmap
+```
+
+---
+
+## 4. The Data Models — `core/models.py`
+
+This file defines the **shapes of data** that flow through the system. Think of them like forms that every piece of information must fill out. They're Python dataclasses — just containers for data, no behavior.
+
+### Signal — "Hey, I think we should trade this stock"
+
+A Signal is the output of either the screener or the AI analyst. It says: "I think you should BUY (or SELL) this stock at this price, with this stop-loss and take-profit."
+
+```
+Signal:
+  - ticker: "AAPL"              ← which stock
+  - action: BUY / SELL / HOLD   ← what to do
+  - confidence: 0-100           ← how sure are we (AI gives this)
+  - entry_price: 175.50         ← what price to buy at
+  - stop_loss: 170.00           ← bail out if it drops here (limits losses)
+  - take_profit: 185.00         ← cash out if it reaches here (locks profit)
+  - reasoning: "Strong uptrend..."  ← why this trade
+  - source: "screener" or "ai"  ← who generated this signal
+  - trade_type: DAY or SWING    ← close today, or hold overnight?
+  - indicator_values: {...}     ← raw indicator numbers for the AI to see
+```
+
+### Position — "We currently own this stock"
+
+```
+Position:
+  - ticker, exchange, quantity, entry_price, entry_time
+  - stop_loss, take_profit, trade_type, sector
+  - current_price (updated live)
+  - unrealized_pnl → computed: (current_price - entry_price) * quantity
+```
+
+### Trade — "We bought and sold this stock, here's how it went"
+
+```
+Trade:
+  - Everything from Position, plus:
+  - exit_price, exit_time
+  - pnl → computed: (exit_price - entry_price) * quantity
+  - pnl_pct → computed: percentage gain/loss
+  - duration → computed: how long we held it
+```
+
+### Other models
+
+- **DailySummary** — End-of-day snapshot: portfolio value, P&L, win/loss counts
+- **StockInfo** — Basic info about a tradeable stock: ticker, sector, market cap, volume
+- **Action** (enum) — BUY, SELL, HOLD
+- **TradeType** (enum) — DAY (close same day), SWING (hold days/weeks)
+
+---
+
+## 5. Configuration — `config/settings.py`
+
+This is the **single source of truth** for every number in the system. No magic numbers hidden in random files. If you want to change how the system behaves, this is where you go.
+
+### Broker Settings
+```python
+IBKR_HOST = "127.0.0.1"    # IBKR runs on your local machine
+IBKR_PORT = 7497            # 7497 = paper trading, 7496 = real money
+IBKR_CLIENT_ID = 1          # Identifies our connection to IBKR
+```
+
+### What We Trade
+```python
+MARKETS = ["US"]                    # Only US stocks
+EXCLUDED_SECTORS = ["Financials"]   # No banks, insurance, lending
+MIN_DAILY_VOLUME = 100_000          # Stock must trade 100K shares/day minimum
+MIN_MARKET_CAP = 50_000_000         # $50M minimum market cap
+```
+
+Why exclude financials? Banks and insurance companies behave very differently from regular companies — their prices are driven by interest rates, regulations, and credit cycles rather than normal business performance. Our technical indicators don't work well on them.
+
+### Strategy Settings
+```python
+SCAN_INTERVAL_MINUTES = 15         # Run the full pipeline every 15 min
+AI_CONFIDENCE_THRESHOLD = 70       # AI must be 70%+ confident
+AI_MODEL = "qwen2.5:7b"           # The local AI model
+OLLAMA_HOST = "http://localhost:11434"  # Where Ollama runs
+```
+
+### Risk Limits — The Safety Net
+```python
+MAX_POSITION_SIZE_PCT = 5.0         # Never put >5% of portfolio in one stock
+DAILY_LOSS_LIMIT_PCT = 2.0          # Stop trading if down 2% today
+MAX_OPEN_POSITIONS = 10             # Max 10 stocks at once
+DEFAULT_STOP_LOSS_PCT = 3.0         # Default: bail if stock drops 3%
+DEFAULT_TAKE_PROFIT_PCT = 6.0       # Default: cash out at 6% profit
+MAX_SECTOR_CONCENTRATION_PCT = 25.0 # Max 25% in one sector (like tech)
+ANTI_MOMENTUM_PCT = 5.0             # Don't buy if already moved 5%
+MIN_RISK_REWARD_RATIO = 1.5         # Potential profit must be 1.5x potential loss
+ALLOW_SHORT_SELLING = False         # Block sells for stocks not held (no shorting)
+```
+
+### Technical Indicator Settings
+```python
+RSI_PERIOD = 14                # Standard RSI lookback window
+RSI_OVERSOLD = 30              # Below 30 = oversold (potential buy)
+RSI_OVERBOUGHT = 70            # Above 70 = overbought (potential sell)
+MACD_FAST = 12, SLOW = 26     # MACD moving average periods
+MA_FAST = 5, MA_SLOW = 20     # Short and long moving averages
+VOLUME_SPIKE_MULTIPLIER = 2.0  # Volume must be 2x normal to count
+```
+
+---
+
+## 6. Connecting to the Broker — `core/connection.py`
+
+This module handles all communication with Interactive Brokers (IBKR). IBKR provides a desktop app called TWS (Trader Workstation) or a lighter version called IB Gateway. Our bot connects to either of these over a socket on your local machine.
+
+### Key Functions
+
+**`connect(host, port, client_id, timeout)`** — Establishes the connection. Think of it like logging into your brokerage account, but programmatically. If TWS isn't running or the port is wrong, it raises a `ConnectionError`.
+
+**`ensure_connected(ib, ...)`** — IBKR connections drop frequently (network hiccups, TWS restarts). This function checks if we're still connected and reconnects if not. It's called at the start of every scan cycle.
+
+**`create_contract(ticker, exchange)`** — Creates an IBKR "contract" object. IBKR needs to know exactly which financial instrument you're talking about. For US stocks, we use the "SMART" exchange (IBKR's smart order routing that finds the best price across exchanges).
+
+**`get_account_summary(ib)`** — Asks IBKR: "What's my account worth? How much cash do I have? What's my P&L today?" Returns a dictionary with values like NetLiquidation (total account value), AvailableFunds, and RealizedPnL.
+
+### Why It's Separate
+
+Having connection logic in its own file means the rest of the code never needs to worry about connection details. The screener doesn't know about sockets. The risk manager doesn't know about ports. They just get data handed to them.
+
+---
+
+## 7. Getting Market Data — `core/data.py`
+
+This module fetches prices and news. It has two data sources and caching to avoid being wasteful.
+
+### Primary Source: IBKR
+
+**`get_historical_data(ib, contract, duration, bar_size)`** — Gets OHLCV bars (Open, High, Low, Close, Volume) from IBKR. Default: 60 days of daily bars. This is what the screener analyzes.
+
+**`get_realtime_quote(ib, contract)`** — Gets a current price snapshot. Used to check if a stock has already moved too much before buying.
+
+### Fallback Source: YFinance
+
+**`get_historical_data_yfinance(ticker, period, interval)`** — Same data but from Yahoo Finance. Used only by the backtester (since you don't need an IBKR connection to backtest) and as a fallback if IBKR data fails.
+
+### News
+
+**`get_news(ticker, market, max_results)`** — Fetches recent news headlines using the Tavily API. The AI analyst uses these to factor in recent events (earnings, lawsuits, FDA approvals, etc.).
+
+### Caching
+
+Every data fetch is cached with a time-to-live (TTL):
+- Historical bars: cached for 5 minutes (they don't change that fast)
+- Quotes: cached for 30 seconds
+- News: cached for 15 minutes
+
+This prevents us from hammering the APIs with identical requests within the same scan cycle.
+
+### Column Normalization
+
+Different data sources return columns with different names (IBKR uses "Close", YFinance might use "close"). This module normalizes everything to lowercase: `open, high, low, close, volume`. This way, downstream code never needs to worry about capitalization.
+
+---
+
+## 8. Building the Stock Universe — `core/universe.py`
+
+Before we can screen stocks, we need a list of stocks TO screen. That's what the universe builder does. It answers: "Which stocks should we even look at today?"
+
+### The Process
+
+```
+Step 1: Check cache — did we already build today's universe?
+   YES → use cached list (it doesn't change intraday)
+   NO  → continue to Step 2
+
+Step 2: Ask IBKR to scan the market using 10 different scanner types:
+   - MOST_ACTIVE         (highest volume today)
+   - TOP_PERC_GAIN       (biggest gainers)
+   - TOP_PERC_LOSE       (biggest losers — could be short candidates)
+   - HOT_BY_VOLUME       (unusual volume spikes)
+   - TOP_OPEN_PERC_GAIN  (gapped up at open)
+   - TOP_OPEN_PERC_LOSE  (gapped down at open)
+   - HIGH_VS_13W_HL      (near 13-week high)
+   - LOW_VS_13W_HL       (near 13-week low)
+   - TOP_TRADE_COUNT     (most individual trades)
+   - TOP_TRADE_RATE      (fastest rate of trades)
+
+Step 3: Combine all results and remove duplicates.
+        A stock that appears in 3 different scanners still only appears once.
+        Typical result: ~200-350 unique stocks
+
+Step 4: Filter out:
+   - Financial sector stocks (banks, insurance, etc.)
+   - Stocks with volume below 100K shares/day
+   - Stocks with market cap below $50M
+   - Explicitly excluded tickers (like certain Israel-based companies)
+
+Step 5: Cache the result as a JSON file for the rest of the day
+```
+
+### The Fallback Chain
+
+What if IBKR scanners aren't available (maybe TWS just started and isn't ready)?
+
+1. **Try cache** — maybe we already built it today
+2. **Try IBKR scanners** — the main approach
+3. **Static fallback** — a hardcoded list of ~100 well-known US stocks (AAPL, MSFT, GOOGL, etc.)
+
+This means the system ALWAYS has stocks to trade, even if IBKR is being flaky.
+
+---
+
+## 9. The Technical Screener — `core/screener.py`
+
+This is the **fast, free first filter**. It runs 6 technical indicators on every stock in the universe and scores them. It takes maybe a second to screen 300 stocks. No AI, no API calls — just math on price data.
+
+### The Architecture Rule
+
+The screener is written as **pure functions**. This is a critical design decision.
+
+What does "pure function" mean? It means the screener:
+- Takes data IN (a DataFrame of prices)
+- Returns results OUT (a list of Signals)
+- Never reaches out to fetch data itself
+- Never writes to a database
+- Has no side effects
+
+Why? Because the **backtester uses the exact same screener code**. During live trading, the scheduler feeds it today's data. During backtesting, the engine feeds it historical data. Same code, different inputs. Zero duplication.
+
+### The 6 Indicators
+
+Each indicator check looks at the stock's price history and returns either a signal (BUY or SELL) or nothing.
+
+#### 1. RSI (Relative Strength Index) — `check_rsi(df)`
+
+RSI measures how "overbought" or "oversold" a stock is on a scale of 0-100.
+
+- **Below 30** → "This stock has been beaten down. It might bounce back." → BUY signal
+- **Above 70** → "This stock has been on a tear. It might pull back." → SELL signal
+- **30-70** → Normal territory, no signal
+
+The strength of the signal scales with how extreme the RSI is. RSI of 15 is a stronger buy signal than RSI of 28.
+
+#### 2. MACD (Moving Average Convergence Divergence) — `check_macd(df)`
+
+MACD tracks momentum by comparing two moving averages.
+
+- When the fast MACD line **crosses above** the signal line → momentum is turning bullish → BUY
+- When it **crosses below** → momentum is turning bearish → SELL
+
+We specifically check that the crossover happened in the **last 2 bars** (recent crossovers matter, old ones don't).
+
+#### 3. Moving Average Crossover — `check_ma_crossover(df)`
+
+Compares a fast moving average (5-day) against a slow one (20-day).
+
+- **Fast crosses above slow** → "Golden cross" → BUY (short-term trend is now above long-term)
+- **Fast crosses below slow** → "Death cross" → SELL
+
+Again, only recent crossovers count (within last 2 bars).
+
+#### 4. Volume Spike — `check_volume_spike(df)`
+
+Looks for days where volume is **2x or more** the 20-day average.
+
+Why does this matter? Big volume means big interest. If a stock suddenly trades 3x its normal volume, something is happening — earnings, news, institutional buying. Volume confirms that a price move is "real" and not just noise.
+
+This check doesn't generate BUY or SELL by itself — it confirms other signals.
+
+#### 5. Bollinger Bands — `check_bollinger(df)`
+
+Bollinger Bands create an envelope around the price:
+- Middle band = 20-day moving average
+- Upper band = middle + 2 standard deviations
+- Lower band = middle - 2 standard deviations
+
+Statistically, price stays within the bands ~95% of the time.
+
+- **Price drops below lower band** → "Unusually cheap" → BUY
+- **Price rises above upper band** → "Unusually expensive" → SELL
+
+#### 6. Support & Resistance — `check_support_resistance(df)`
+
+Looks at the stock's 20-day high and low.
+
+- **Price within 2% of the 20-day low** → Near support → BUY (might bounce)
+- **Price within 2% of the 20-day high** → Near resistance → SELL (might reverse)
+
+### Scoring
+
+Each stock gets a score from 0 to 100 based on:
+
+1. **How many indicators triggered** — More signals = higher score. If RSI, MACD, and volume ALL say "buy", that's more convincing than just RSI alone.
+2. **Signal strength** — Each indicator returns a strength between 0 and 1. A deeply oversold RSI of 15 scores higher than a barely-oversold RSI of 29.
+3. **Consensus** — Are all signals pointing the same direction? 4 buy signals = strong. 2 buy + 2 sell = confused (lower score).
+
+Stocks scoring above the minimum threshold (default: 15.0) become candidates and get passed to the AI analyst.
+
+### ATR-Based Stop Losses
+
+Instead of using a fixed 3% stop-loss for every stock, the screener uses **ATR (Average True Range)** — a measure of how much a stock typically moves in a day.
+
+A volatile stock like Tesla might move 5% in a normal day, so a 3% stop-loss would get triggered by normal noise. ATR says: "This stock normally moves $X per day, so set the stop-loss at 1.5x that distance below entry."
+
+This adapts the stop-loss to each stock's personality.
+
+---
+
+## 10. The AI Analyst — `core/analyst.py`
+
+The AI analyst is the "smart filter." It takes candidates from the screener and does deep qualitative analysis using a local Large Language Model.
+
+### Why Local AI?
+
+We use **Ollama** running **Qwen 2.5 7B** locally. This was a deliberate choice (and a pivot from the original design — see Challenges section). Benefits:
+
+- **Zero cost** — No API fees. Cloud AI (Claude, GPT) would cost money per analysis, and we run 10-20 analyses every 15 minutes.
+- **No internet dependency** — Works offline. No API outages.
+- **Privacy** — Your trading data never leaves your machine.
+- **No rate limits** — Run as many analyses as you want.
+
+### How Analysis Works
+
+For each candidate stock, the analyst:
+
+#### Step 1: Build the Prompt
+
+The prompt is a structured document that gives the AI everything it needs:
+
+```
+"You are a disciplined stock trader making real money decisions..."
+
+Stock: AAPL (US)
+
+Recent Price Action (last 5 days):
+  2026-03-27: O=174.50 H=176.20 L=173.80 C=175.90 V=45.2M
+  2026-03-28: O=175.90 H=178.30 L=175.10 C=177.80 V=52.1M
+  ...
+
+Technical Indicators:
+  - RSI(14) = 35.2 → BUY signal (oversold)
+  - MACD crossover: bullish (1 bar ago)
+  - Volume: 2.3x average (spike confirmed)
+
+News Headlines:
+  - "Apple announces record services revenue"
+  - "iPhone 17 leaks suggest major camera upgrade"
+
+Decision Checklist — evaluate each:
+  1. TREND: Is the stock in a clear trend?
+  2. MOMENTUM: Is momentum confirming?
+  3. VOLUME: Is there volume confirmation?
+  4. RISK/REWARD: Is reward >= 1.5x risk?
+  5. NEWS: Any catalysts or red flags?
+  6. ANTI-CHASE: Has it already moved >5%?
+```
+
+#### Step 2: Call the AI
+
+Makes an HTTP request to the local Ollama server. The AI processes the prompt and returns structured JSON:
+
+```json
+{
+  "action": "buy",
+  "confidence": 78,
+  "entry_price": 177.50,
+  "stop_loss": 173.00,
+  "take_profit": 185.00,
+  "reasoning": "Strong oversold bounce with volume confirmation...",
+  "trade_type": "swing"
+}
+```
+
+#### Step 3: Validate the Response
+
+The system checks:
+- Is `action` one of buy/sell/hold?
+- Is `confidence` a number between 0 and 100?
+- Are prices provided (for buy/sell)?
+- Is `stop_loss` below `entry_price` (for buys)?
+- Is `take_profit` above `entry_price` (for buys)?
+
+Invalid responses are rejected and retried (up to 3 times with exponential backoff).
+
+#### Step 4: Filter by Confidence
+
+Only signals with confidence >= 70 pass through. The AI is encouraged to be honest — if it's uncertain, it should say confidence 40, and we'll skip it.
+
+### The Discipline Rules
+
+These are embedded in the prompt to prevent common trading mistakes:
+
+1. **Require 4/6 checklist items favorable** — Don't buy just because RSI is oversold. Need multiple confirmations.
+2. **Anti-chase** — If a stock already moved 5%+ in the direction of the signal, reject it. You missed the move.
+3. **Conservative confidence** — Only give 70+ when trend + momentum + volume align. Be honest about uncertainty.
+4. **No FOMO** — It's okay to say HOLD. Missing a trade is better than taking a bad one.
+
+### Batch Processing
+
+The `analyze_batch()` function processes multiple candidates sequentially, collecting all AI-approved signals before passing them to the risk manager.
+
+---
+
+## 11. The Risk Manager — `core/risk.py`
+
+The risk manager is the **last line of defense** before real money moves. Even if the screener loves a stock and the AI says "buy with 85% confidence," the risk manager can still say "no" if any safety rule is violated.
+
+Like the screener, it's **pure functions** — takes portfolio state as input, returns approval/rejection. No data fetching, no side effects. Same code works in live trading and backtesting.
+
+### The 11 Safety Checks
+
+Every signal must pass ALL of these. Fail one, the trade is rejected.
+
+#### 1. Short Selling Block — `check_short_selling()`
+"Is this a sell signal for a stock we don't own?"
+
+Rule: If `ALLOW_SHORT_SELLING` is False (the default), reject any SELL signal where we don't already hold the stock.
+
+Why: Short selling (selling borrowed shares hoping the price drops) carries unlimited downside risk — a stock can rise infinitely. With a 7B local AI model, the risk of a bad short call is too high. This check is configurable via `ALLOW_SHORT_SELLING` in settings for advanced users who understand the risks.
+
+#### 2. Position Size Check — `check_position_size()`
+"Is this trade too big relative to our portfolio?"
+
+Rule: No single position can be more than 5% of total portfolio value.
+
+Why: If one stock crashes, you lose at most 5% of your portfolio, not 50%.
+
+#### 3. Daily Loss Limit — `check_daily_loss_limit()`
+"Have we already lost too much today?"
+
+Rule: If today's losses exceed 2% of portfolio value, STOP TRADING. No more new positions.
+
+Why: Bad days happen. This prevents emotional revenge-trading. If you're down 2%, the system shuts off and you live to trade another day. This is the single most important safety feature.
+
+#### 4. Max Open Positions — `check_max_positions()`
+"Do we have too many open positions?"
+
+Rule: Maximum 10 open positions at once.
+
+Why: More positions = more to monitor = more risk of something slipping through. Also keeps the portfolio manageable.
+
+#### 5. Stop-Loss Validation — `check_stop_loss()`
+"Does this signal have a valid stop-loss?"
+
+Rule: Every trade MUST have a stop-loss. For buys, stop-loss must be below entry price. For sells, above.
+
+Why: A trade without a stop-loss has unlimited downside. Never acceptable.
+
+#### 6. Sector Concentration — `check_sector_concentration()`
+"Are we too heavy in one sector?"
+
+Rule: No more than 25% of portfolio in a single sector (like Technology or Healthcare).
+
+Why: If all your money is in tech stocks and tech crashes, everything drops together. Diversification protects you.
+
+#### 7. No Duplicates — `check_no_duplicate()`
+"Do we already have a position in this stock?"
+
+Rule: Can't buy AAPL if we already own AAPL.
+
+Why: Prevents doubling down on a losing position (a common emotional mistake).
+
+#### 8. Excluded Sector — `check_excluded_sector()`
+"Is this stock in a sector we don't trade?"
+
+Rule: No financial sector stocks (banks, insurance, lending).
+
+Why: Safety net. Even if IBKR's sector data is wrong and a bank slips through the universe filter, this catches it at the risk level.
+
+#### 9. Anti-Momentum — `check_anti_momentum()`
+"Has this stock already moved too much?"
+
+Rule: Reject if the current price has already moved more than 5% from the signal's entry price.
+
+Why: Chasing. If the screener flagged TSLA at $200 but by the time we get to risk check it's at $212, we missed the move. Buying now means we're chasing and likely buying at a local top.
+
+#### 10. Trend Confirmation — `check_trend_confirmation()`
+"Are the moving averages aligned in our favor?"
+
+Rule: For buys, need MA5 > MA10 > MA20 (short-term above long-term = uptrend). For sells, reversed.
+
+Why: Trading against the trend is fighting the market. This check ensures we're swimming WITH the current.
+
+#### 11. Risk/Reward Ratio — `check_risk_reward()`
+"Is the potential profit worth the potential loss?"
+
+Rule: (take_profit - entry) / (entry - stop_loss) must be >= 1.5
+
+Why: If you risk $1 to make $1, you need to be right >50% of the time to profit. At 1.5:1, you only need to be right ~40% of the time. The math works in your favor.
+
+### Position Sizing
+
+If all checks pass, the risk manager calculates HOW MANY shares to buy:
+
+```
+Method 1: Max position = 5% of portfolio / entry price
+Method 2: Risk-based = 1% of portfolio / distance to stop-loss
+
+Use the SMALLER of the two.
+```
+
+Method 2 is the clever one. It says: "If I'm wrong and my stop-loss gets hit, I want to lose at most 1% of my portfolio." So if the stop-loss is very tight (close to entry), you can buy more shares. If it's wide, you buy fewer. This is professional-grade position sizing.
+
+### The RiskResult
+
+The output is a simple object:
+```python
+RiskResult:
+  approved: True/False
+  reasons: ["Daily loss limit breached", ...]  # empty if approved
+  position_size: 45  # shares to buy
+```
+
+---
+
+## 12. Executing Trades — `core/executor.py`
+
+Once the risk manager approves a trade, the executor places actual orders on IBKR.
+
+### Bracket Orders
+
+The primary order type is a **bracket order** — three linked orders placed together:
+
+```
+1. PARENT ORDER: Buy 100 shares of AAPL at $175.50 (limit order)
+2. TAKE-PROFIT: Sell 100 shares of AAPL at $185.00 (limit order)
+3. STOP-LOSS: Sell 100 shares of AAPL at $170.00 (stop order)
+
+These are linked:
+- Parent fills first
+- Then TP and SL become active
+- When TP fills → SL automatically cancels (and vice versa)
+```
+
+This is **atomic** — all three orders are placed as a unit. You never end up with a position that has no stop-loss, even for a millisecond.
+
+### Key Functions
+
+**`place_order(ib, signal, quantity, dry_run)`** — The main function. Creates a bracket order from the signal's entry, stop-loss, and take-profit prices. In dry-run mode, it just logs what WOULD happen.
+
+**`close_position_market(ib, position, dry_run)`** — Immediately close a position with a market order. Used when day-trade positions need to be closed before market close.
+
+**`close_all_day_trades(ib, positions, dry_run)`** — Called 15 minutes before market close. Finds all positions marked as DAY trades and closes them with market orders.
+
+**`handle_fill(signal, quantity, fill_price)`** — Called when IBKR confirms an order filled. Records the position in the SQLite database.
+
+**`setup_disconnect_handler(ib)`** — Attaches a callback for connection drops. Important because IBKR connections are notoriously unstable.
+
+### Dry-Run Mode
+
+When the system runs in `dry-run` mode, the executor does everything EXCEPT actually calling `ib.placeOrder()`. It logs the exact order it would have placed. This is invaluable for testing the full pipeline without risking money.
+
+---
+
+## 13. The Scheduler — Tying It All Together — `core/scheduler.py`
+
+The scheduler is the **conductor** of the orchestra. It doesn't play any instrument itself — it tells each module when to play and passes data between them.
+
+### Market Hours
+
+The scheduler knows when markets are open:
+
+```python
+US Market: 16:30 - 23:00 Turkey time (9:30 AM - 4:00 PM Eastern)
+```
+
+(The timezone is Turkey because that's where the developer is located.)
+
+It only runs scan cycles during market hours. On weekends, it sleeps.
+
+### The Scan Cycle — `run_scan_cycle()`
+
+This is the heart of the system. Called every 15 minutes:
+
+```python
+def run_scan_cycle(ib, markets, mode="paper"):
+    # 1. Make sure we're connected
+    ensure_connected(ib, ...)
+
+    # 2. Get account info
+    account = get_account_summary(ib)
+    portfolio_value = account["NetLiquidation"]
+    daily_pnl = account["RealizedPnL"] + account["UnrealizedPnL"]
+
+    # 3. Build today's universe (cached)
+    universe = build_universe(ib, markets)
+
+    # 4. For each market that's currently open:
+    for market in get_active_markets(markets):
+
+        # 5. Fetch 60 days of data for every stock
+        stock_data = {}
+        for stock in universe[market]:
+            df = get_historical_data(ib, contract, "60 D", "1 day")
+            stock_data[stock.ticker] = (stock.exchange, df)
+
+        # 6. Run the screener
+        candidates = screen_stocks(stock_data)
+
+        # 7. AI analysis on candidates
+        ai_signals = analyze_batch(candidates, stock_data)
+
+        # 8. Risk check and execute
+        for signal in ai_signals:
+            result = evaluate(signal, open_positions, portfolio_value, daily_pnl)
+            if result.approved:
+                place_order(ib, signal, result.position_size, dry_run=...)
+                add_position(...)
+                notify_trade(...)
+
+    # 9. Close day trades if near market close
+    if minutes_to_close(market) <= 15:
+        close_all_day_trades(ib, open_positions)
+```
+
+### The Main Loop — `start_scheduler()`
+
+```python
+def start_scheduler(ib, markets, mode="paper"):
+    # Handle Ctrl+C gracefully
+    setup_signal_handlers()
+
+    while not shutting_down:
+        if any market is open:
+            run_scan_cycle(ib, markets, mode)
+
+        # Sleep using ib_insync's event loop (not time.sleep!)
+        ib.sleep(SCAN_INTERVAL_MINUTES * 60)
+```
+
+### Why `ib.sleep()` Instead of `time.sleep()`?
+
+This was one of our challenges (see Section 21). `ib_insync` needs its event loop running to process callbacks (order fills, connection events). Regular `time.sleep()` blocks the event loop. `ib.sleep()` sleeps while keeping the event loop alive. We originally used APScheduler but had to replace it because of this.
+
+### Graceful Shutdown
+
+When you press Ctrl+C:
+1. Sets a `_shutting_down` flag to prevent reconnection attempts
+2. Closes all open day-trade positions (so you don't accidentally hold them overnight)
+3. Disconnects from IBKR cleanly
+
+---
+
+## 14. Portfolio Tracking — `core/portfolio.py`
+
+This module manages all persistent state using SQLite — a simple file-based database that doesn't require a separate server.
+
+### The Database Tables
+
+```
+positions (currently held stocks):
+  - id, ticker, exchange, quantity, entry_price, entry_time
+  - stop_loss, take_profit, trade_type, sector
+
+trades (completed, closed trades):
+  - id, ticker, exchange, quantity
+  - entry_price, exit_price, entry_time, exit_time
+  - trade_type, sector, reasoning
+
+daily_summary (end-of-day snapshots):
+  - date, portfolio_value, daily_pnl, daily_pnl_pct
+  - num_trades, winning_trades, losing_trades
+
+signals (every signal ever generated — audit trail):
+  - ticker, action, confidence, prices, reasoning
+  - source (screener/ai), timestamp
+```
+
+### Key Operations
+
+**`add_position(position)`** — When a trade fills, save it to the positions table.
+
+**`close_position(ticker, exit_price)`** — When closing a trade:
+1. Read the position from the positions table
+2. Create a Trade record with entry AND exit info
+3. Insert into trades table
+4. Delete from positions table
+5. All in one transaction (either everything succeeds or nothing does)
+
+**`get_daily_pnl()`** — Calculate today's realized P&L by summing all trades closed today.
+
+**`record_signal(signal)`** — Save every signal for audit trail. Even rejected ones. Useful for backtesting analysis: "How often did we reject signals that would have been profitable?"
+
+### Transaction Safety
+
+All database operations use Python's context manager pattern:
+
+```python
+with _db_connection(db_path) as conn:
+    conn.execute("INSERT INTO positions ...")
+    # If an error happens here, everything rolls back automatically
+```
+
+This prevents half-written data if the system crashes mid-operation.
+
+---
+
+## 15. Logging & Dashboard — `core/logger.py`
+
+### Log Files
+
+Every day creates a new log file: `logs/trader_2026-04-01.log`
+
+Logs include timestamps, log levels, and which module generated the message:
+```
+2026-04-01 16:45:32 INFO  [scheduler] Scan cycle started - US market
+2026-04-01 16:45:33 INFO  [screener] 12 candidates from 287 stocks
+2026-04-01 16:45:58 INFO  [analyst] AAPL: BUY confidence=78
+2026-04-01 16:45:59 WARNING [risk] TSLA rejected: daily loss limit
+```
+
+### Trade Journal
+
+Every completed trade gets written to a CSV: `logs/trades_2026-04-01.csv`
+
+This creates a paper trail you can open in Excel or Google Sheets to review your trading performance.
+
+### Rich Terminal Dashboard
+
+When the system runs, it displays a styled dashboard in your terminal using the Rich library:
+
+```
+┌─ Portfolio Summary ─────────────────────────┐
+│ Value: $105,234.50  Daily P&L: +$1,234.50   │
+│ Open Positions: 4    Win Rate: 65%           │
+└─────────────────────────────────────────────┘
+
+┌─ Open Positions ────────────────────────────┐
+│ AAPL  100 shares  +2.3%  $+405.00           │
+│ MSFT   50 shares  -0.8%  $-162.00           │
+│ NVDA   30 shares  +4.1%  $+891.00           │
+└─────────────────────────────────────────────┘
+
+┌─ Scan Results ──────────────────────────────┐
+│ GOOGL  BUY   Score: 72  RSI oversold + MACD │
+│ AMZN   SELL  Score: 65  Bollinger breach     │
+└─────────────────────────────────────────────┘
+```
+
+---
+
+## 16. Notifications — `notifications/telegram.py`
+
+Sends alerts to your phone via Telegram. You create a Telegram bot (using @BotFather), get a token, and the system sends messages through it.
+
+### Notification Types
+
+- **Trade opened** — "BUY 100 AAPL @ $175.50 | SL: $170.00 | TP: $185.00"
+- **Trade closed** — "SOLD 100 AAPL @ $183.20 | P&L: +$770.00 (+4.4%)"
+- **Daily summary** — End-of-day report with total P&L, trades, win rate
+- **Risk warning** — "Daily loss limit reached. Trading halted."
+- **Error** — "IBKR connection lost. Attempting reconnect."
+- **Scan summary** — "Scanned 287 stocks → 12 candidates → 3 AI approved → 2 orders placed"
+
+### Design
+
+Notifications are fire-and-forget. If Telegram is down or the token is missing, the error is logged but the system keeps trading. Notifications are nice-to-have, not critical path.
+
+---
+
+## 17. Backtesting Engine — `backtest/engine.py`
+
+The backtester answers: "If this strategy had been running for the last 6 months, how would it have performed?"
+
+### The Key Insight
+
+The backtester uses the **exact same screener and risk manager code** as live trading. It doesn't have a separate "backtest version" of the screener. This means what you backtest IS what you'll run live. No surprises.
+
+The only things that differ:
+- **Data source**: YFinance instead of IBKR (no connection needed)
+- **Execution**: Simulated fills instead of real orders
+- **Slippage**: Adds 0.1% slippage to simulate real-world execution
+- **Commission**: Adds $1 per trade
+
+### How It Works
+
+```
+Day-by-day replay:
+
+For each trading day in the date range:
+  1. CHECK EXITS — Do any open positions hit their stop-loss or take-profit?
+     Look at today's high and low:
+       - If high >= take_profit → close at take_profit (win!)
+       - If low <= stop_loss → close at stop_loss (loss)
+
+  2. BUILD DATA — Gather all price history UP TO today (not including future!)
+     This is critical: NO LOOK-AHEAD BIAS.
+     On March 15, the screener only sees data through March 15.
+
+  3. SCREEN — Run the same screener with same settings
+
+  4. RISK CHECK — Run the same risk manager
+
+  5. SIMULATE FILL — "Buy" at today's close price + slippage
+
+  6. RECORD EQUITY — Write down portfolio value at end of day
+
+After all days:
+  Close any remaining open positions at last day's close
+  Calculate performance metrics
+```
+
+### No Look-Ahead Bias
+
+This is the #1 sin of backtesting: accidentally using future data to make past decisions. Our protection:
+
+```python
+# Only use data up to current date
+historical = full_data[full_data.index <= current_date]
+candidates = screen_stocks(historical)  # screener only sees past
+```
+
+The screener genuinely doesn't know what happens tomorrow.
+
+### SimulatedPortfolio
+
+An in-memory portfolio that tracks:
+- Cash remaining
+- Open positions
+- Closed trades
+- Equity curve (portfolio value at end of each day)
+
+No SQLite needed — it's all in memory since it's just a simulation.
+
+---
+
+## 18. Backtest Reporting — `backtest/report.py`
+
+Takes the results from the backtester and calculates professional performance metrics.
+
+### Metrics Calculated
+
+| Metric | What It Means |
+|--------|---------------|
+| **Total Return** | If you started with $100K, how much did you end with? |
+| **Annualized Return** | Total return normalized to a yearly rate |
+| **Sharpe Ratio** | Return per unit of risk. >1 is good, >2 is great, <0 is losing money |
+| **Max Drawdown** | Worst peak-to-trough decline. "At worst, I was down X% from my best" |
+| **Win Rate** | What % of trades were profitable |
+| **Profit Factor** | Total profits / total losses. >1 means profitable overall |
+| **Avg Trade P&L** | Average profit/loss per trade |
+| **Best/Worst Trade** | Your biggest win and biggest loss |
+| **Avg Duration** | How long trades are held on average |
+
+### Comparison Feature
+
+You can run multiple backtests with different settings and compare them side by side:
+
+```bash
+python main.py --mode backtest --tickers AAPL MSFT GOOGL --capital 100000
+```
+
+---
+
+## 19. The Entry Point — `main.py`
+
+This is where everything starts. It parses command-line arguments and routes to the right mode.
+
+### Command Line Usage
+
+```bash
+# Paper trading (default — safe, uses fake money)
+python main.py
+
+# Single scan cycle (run once and exit)
+python main.py --once
+
+# Dry run (full pipeline, but only LOG orders, don't place them)
+python main.py --mode dry-run
+
+# Live trading (REAL MONEY — requires confirmation)
+python main.py --mode live
+
+# Backtesting
+python main.py --mode backtest --backtest-tickers AAPL MSFT GOOGL
+
+# Backtest with date range
+python main.py --mode backtest --backtest-tickers AAPL --backtest-start 2025-01-01 --backtest-end 2025-12-31
+```
+
+### Live Mode Safety
+
+When you run `--mode live`, the system:
+1. Prints a big warning
+2. Shows your account details
+3. Asks you to type "CONFIRM LIVE" to proceed
+4. Connects to port 7496 (live) instead of 7497 (paper)
+
+This prevents accidentally trading with real money.
+
+### Startup Sequence
+
+```
+1. Parse arguments
+2. Setup logging (file + console)
+3. Load environment variables (.env)
+4. Initialize SQLite database (create tables if first run)
+5. If backtest mode → run backtester → display results → exit
+6. Connect to IBKR (paper or live port)
+7. Display account summary
+8. If --once → run single scan cycle → exit
+9. Otherwise → start scheduler loop (runs until Ctrl+C)
+```
+
+---
+
+## 20. Testing Strategy
+
+### Test Philosophy
+
+Every module has its own test file. Tests use **synthetic data** — hand-built DataFrames and mock objects — so they don't need an IBKR connection or internet access.
+
+### What's Tested
+
+| Test File | What It Verifies |
+|-----------|-----------------|
+| `test_screener.py` | Each indicator triggers correctly on crafted price data |
+| `test_risk.py` | Each safety check accepts/rejects correctly |
+| `test_analyst.py` | Prompt building, response parsing, validation |
+| `test_data.py` | Data fetching, caching, column normalization |
+| `test_connection.py` | Contract creation, connection handling |
+| `test_portfolio.py` | DB operations, position lifecycle |
+| `test_models.py` | Dataclass construction, computed properties (P&L, duration) |
+| `test_universe.py` | Universe building, filtering, caching |
+| `test_backtest.py` | Full backtest loop, exit checking, no look-ahead |
+
+### Running Tests
+
+```bash
+# Run all tests
+pytest tests/
+
+# Run one file with verbose output
+pytest tests/test_screener.py -v
+
+# Run one specific test
+pytest tests/test_risk.py::test_daily_loss_limit -v
+```
+
+---
+
+## 21. Challenges We Faced & How We Solved Them
+
+### Challenge 1: Cloud AI Was Too Expensive
+
+**The problem**: The original design used cloud AI APIs (Claude, GPT) for stock analysis. Running 10-20 analyses every 15 minutes, all day long, would cost real money. And what if the API goes down during market hours?
+
+**The solution**: Switched to **Ollama** running **Qwen 2.5 7B** locally. Zero cost, zero internet dependency. The model runs on your own GPU/CPU. We had to rewrite the analyst module from cloud API calls to local HTTP calls, but the prompt structure stayed the same.
+
+**Tradeoff**: A 7B model isn't as smart as GPT-4 or Claude. But for stock analysis with structured data, it's good enough — and it's free.
+
+### Challenge 2: APScheduler vs ib_insync Event Loop
+
+**The problem**: We initially used APScheduler to run the scan cycle every 15 minutes. But `ib_insync` (the IBKR library) has its own asyncio event loop, and it requires all IBKR calls to happen on the main thread's event loop. APScheduler was running our scan function in a way that conflicted with this.
+
+**The symptoms**: Random connection drops, callbacks not firing, "not connected" errors in the middle of operations.
+
+**The solution**: Ripped out APScheduler entirely. Replaced it with a simple `while` loop using `ib.sleep()` — which sleeps while keeping ib_insync's event loop alive. Much simpler, much more reliable.
+
+**Lesson**: Sometimes a simple `while True` loop is better than a fancy scheduler library.
+
+### Challenge 3: AI Rejecting Valid "Hold" Responses
+
+**The problem**: When the AI analyst decided a stock wasn't worth trading (HOLD), it would return `action: "hold"` with no prices (no entry, stop-loss, or take-profit — because there's no trade to make). But our validation code required prices for ALL responses and was rejecting these as "invalid."
+
+**The symptoms**: Every HOLD response was logged as a validation failure. The AI was working correctly, but we were throwing away its valid "no trade" decisions.
+
+**The solution**: Updated validation to skip price checks when action is HOLD. Null prices are perfectly fine for holds — there IS no trade. Also promoted these validation failures from DEBUG to WARNING level so we'd actually notice them in the logs.
+
+### Challenge 4: Multi-Market Complexity (BIST)
+
+**The problem**: The original design supported both US and Turkish (BIST) markets. But BIST had different trading hours, different currency (TRY), different data sources, different contract types, and different sector classifications. Every module needed `if market == "BIST"` branches.
+
+**The symptoms**: Complexity in 10+ files. Edge cases everywhere. BIST data was less reliable. The effort to maintain two markets was slowing down development of core features.
+
+**The solution**: Made the strategic decision to **remove BIST entirely** and focus exclusively on US stocks. Deleted 54 lines of BIST-specific code across 10 files. The codebase became dramatically simpler.
+
+**Lesson**: It's better to do one market really well than two markets poorly.
+
+### Challenge 5: Small Stock Universe
+
+**The problem**: Initially, the universe builder ran just 1-2 IBKR scanner types, which returned maybe 50 stocks. That's a tiny pool to find trading opportunities in.
+
+**The solution**: Expanded to **10 different scanner types** (most active, top gainers, top losers, hot by volume, gap ups/downs, 13-week highs/lows, top trade count/rate). Each returns different stocks, so after deduplication, we get 200-350 unique stocks. Much better coverage.
+
+**Additionally**: Added a static fallback list of ~100 well-known stocks. Even if all IBKR scanners fail, the system has stocks to screen.
+
+### Challenge 6: Candidate Cap Was Limiting Opportunities
+
+**The problem**: The screener originally capped candidates at 20 (the top 20 scores). This meant stocks scoring #21 never got analyzed by the AI, even if they were great opportunities.
+
+**The solution**: Removed the cap entirely. ALL stocks above the minimum score get passed to the AI analyst. The AI is smart enough to reject bad ones (that's its job). Why have a dumb numeric cutoff do the AI's job?
+
+**Tradeoff**: More AI analyses per cycle = slightly longer scan time. But with a local model, there's no cost penalty, just time (~2-3 seconds per analysis).
+
+### Challenge 7: IBKR Connection Instability
+
+**The problem**: IBKR's TWS/Gateway connections drop randomly. Network hiccup? Connection lost. TWS auto-restarts? Connection lost. IBKR does daily server resets around midnight? Connection lost.
+
+**The solution**: The `ensure_connected()` function at the top of every scan cycle. Before doing anything, check the connection. If it's dead, reconnect. Plus: the graceful shutdown handler sets a `_shutting_down` flag to prevent the reconnection logic from fighting a deliberate disconnect (this was a bug where Ctrl+C would try to reconnect instead of shutting down).
+
+### Challenge 8: Financial Sector Stocks Slipping Through
+
+**The problem**: IBKR's sector data isn't always reliable. Sometimes a bank stock would have sector = "N/A" or a wrong sector, passing through the universe filter.
+
+**The solution**: **Double filtering**. The universe builder filters by sector at build time. Then the risk manager has its OWN `check_excluded_sector()` that catches any stragglers. Belt AND suspenders. Also added an explicit exclusion list of ~40 specific tickers known to be problematic.
+
+---
+
+## 22. Architecture Decisions & Why
+
+### "Pure Functions" for Screener and Risk Manager
+
+**Decision**: The screener and risk manager never fetch data. They receive data as function arguments.
+
+**Why**: The backtester needs to run the same logic on historical data. If the screener fetched live data internally, the backtester would need a separate "backtest screener" with duplicate logic. Pure functions mean ONE screener for both live and backtest. Change a rule, and it changes everywhere.
+
+### Local AI Instead of Cloud
+
+**Decision**: Use Ollama + Qwen 2.5 7B running locally instead of Claude/GPT APIs.
+
+**Why**: Cost and reliability. 10-20 analyses every 15 minutes × 6.5 hours per trading day × 252 trading days = ~100,000+ analyses per year. Even at $0.01 each, that's $1,000/year. Local is $0. Plus no outage risk during market hours.
+
+### SQLite Instead of PostgreSQL
+
+**Decision**: SQLite file-based database instead of a proper database server.
+
+**Why**: This is a single-user system running on one machine. There's no concurrent access, no need for network database, no complex queries. SQLite is zero-config, zero-maintenance, and the database is just a file you can back up by copying it.
+
+### Bracket Orders
+
+**Decision**: Every trade is placed as a bracket order (entry + take-profit + stop-loss).
+
+**Why**: Atomicity. With separate orders, there's a window where you have a position but no stop-loss (if the system crashes between placing the entry and the stop-loss). With bracket orders, IBKR handles all three as a unit. Your stop-loss exists from the very first moment.
+
+### Paper Mode as Default
+
+**Decision**: `--mode paper` is the default. Live requires explicit `--mode live` AND typing "CONFIRM LIVE".
+
+**Why**: The worst bug in a trading system is accidentally trading with real money. Two barriers (flag + confirmation) make this extremely unlikely.
+
+### Turkey Timezone
+
+**Decision**: All times are in `Europe/Istanbul` timezone.
+
+**Why**: The developer is in Turkey. US market hours are 16:30-23:00 TRT. Rather than constantly converting, everything uses local time.
+
+---
+
+## 23. The Complete Data Flow
+
+Here's the entire system in one diagram, showing exactly what data flows where:
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                         main.py                                 │
+│                    (parse args, pick mode)                       │
+└─────────────────────────┬───────────────────────────────────────┘
+                          │
+            ┌─────────────┼────────────────┐
+            │             │                │
+         BACKTEST      PAPER/LIVE       DRY-RUN
+            │             │                │
+            ▼             ▼                ▼
+     ┌──────────┐  ┌──────────────────────────────────┐
+     │ YFinance │  │     scheduler.py (every 15 min)   │
+     │  (data)  │  │                                    │
+     └────┬─────┘  │  ┌─────────────────────────────┐  │
+          │        │  │ 1. ensure_connected()        │  │
+          │        │  │ 2. get_account_summary()     │  │
+          │        │  │ 3. build_universe()  ────────┼──┼──→ IBKR Scanners
+          │        │  │ 4. get_historical_data() ────┼──┼──→ IBKR Data
+          │        │  │ 5. screen_stocks()           │  │
+          │        │  │    ├─ check_rsi()            │  │
+          │        │  │    ├─ check_macd()           │  │
+          │        │  │    ├─ check_ma_crossover()   │  │
+          │        │  │    ├─ check_volume_spike()   │  │
+          │        │  │    ├─ check_bollinger()      │  │
+          │        │  │    └─ check_support_resist() │  │
+          │        │  │ 6. analyze_batch()  ─────────┼──┼──→ Ollama (local AI)
+          │        │  │    └─ per candidate:         │  │
+          │        │  │       ├─ build prompt        │  │
+          │        │  │       ├─ call LLM            │  │
+          │        │  │       └─ validate response   │  │
+          │        │  │ 7. evaluate() (risk mgr)     │  │
+          │        │  │    ├─ position size           │  │
+          │        │  │    ├─ daily loss limit        │  │
+          │        │  │    ├─ max positions           │  │
+          │        │  │    ├─ stop-loss valid         │  │
+          │        │  │    ├─ sector concentration    │  │
+          │        │  │    ├─ no duplicate            │  │
+          │        │  │    ├─ excluded sector         │  │
+          │        │  │    ├─ anti-momentum           │  │
+          │        │  │    ├─ trend confirmation      │  │
+          │        │  │    └─ risk/reward ratio       │  │
+          │        │  │ 8. place_order() ────────────┼──┼──→ IBKR (bracket order)
+          │        │  │ 9. add_position() ───────────┼──┼──→ SQLite
+          │        │  │ 10. notify_trade() ──────────┼──┼──→ Telegram
+          │        │  │ 11. log + dashboard ─────────┼──┼──→ Terminal + log file
+          │        │  └─────────────────────────────┘  │
+          │        └───────────────────────────────────┘
+          │
+          ▼
+   ┌──────────────┐
+   │  backtest/    │
+   │  engine.py    │
+   │              │
+   │  Same code:  │        ┌───────────────┐
+   │  screen_stocks() ────→│ backtest/      │
+   │  evaluate()      ────→│ report.py      │
+   │  (simulated fills)    │                │
+   │                       │ Sharpe ratio   │
+   │  Day-by-day replay    │ Max drawdown   │
+   │  No look-ahead!       │ Win rate       │
+   └──────────────┘        │ Profit factor  │
+                           └───────────────┘
+```
+
+---
+
+## Final Notes
+
+This system was built iteratively over 8 milestones, with each one building on the previous. The code evolved through real-world challenges — switching from cloud to local AI, removing multi-market complexity, fixing event loop conflicts, and tightening discipline rules.
+
+The core philosophy throughout has been:
+- **Safety first** — Paper mode default, daily loss limits, bracket orders, multiple confirmation layers
+- **Same code everywhere** — Pure functions mean the backtester uses identical logic to live trading
+- **Simplicity over cleverness** — SQLite over Postgres, while loop over scheduler framework, local AI over cloud
+- **Graceful degradation** — Always have a fallback (cache, static list, retry)
+
+The system is currently fully operational in paper trading mode (Milestones 1-7 complete). Options support (Milestone 8) is planned for the future.

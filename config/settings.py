@@ -64,6 +64,7 @@ MAX_SECTOR_CONCENTRATION_PCT = 25.0
 ANTI_MOMENTUM_PCT = 5.0         # Reject if price moved >5% from signal entry
 TREND_CONFIRMATION = True       # Require MA5 > MA10 > MA20 alignment for buys
 MIN_RISK_REWARD_RATIO = 1.5     # Minimum reward/risk ratio
+ALLOW_SHORT_SELLING = False     # Block sell signals for stocks not currently held
 
 # ---------------------------------------------------------------------------
 # Day Trading
