@@ -693,7 +693,7 @@ This is **atomic** — all three orders are placed as a unit. You never end up w
 
 ### Key Functions
 
-**`place_order(ib, signal, quantity, dry_run)`** — The main function. Creates a bracket order from the signal's entry, stop-loss, and take-profit prices. In dry-run mode, it just logs what WOULD happen.
+**`place_order(ib, signal, quantity, dry_run)`** — The main function. Creates a bracket order from the signal's entry, stop-loss, and take-profit prices. All legs use `tif='GTC'` (Good Till Cancelled) so orders placed outside market hours persist and execute at market open. In dry-run mode, it just logs what WOULD happen.
 
 **`close_position_market(ib, position, dry_run)`** — Immediately close a position with a market order. Used when day-trade positions need to be closed before market close.
 
@@ -723,14 +723,14 @@ US Market: 16:30 - 23:00 Turkey time (9:30 AM - 4:00 PM Eastern)
 
 (The timezone is Turkey because that's where the developer is located.)
 
-It only runs scan cycles during market hours. On weekends, it sleeps.
+It only runs scan cycles during market hours. On weekends, it sleeps. With the `--force` flag, it bypasses both the market-open check and the end-of-day close check, allowing the full pipeline to run outside market hours (orders queue as GTC for the next open).
 
 ### The Scan Cycle — `run_scan_cycle()`
 
 This is the heart of the system. Called every 15 minutes:
 
 ```python
-def run_scan_cycle(ib, markets, mode="paper"):
+def run_scan_cycle(ib, markets, mode="paper", force=False):
     # 1. Make sure we're connected
     ensure_connected(ib, ...)
 
@@ -742,8 +742,13 @@ def run_scan_cycle(ib, markets, mode="paper"):
     # 3. Build today's universe (cached)
     universe = build_universe(ib, markets)
 
-    # 4. For each market that's currently open:
-    for market in get_active_markets(markets):
+    # 4. For each active market (or all markets if force=True):
+    for market in active_markets:
+
+        # 4.5 Close day trades near market close (skipped in force mode)
+        if not force and minutes_to_close(market) <= 15:
+            close_all_day_trades(ib, open_positions)
+            continue
 
         # 5. Fetch 60 days of data for every stock
         stock_data = {}
@@ -754,8 +759,8 @@ def run_scan_cycle(ib, markets, mode="paper"):
         # 6. Run the screener
         candidates = screen_stocks(stock_data)
 
-        # 7. AI analysis on candidates
-        ai_signals = analyze_batch(candidates, stock_data)
+        # 7. AI analysis on candidates (notifies Telegram immediately per signal)
+        ai_signals = analyze_batch(candidates, stock_data, on_signal=notify_ai_signal)
 
         # 8. Risk check and execute
         for signal in ai_signals:
@@ -764,10 +769,6 @@ def run_scan_cycle(ib, markets, mode="paper"):
                 place_order(ib, signal, result.position_size, dry_run=...)
                 add_position(...)
                 notify_trade(...)
-
-    # 9. Close day trades if near market close
-    if minutes_to_close(market) <= 15:
-        close_all_day_trades(ib, open_positions)
 ```
 
 ### The Main Loop — `start_scheduler()`
@@ -1035,6 +1036,12 @@ python main.py
 # Single scan cycle (run once and exit)
 python main.py --once
 
+# Force scan outside market hours (GTC orders queue for next open)
+python main.py --force
+
+# Watchdog mode — IBC manages gateway lifecycle, auto-reconnects after restarts
+python main.py --watchdog
+
 # Dry run (full pipeline, but only LOG orders, don't place them)
 python main.py --mode dry-run
 
@@ -1047,6 +1054,17 @@ python main.py --mode backtest --backtest-tickers AAPL MSFT GOOGL
 # Backtest with date range
 python main.py --mode backtest --backtest-tickers AAPL --backtest-start 2025-01-01 --backtest-end 2025-12-31
 ```
+
+### Watchdog Mode
+
+When you pass `--watchdog`, the system uses IBC (IB Controller) to manage the full IB Gateway lifecycle:
+
+1. IBC starts IB Gateway and logs in automatically (using credentials from `~/ibc/config.ini`)
+2. The `Watchdog` class from `ib_insync` monitors the connection
+3. When the gateway auto-restarts (daily restart at the configured time), the Watchdog detects the disconnect, waits for the gateway to come back, and reconnects automatically
+4. The scheduler continues running on the reconnected IB instance
+
+This is the recommended mode for unattended operation. It can also be run as a systemd service (see `~/.config/systemd/user/auto-trader.service`).
 
 ### Live Mode Safety
 
@@ -1066,10 +1084,11 @@ This prevents accidentally trading with real money.
 3. Load environment variables (.env)
 4. Initialize SQLite database (create tables if first run)
 5. If backtest mode → run backtester → display results → exit
-6. Connect to IBKR (paper or live port)
-7. Display account summary
-8. If --once → run single scan cycle → exit
-9. Otherwise → start scheduler loop (runs until Ctrl+C)
+6. If --watchdog → start IBC Watchdog (starts gateway, connects, monitors) → start scheduler on connect
+7. Otherwise → connect to IBKR directly (gateway must already be running)
+8. Display account summary
+9. If --once → run single scan cycle → exit
+10. Otherwise → start scheduler loop (runs until Ctrl+C)
 ```
 
 ---

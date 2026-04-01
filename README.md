@@ -46,6 +46,8 @@ Financial sector stocks (banks, insurance, lending companies) are automatically 
 - **Paper trading by default**: Live mode requires explicit opt-in with confirmation prompt
 - **Market hours awareness**: Respects US (16:30-23:00 TRT) trading hours
 - **Connection resilience**: Automatic reconnection to IBKR on connection drops with retry logic
+- **IBC Watchdog mode**: Optional auto-start of IB Gateway with automatic reconnection after daily restarts via IBC
+- **GTC bracket orders**: Orders placed outside market hours persist and execute at market open
 - **Zero AI cost**: Runs AI analysis locally via Ollama -- no cloud API fees
 
 ---
@@ -212,9 +214,22 @@ You need either TWS (Trader Workstation) or IB Gateway running on the same machi
    - **Uncheck** "Read-Only API" (the system needs to place orders)
    - Click OK/Apply
 
-4. **TWS/Gateway must be running** whenever the trading system is active. The system will fail to start if it cannot connect.
+4. **TWS/Gateway must be running** whenever the trading system is active. The system will fail to start if it cannot connect (unless using `--watchdog` mode, which starts the gateway automatically).
 
-### 3. Telegram Bot (for notifications)
+### 3. IBC (Optional — for unattended operation)
+
+[IBC](https://github.com/IbcAlpha/IBC) automates IB Gateway login and handles daily restarts. Required only for `--watchdog` mode.
+
+```bash
+# Download and install to ~/ibc
+curl -sL -o /tmp/IBCLinux.zip https://github.com/IbcAlpha/IBC/releases/latest/download/IBCLinux-3.23.0.zip
+mkdir -p ~/ibc && unzip -o /tmp/IBCLinux.zip -d ~/ibc
+chmod +x ~/ibc/scripts/*.sh ~/ibc/*.sh
+```
+
+Edit `~/ibc/config.ini` and set your IBKR credentials (`IbLoginId`, `IbPassword`), trading mode, and auto-restart time.
+
+### 4. Telegram Bot (for notifications)
 
 1. Open Telegram and message [@BotFather](https://t.me/BotFather)
 2. Send `/newbot` and follow the prompts to create a bot
@@ -225,7 +240,7 @@ You need either TWS (Trader Workstation) or IB Gateway running on the same machi
    ```
 5. Find your **chat_id** in the response JSON under `result[0].message.chat.id`
 
-### 4. Ollama (Local AI)
+### 5. Ollama (Local AI)
 
 The AI analyst runs locally via Ollama -- no cloud API keys needed.
 
@@ -239,7 +254,7 @@ ollama pull qwen2.5:7b
 
 Ollama must be running whenever the trading system is active. It starts automatically as a system service after installation.
 
-### 5. API Keys (Optional)
+### 6. API Keys (Optional)
 
 | Service | Purpose | Where to get |
 |---------|---------|-------------|
@@ -316,6 +331,16 @@ All trading parameters are configured in `config/settings.py`. Key settings:
 | `IBKR_HOST` | `127.0.0.1` | TWS/Gateway host |
 | `IBKR_PORT` | `7497` | Socket port (7497=paper, 7496=live) |
 | `IBKR_CLIENT_ID` | `1` | Client ID for API connection |
+
+#### IBC Settings (for `--watchdog` mode)
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `IBC_PATH` | `~/ibc` | Path to IBC installation |
+| `IBC_INI` | `~/ibc/config.ini` | Path to IBC configuration file |
+| `TWS_PATH` | `~/Jts` | Path to TWS/Gateway installation |
+| `TWS_VERSION` | `1037` | IB Gateway major version number |
+| `IBC_USERID` | (empty) | IBKR username (overrides config.ini) |
+| `IBC_PASSWORD` | (empty) | IBKR password (overrides config.ini) |
 
 #### Market Settings
 | Parameter | Default | Description |
@@ -396,6 +421,15 @@ python main.py --mode backtest --backtest-tickers AAPL MSFT GOOGL --backtest-sta
 # Backtest with custom initial capital
 python main.py --mode backtest --capital 50000
 
+# Force scan outside market hours (orders queue for next open as GTC)
+python main.py --force
+
+# Watchdog mode — IBC auto-starts gateway and reconnects after daily restarts
+python main.py --watchdog
+
+# Combine flags
+python main.py --watchdog --force
+
 # Live trading (requires explicit confirmation)
 python main.py --mode live
 ```
@@ -407,6 +441,8 @@ python main.py --mode live
 | `--mode` | `paper`, `live`, `backtest`, `dry-run` | `paper` | Trading mode |
 | `--market` | `us`, `all` | `all` | Markets to trade |
 | `--once` | flag | off | Run single scan then exit |
+| `--force` | flag | off | Bypass market hours check (GTC orders queue for next open) |
+| `--watchdog` | flag | off | Use IBC to auto-start gateway and reconnect on restarts |
 | `--backtest-tickers` | space-separated tickers | default list | Tickers for backtesting |
 | `--backtest-start` | `YYYY-MM-DD` | 1 year ago | Backtest start date |
 | `--backtest-end` | `YYYY-MM-DD` | today | Backtest end date |
@@ -822,6 +858,7 @@ This system is designed with multiple layers of safety:
 - The system automatically attempts reconnection (3 retries, 5s delay)
 - TWS/Gateway may drop connections after inactivity -- this is normal IBKR behavior
 - If TWS was restarted, the system will reconnect on the next scan cycle
+- For unattended operation, use `--watchdog` mode which auto-restarts the gateway and reconnects
 
 ### IBKR Data Issues
 
