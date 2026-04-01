@@ -61,15 +61,15 @@ def test_position_pnl_none_when_no_current_price():
 
 def test_trade_pnl():
     trade = Trade(
-        ticker="THYAO",
-        exchange="BIST",
+        ticker="NVDA",
+        exchange="SMART",
         quantity=100,
         entry_price=200.0,
         exit_price=220.0,
         entry_time=datetime(2024, 1, 15, 10, 0),
         exit_time=datetime(2024, 1, 15, 14, 0),
         trade_type=TradeType.DAY,
-        sector="Industrials",
+        sector="Technology",
     )
     assert trade.pnl == 2000.0  # (220 - 200) * 100
     assert trade.pnl_pct == 10.0
@@ -99,18 +99,17 @@ def test_enums():
     assert TradeType.DAY.value == "day"
     assert TradeType.SWING.value == "swing"
     assert Market.US.value == "US"
-    assert Market.BIST.value == "BIST"
 
 
 def test_stock_info():
     info = StockInfo(
-        ticker="THYAO",
-        exchange="BIST",
-        sector="Industrials",
-        market_cap=5_000_000_000,
-        avg_volume=10_000_000,
-        currency="TRY",
-        name="Turkish Airlines",
+        ticker="AAPL",
+        exchange="SMART",
+        sector="Technology",
+        market_cap=3_000_000_000_000,
+        avg_volume=50_000_000,
+        currency="USD",
+        name="Apple Inc",
     )
-    assert info.ticker == "THYAO"
-    assert info.currency == "TRY"
+    assert info.ticker == "AAPL"
+    assert info.currency == "USD"

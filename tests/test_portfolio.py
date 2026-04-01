@@ -55,12 +55,12 @@ class TestPositions:
     def test_multiple_positions(self, db_path):
         add_position(_make_position(ticker="AAPL"), db_path)
         add_position(_make_position(ticker="MSFT", entry_price=300.0), db_path)
-        add_position(_make_position(ticker="THYAO", exchange="BIST"), db_path)
+        add_position(_make_position(ticker="NVDA", entry_price=800.0), db_path)
 
         positions = get_open_positions(db_path)
         assert len(positions) == 3
         tickers = {p.ticker for p in positions}
-        assert tickers == {"AAPL", "MSFT", "THYAO"}
+        assert tickers == {"AAPL", "MSFT", "NVDA"}
 
     def test_close_position(self, db_path):
         add_position(_make_position(ticker="AAPL"), db_path)

@@ -251,7 +251,7 @@ def run_backtest(config: BacktestConfig) -> SimulatedPortfolio:
                 hist = df[df.index <= current_date]
 
             if len(hist) >= warmup:
-                exchange = "BIST" if config.market == "BIST" else "SMART"
+                exchange = "SMART"
                 stock_data[ticker] = (exchange, hist)
 
         # Step 3: Run screener

@@ -113,18 +113,13 @@ def get_historical_data_yfinance(
     interval: str = "1d",
     market: str = "US",
 ) -> pd.DataFrame:
-    """Fetch historical data via YFinance. Fallback for backtest mode.
-
-    For BIST tickers, auto-appends .IS suffix if not present.
-    """
+    """Fetch historical data via YFinance. Fallback for backtest mode."""
     cache_key = f"yf:{ticker}:{market}:{period}:{interval}"
     cached = _cache_get(cache_key)
     if cached is not None:
         return cached
 
     yf_ticker = ticker
-    if market.upper() == "BIST" and not ticker.endswith(".IS"):
-        yf_ticker = f"{ticker}.IS"
 
     try:
         data = yf.download(yf_ticker, period=period, interval=interval, progress=False)
@@ -224,8 +219,6 @@ def get_news(ticker: str, market: str = "US", max_results: int = 5) -> list[str]
         client = TavilyClient(api_key=TAVILY_API_KEY)
 
         query = f"{ticker} stock"
-        if market.upper() == "BIST":
-            query = f"{ticker} BIST hisse"
 
         response = client.search(query, max_results=max_results, search_depth="basic")
         headlines = [r.get("title", "") for r in response.get("results", [])]

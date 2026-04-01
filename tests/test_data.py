@@ -45,11 +45,6 @@ class TestYFinanceFallback:
                 col in df.columns for col in ["open", "high", "low", "close", "volume"]
             )
 
-    def test_fetch_bist_stock(self):
-        df = get_historical_data_yfinance("THYAO", period="5d", interval="1d", market="BIST")
-        assert isinstance(df, pd.DataFrame)
-        # BIST data may be unavailable on some systems, so just check it doesn't crash
-
     def test_invalid_ticker(self):
         df = get_historical_data_yfinance("ZZZZZZZNOTREAL", period="5d")
         assert isinstance(df, pd.DataFrame)

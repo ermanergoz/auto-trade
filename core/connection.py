@@ -76,15 +76,9 @@ def ensure_connected(
 def create_contract(ticker: str, exchange: str) -> Stock:
     """Create an ib_insync Stock contract for the given ticker and exchange.
 
-    US stocks use SMART routing; BIST stocks use BIST exchange with TRY currency.
+    US stocks use SMART routing for best execution.
     """
-    exchange_upper = exchange.upper()
-
-    if exchange_upper == "BIST":
-        return Stock(ticker, "BIST", "TRY")
-    else:
-        # US stocks — use SMART routing for best execution
-        return Stock(ticker, "SMART", "USD")
+    return Stock(ticker, "SMART", "USD")
 
 
 def qualify_contracts(ib: IB, contracts: list[Contract]) -> list[Contract]:

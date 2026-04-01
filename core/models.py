@@ -21,7 +21,6 @@ class TradeType(Enum):
 
 class Market(Enum):
     US = "US"
-    BIST = "BIST"
 
 
 @dataclass

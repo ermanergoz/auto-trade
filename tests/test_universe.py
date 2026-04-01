@@ -83,18 +83,6 @@ class TestStaticFallback:
         for s in stocks:
             assert not _is_financial_sector(s.sector), f"{s.ticker} is financial"
 
-    def test_bist_fallback_has_stocks(self):
-        stocks = _static_fallback("BIST")
-        assert len(stocks) > 20
-        tickers = {s.ticker for s in stocks}
-        assert "THYAO" in tickers
-        assert "EREGL" in tickers
-
-    def test_bist_fallback_no_financials(self):
-        stocks = _static_fallback("BIST")
-        for s in stocks:
-            assert not _is_financial_sector(s.sector), f"{s.ticker} is financial"
-
     def test_unknown_market(self):
         stocks = _static_fallback("MOON")
         assert stocks == []
@@ -110,7 +98,7 @@ class TestCacheIO:
 
         stocks = [
             StockInfo("AAPL", "SMART", "Technology", 3e12, 50e6, "USD", "Apple Inc"),
-            StockInfo("THYAO", "BIST", "Industrials", 5e9, 10e6, "TRY", "Turkish Airlines"),
+            StockInfo("MSFT", "SMART", "Technology", 2e12, 30e6, "USD", "Microsoft"),
         ]
         cache_universe(stocks, "TEST")
 
@@ -118,25 +106,14 @@ class TestCacheIO:
         assert loaded is not None
         assert len(loaded) == 2
         assert loaded[0].ticker == "AAPL"
-        assert loaded[1].ticker == "THYAO"
-        assert loaded[1].currency == "TRY"
+        assert loaded[1].ticker == "MSFT"
 
 
 class TestGetTickersForMarket:
     def test_filter_us(self):
         universe = [
             StockInfo("AAPL", "SMART", "Tech", 0, 0),
-            StockInfo("THYAO", "BIST", "Ind", 0, 0),
+            StockInfo("MSFT", "NYSE", "Tech", 0, 0),
         ]
         us = get_tickers_for_market(universe, "US")
-        assert len(us) == 1
-        assert us[0].ticker == "AAPL"
-
-    def test_filter_bist(self):
-        universe = [
-            StockInfo("AAPL", "SMART", "Tech", 0, 0),
-            StockInfo("THYAO", "BIST", "Ind", 0, 0),
-        ]
-        bist = get_tickers_for_market(universe, "BIST")
-        assert len(bist) == 1
-        assert bist[0].ticker == "THYAO"
+        assert len(us) == 2

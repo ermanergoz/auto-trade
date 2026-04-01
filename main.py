@@ -48,7 +48,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--market",
-        choices=["us", "bist", "all"],
+        choices=["us", "all"],
         default="all",
         help="Market to trade (default: all)",
     )
@@ -116,7 +116,7 @@ def run_backtest_mode(args: argparse.Namespace) -> None:
         ]
         console.print(f"Using default tickers: {', '.join(tickers)}")
 
-    market = "US" if args.market in ("us", "all") else "BIST"
+    market = "US"
 
     config = BacktestConfig(
         tickers=tickers,
