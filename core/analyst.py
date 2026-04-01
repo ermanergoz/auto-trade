@@ -243,12 +243,14 @@ def analyze_candidate(
 
 def analyze_batch(
     candidates: list[dict],
+    on_signal=None,
 ) -> list[Signal]:
     """Analyze a batch of screener candidates sequentially.
 
     Args:
         candidates: List of dicts with keys:
             ticker, exchange, df, indicator_values, news
+        on_signal: Optional callback called immediately when a signal is approved.
 
     Returns list of approved Signal objects.
     """
@@ -269,6 +271,8 @@ def analyze_batch(
                 "AI approved %s: %s confidence=%d",
                 signal.ticker, signal.action.value, signal.confidence,
             )
+            if on_signal:
+                on_signal(signal)
 
     logger.info(
         "AI analysis complete: %d/%d candidates approved",
