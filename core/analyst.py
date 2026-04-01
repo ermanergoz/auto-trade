@@ -154,7 +154,7 @@ def _call_llm(prompt: str, max_retries: int = 3) -> Optional[dict]:
             if result and _validate_response(result):
                 return result
             else:
-                logger.warning("Invalid LLM response on attempt %d", attempt)
+                logger.warning("Invalid LLM response on attempt %d: %s", attempt, result)
 
         except Exception as e:
             logger.warning("LLM call failed (attempt %d/%d): %s", attempt, max_retries, e)
@@ -165,16 +165,23 @@ def _call_llm(prompt: str, max_retries: int = 3) -> Optional[dict]:
 def _validate_response(data: dict) -> bool:
     """Validate LLM response has all required fields with valid values."""
     required = ["action", "confidence", "entry_price", "stop_loss", "take_profit", "reasoning"]
-    for field in required:
-        if field not in data:
-            return False
+    missing = [f for f in required if f not in data]
+    if missing:
+        logger.warning("LLM response missing fields: %s. Keys present: %s", missing, list(data.keys()))
+        return False
 
     if data["action"] not in ("buy", "sell", "hold"):
+        logger.warning("LLM response invalid action: %r", data["action"])
         return False
     if not isinstance(data["confidence"], (int, float)) or not (0 <= data["confidence"] <= 100):
+        logger.warning("LLM response invalid confidence: %r", data["confidence"])
         return False
-    if data["entry_price"] <= 0 or data["stop_loss"] <= 0 or data["take_profit"] <= 0:
-        return False
+    # Price fields are only required for buy/sell — holds legitimately have no prices
+    if data["action"] in ("buy", "sell"):
+        for price_field in ("entry_price", "stop_loss", "take_profit"):
+            if not isinstance(data[price_field], (int, float)) or data[price_field] <= 0:
+                logger.warning("LLM response invalid %s: %r", price_field, data[price_field])
+                return False
 
     return True
 
