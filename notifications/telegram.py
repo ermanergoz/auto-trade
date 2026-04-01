@@ -11,8 +11,6 @@ from core.models import Trade, DailySummary, Signal
 
 logger = logging.getLogger(__name__)
 
-_bot = None
-
 # Shared system state for "Whatsup" responses
 _system_status = {
     "phase": "initializing",
@@ -29,36 +27,31 @@ def update_status(phase: str, detail: str = "") -> None:
     _system_status["detail"] = detail
 
 
-def _get_bot():
-    """Lazy-init the Telegram bot."""
-    global _bot
-    if _bot is None:
-        if not TELEGRAM_BOT_TOKEN:
-            return None
-        from telegram import Bot
-        _bot = Bot(token=TELEGRAM_BOT_TOKEN)
-    return _bot
+def _run_async(coro):
+    """Run an async coroutine in a fresh event loop (thread-safe)."""
+    loop = asyncio.new_event_loop()
+    try:
+        return loop.run_until_complete(coro)
+    finally:
+        loop.close()
 
 
 def _send_sync(text: str) -> bool:
     """Send a message synchronously (fire-and-forget)."""
-    bot = _get_bot()
-    if not bot or not TELEGRAM_CHAT_ID:
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         logger.debug("Telegram not configured — skipping notification")
         return False
 
     try:
-        loop = asyncio.new_event_loop()
-        try:
-            loop.run_until_complete(
-                bot.send_message(
-                    chat_id=TELEGRAM_CHAT_ID,
-                    text=text,
-                    parse_mode="HTML",
-                )
+        from telegram import Bot
+        bot = Bot(token=TELEGRAM_BOT_TOKEN)
+        _run_async(
+            bot.send_message(
+                chat_id=TELEGRAM_CHAT_ID,
+                text=text,
+                parse_mode="HTML",
             )
-        finally:
-            loop.close()
+        )
         return True
     except Exception as e:
         logger.error("Telegram send failed: %s", e)
@@ -67,19 +60,13 @@ def _send_sync(text: str) -> bool:
 
 def _get_updates_sync(offset: Optional[int] = None) -> list:
     """Fetch new messages from Telegram."""
-    bot = _get_bot()
-    if not bot:
+    if not TELEGRAM_BOT_TOKEN:
         return []
 
     try:
-        loop = asyncio.new_event_loop()
-        try:
-            updates = loop.run_until_complete(
-                bot.get_updates(offset=offset, timeout=10)
-            )
-        finally:
-            loop.close()
-        return updates
+        from telegram import Bot
+        bot = Bot(token=TELEGRAM_BOT_TOKEN)
+        return _run_async(bot.get_updates(offset=offset, timeout=10))
     except Exception as e:
         logger.debug("Telegram get_updates failed: %s", e)
         return []

@@ -231,6 +231,7 @@ Why exclude financials? Banks and insurance companies behave very differently fr
 ```python
 SCAN_INTERVAL_MINUTES = 15         # Run the full pipeline every 15 min
 AI_CONFIDENCE_THRESHOLD = 70       # AI must be 70%+ confident
+AI_MAX_CANDIDATES = 20             # Max stocks sent to AI per cycle (0 = no limit)
 AI_MODEL = "qwen2.5:7b"           # The local AI model
 OLLAMA_HOST = "http://localhost:11434"  # Where Ollama runs
 ```

@@ -35,6 +35,9 @@ def setup_logging(mode: str) -> None:
             logging.StreamHandler(sys.stdout),
         ],
     )
+    # Suppress noisy HTTP request logs from Telegram polling
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+
     logger.info("Starting auto-trader in %s mode", mode)
 
 

@@ -11,6 +11,7 @@ from ib_insync import IB
 from config.settings import (
     SCAN_INTERVAL_MINUTES, TIMEZONE, MARKET_HOURS,
     CLOSE_DAY_TRADES_BEFORE_MARKET_CLOSE, CLOSE_MINUTES_BEFORE,
+    AI_MAX_CANDIDATES,
 )
 from core.connection import ensure_connected, create_contract, disconnect
 from core.data import get_historical_data, get_news, get_historical_data_yfinance
@@ -154,6 +155,14 @@ def run_scan_cycle(
 
         if not candidates:
             continue
+
+        # Limit candidates sent to AI (they're already sorted by score descending)
+        if AI_MAX_CANDIDATES > 0 and len(candidates) > AI_MAX_CANDIDATES:
+            logger.info(
+                "Capping AI analysis to top %d candidates (of %d)",
+                AI_MAX_CANDIDATES, len(candidates),
+            )
+            candidates = candidates[:AI_MAX_CANDIDATES]
 
         # Step 3: AI analysis
         ai_input = []

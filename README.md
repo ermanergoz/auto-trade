@@ -331,6 +331,7 @@ All trading parameters are configured in `config/settings.py`. Key settings:
 |-----------|---------|-------------|
 | `SCAN_INTERVAL_MINUTES` | `15` | Minutes between scan cycles |
 | `AI_CONFIDENCE_THRESHOLD` | `70` | Minimum AI confidence to act (0-100) |
+| `AI_MAX_CANDIDATES` | `20` | Max candidates sent to AI per cycle (0 = unlimited) |
 | `AI_MODEL` | `qwen2.5:7b` | Ollama model for analysis |
 
 #### Risk Settings
