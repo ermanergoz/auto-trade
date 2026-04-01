@@ -421,9 +421,8 @@ def _compute_atr(df: pd.DataFrame, period: int = 14) -> Optional[float]:
 def screen_stocks(
     stock_data: dict[str, tuple[str, pd.DataFrame]],
     min_score: float = 15.0,
-    max_candidates: int = 20,
 ) -> list[Signal]:
-    """Screen multiple stocks and return top candidates.
+    """Screen multiple stocks and return all candidates above min_score.
 
     This is a PURE FUNCTION — it does not fetch any data.
     The caller provides all data so the backtester can reuse this.
@@ -431,7 +430,6 @@ def screen_stocks(
     Args:
         stock_data: Dict mapping ticker -> (exchange, ohlcv_dataframe).
         min_score: Minimum screener score to include (0-100).
-        max_candidates: Max number of candidates to return.
 
     Returns:
         List of Signal objects sorted by score descending.
@@ -457,12 +455,11 @@ def screen_stocks(
         except Exception as e:
             logger.warning("Screening failed for %s: %s", ticker, e)
 
-    # Sort by score descending, take top N
     candidates.sort(key=lambda x: x[0], reverse=True)
-    top = [signal for _, signal in candidates[:max_candidates]]
+    result = [signal for _, signal in candidates]
 
     logger.info(
         "Screener found %d candidates (from %d stocks, min_score=%.0f)",
-        len(top), len(stock_data), min_score,
+        len(result), len(stock_data), min_score,
     )
-    return top
+    return result

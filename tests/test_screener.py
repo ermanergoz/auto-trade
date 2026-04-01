@@ -294,8 +294,8 @@ class TestScreenStocks:
             df = _make_df(closes, volumes)
             stock_data[f"STK{i:03d}"] = ("SMART", df)
 
-        signals = screen_stocks(stock_data, min_score=0.1, max_candidates=10)
-        assert len(signals) <= 10
+        signals = screen_stocks(stock_data, min_score=0.1)
+        assert len(signals) == 50
 
     def test_signals_sorted_by_score(self):
         stock_data = {}
