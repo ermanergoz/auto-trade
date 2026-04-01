@@ -1,6 +1,6 @@
 # Auto Trade
 
-An automated stock trading system that day-trades and swing-trades US (NYSE/NASDAQ) and Turkish (BIST) equities through Interactive Brokers. The system uses a two-stage pipeline: a fast technical screener filters thousands of stocks down to ~20 candidates, then a local AI model (via Ollama) performs deep analysis on only those candidates. A risk manager gates every trade before execution through IBKR.
+An automated stock trading system that day-trades and swing-trades US (NYSE/NASDAQ) equities through Interactive Brokers. The system uses a two-stage pipeline: a fast technical screener filters hundreds of stocks, then a local AI model (via Ollama) performs deep analysis on all qualifying candidates. A risk manager gates every trade before execution through IBKR.
 
 Financial sector stocks (banks, insurance, lending companies) are automatically excluded from all trading.
 
@@ -33,8 +33,8 @@ Financial sector stocks (banks, insurance, lending companies) are automatically 
 
 ## Features
 
-- **Multi-market support**: Trades both US (NYSE/NASDAQ) and Turkish (BIST) equities through a single IBKR account
-- **Two-stage screening pipeline**: Technical screener (fast, free) filters thousands of stocks, then AI analyst performs deep analysis on ~20 candidates per market
+- **US market focus**: Trades US (NYSE/NASDAQ) equities through IBKR with 10 different scanner types for broad market coverage
+- **Two-stage screening pipeline**: Technical screener (fast, free) filters hundreds of stocks, then AI analyst performs deep analysis on all qualifying candidates
 - **AI-powered analysis**: Local LLM via Ollama (Qwen 2.5 7B by default) -- no API keys, no cost, fully offline
 - **Comprehensive risk management**: Position sizing, daily loss limits, sector concentration limits, mandatory stop-losses, and duplicate position prevention
 - **Bracket order execution**: Automatic stop-loss and take-profit orders attached to every trade via IBKR bracket orders
@@ -44,7 +44,7 @@ Financial sector stocks (banks, insurance, lending companies) are automatically 
 - **Rich terminal dashboard**: Live position tracking, P&L display, scan results, and portfolio summary using Rich
 - **SQLite persistence**: Full audit trail of positions, trades, signals, and daily summaries
 - **Paper trading by default**: Live mode requires explicit opt-in with confirmation prompt
-- **Market hours awareness**: Respects BIST (10:00-18:00 TRT) and US (16:30-23:00 TRT) trading hours with overlap handling
+- **Market hours awareness**: Respects US (16:30-23:00 TRT) trading hours
 - **Connection resilience**: Automatic reconnection to IBKR on connection drops with retry logic
 - **Zero AI cost**: Runs AI analysis locally via Ollama -- no cloud API fees
 
@@ -55,7 +55,7 @@ Financial sector stocks (banks, insurance, lending companies) are automatically 
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │                        Scheduler                            │
-│  (Runs during BIST: 10:00-18:00 TRT, US: 16:30-23:00 TRT) │
+│        (Runs during US: 16:30-23:00 TRT)                    │
 └─────────┬───────────────────────────────────┬───────────────┘
           │                                   │
   ┌───────▼────────┐                 ┌────────▼───────┐
@@ -74,7 +74,7 @@ Financial sector stocks (banks, insurance, lending companies) are automatically 
           │                                   │
   ┌───────▼────────┐                          │
   │  Technical      │                          │
-  │  Screener       │  Candidates (~10-20)    │
+  │  Screener       │  All candidates          │
   │  (RSI, MACD,    ├──────────┐              │
   │   MA, Volume,   │          │              │
   │   Bollinger)    │          │              │
@@ -111,10 +111,10 @@ The screener and risk manager are written as **pure functions** that accept data
 
 Each scan cycle (every 15 minutes by default) executes the following pipeline:
 
-1. **Market hours check** -- Determine which markets (US, BIST, or both) are currently open
-2. **Universe building** -- Build/load the tradeable stock list (cached daily), filtering out financial sector stocks and applying liquidity thresholds
+1. **Market hours check** -- Determine if the US market is currently open
+2. **Universe building** -- Build/load the tradeable stock list (cached daily) using 10 IBKR scanner types, filtering out financial sector stocks and applying liquidity thresholds. Typical result: ~200-350 unique stocks
 3. **Data fetching** -- Fetch historical OHLCV data for all stocks in the universe from IBKR (or YFinance fallback)
-4. **Technical screening** -- Run 6 technical indicators on every stock, score candidates, and select the top ~10-20 per market
+4. **Technical screening** -- Run 6 technical indicators on every stock, score candidates, and pass all qualifying stocks (above min_score) to AI analysis
 5. **AI analysis** -- Send each candidate to the local LLM (via Ollama) with price action, indicators, and news context; receive structured trade recommendations with confidence scores
 6. **Risk evaluation** -- Pass every AI-approved signal through 6 risk checks (position size, daily loss, max positions, stop-loss, sector concentration, no duplicates)
 7. **Order execution** -- Place bracket orders (entry + stop-loss + take-profit) through IBKR for approved signals
@@ -277,7 +277,6 @@ cp .env.example .env
 | `pandas-ta` | >= 0.3.14b | Technical indicators (RSI, MACD, Bollinger, etc.) |
 | `python-telegram-bot` | >= 20.7 | Telegram notification bot |
 | `python-dotenv` | >= 1.0.0 | Environment variable loading |
-| `apscheduler` | >= 3.10.4 | Job scheduling for scan cycles |
 | `rich` | >= 13.7.0 | Terminal UI, tables, and dashboard |
 | `tavily-python` | >= 0.3.0 | News API integration |
 | `pytest` | >= 7.4.0 | Test framework |
@@ -321,7 +320,7 @@ All trading parameters are configured in `config/settings.py`. Key settings:
 #### Market Settings
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `MARKETS` | `["US", "BIST"]` | Active markets |
+| `MARKETS` | `["US"]` | Active markets |
 | `TIMEZONE` | `Europe/Istanbul` | Time zone for market hours |
 | `EXCLUDED_SECTORS` | `["Financials"]` | Sectors to exclude from trading |
 | `MIN_DAILY_VOLUME` | `100,000` | Minimum average daily volume |
@@ -383,9 +382,6 @@ python main.py
 # Trade only US market
 python main.py --market us
 
-# Trade only BIST market
-python main.py --market bist
-
 # Dry-run mode (full pipeline, logs what it would trade, no actual orders)
 python main.py --mode dry-run
 
@@ -407,7 +403,7 @@ python main.py --mode live
 | Argument | Values | Default | Description |
 |----------|--------|---------|-------------|
 | `--mode` | `paper`, `live`, `backtest`, `dry-run` | `paper` | Trading mode |
-| `--market` | `us`, `bist`, `all` | `all` | Markets to trade |
+| `--market` | `us`, `all` | `all` | Markets to trade |
 | `--once` | flag | off | Run single scan then exit |
 | `--backtest-tickers` | space-separated tickers | default list | Tickers for backtesting |
 | `--backtest-start` | `YYYY-MM-DD` | 1 year ago | Backtest start date |
@@ -472,7 +468,7 @@ The screener runs 6 technical indicators on every stock in the universe and scor
 
 ### Scoring
 
-Each triggered indicator contributes to the candidate's score. The screener counts buy signals vs sell signals, determines the dominant direction, and calculates a confidence score (0-100). Stocks are ranked by score and the top candidates (typically 10-20 per market) are passed to the AI analyst.
+Each triggered indicator contributes to the candidate's score. The screener counts buy signals vs sell signals, determines the dominant direction, and calculates a confidence score (0-100). All stocks scoring above the minimum threshold (default: 15) are passed to the AI analyst — there is no hard cap on the number of candidates.
 
 Stop-loss and take-profit levels are calculated using ATR (Average True Range) for volatility-adjusted sizing.
 
@@ -627,7 +623,7 @@ The system uses SQLite (stored at `data/portfolio.db`) with WAL mode enabled for
 |--------|------|-------------|
 | `id` | INTEGER PK | Auto-increment ID |
 | `ticker` | TEXT | Stock ticker symbol |
-| `exchange` | TEXT | Exchange (US/BIST) |
+| `exchange` | TEXT | Exchange (SMART/NYSE/NASDAQ) |
 | `quantity` | INTEGER | Number of shares |
 | `entry_price` | REAL | Entry price per share |
 | `entry_time` | TEXT | ISO timestamp |
@@ -641,7 +637,7 @@ The system uses SQLite (stored at `data/portfolio.db`) with WAL mode enabled for
 |--------|------|-------------|
 | `id` | INTEGER PK | Auto-increment ID |
 | `ticker` | TEXT | Stock ticker symbol |
-| `exchange` | TEXT | Exchange (US/BIST) |
+| `exchange` | TEXT | Exchange (SMART/NYSE/NASDAQ) |
 | `quantity` | INTEGER | Number of shares |
 | `entry_price` | REAL | Entry price per share |
 | `exit_price` | REAL | Exit price per share |
@@ -668,7 +664,7 @@ The system uses SQLite (stored at `data/portfolio.db`) with WAL mode enabled for
 | `id` | INTEGER PK | Auto-increment ID |
 | `timestamp` | TEXT | ISO timestamp |
 | `ticker` | TEXT | Stock ticker symbol |
-| `exchange` | TEXT | Exchange (US/BIST) |
+| `exchange` | TEXT | Exchange (SMART/NYSE/NASDAQ) |
 | `action` | TEXT | BUY/SELL/HOLD |
 | `confidence` | REAL | Confidence score (0-100) |
 | `entry_price` | REAL | Suggested entry price |
@@ -828,11 +824,6 @@ This system is designed with multiple layers of safety:
 - The system batches and caches requests, but very large universes may hit this limit
 - Reduce universe size or increase `SCAN_INTERVAL_MINUTES`
 
-**BIST tickers not resolving**
-- BIST stocks use the "BIST" exchange with "TRY" currency in IBKR
-- The `.IS` suffix is only used for YFinance (backtest fallback)
-- Some tickers may need `qualifyContracts()` -- the connection module handles this automatically
-
 ### AI Analyst Issues
 
 **"LLM call failed" or connection refused**
@@ -848,8 +839,8 @@ This system is designed with multiple layers of safety:
 ### Backtest Issues
 
 **"No data available" for tickers**
-- YFinance may not have data for all tickers, especially BIST stocks
-- Check the ticker symbol (BIST tickers auto-append `.IS` for YFinance)
+- YFinance may not have data for all tickers
+- Check the ticker symbol is valid
 - Try a different date range -- very recent data may have a delay
 
 **Unrealistic backtest results**
@@ -875,11 +866,9 @@ All times are in Turkey time (TRT / Europe/Istanbul):
 
 | Market | Open | Close | Notes |
 |--------|------|-------|-------|
-| **BIST** | 10:00 | 18:00 | Turkish equities |
-| **US (NYSE/NASDAQ)** | 16:30 | 23:00 | Adjusted for TRT |
-| **Overlap** | 16:30 | 18:00 | Both markets active |
+| **US (NYSE/NASDAQ)** | 16:30 | 23:00 | Adjusted for TRT (Europe/Istanbul) |
 
-The scheduler automatically detects which markets are open and only scans active markets. Weekends and holidays are skipped.
+The scheduler automatically detects if the market is open and only runs scans during active hours. Weekends are skipped.
 
 ---
 
