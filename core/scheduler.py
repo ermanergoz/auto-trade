@@ -6,7 +6,6 @@ import sys
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-from apscheduler.schedulers.blocking import BlockingScheduler
 from ib_insync import IB
 
 from config.settings import (
@@ -32,6 +31,7 @@ from core.models import StockInfo
 logger = logging.getLogger(__name__)
 
 _tz = ZoneInfo(TIMEZONE)
+_shutting_down = False
 
 
 # ---------------------------------------------------------------------------
@@ -216,14 +216,14 @@ def _fetch_market_data(
 
             if df.empty:
                 # Fallback to yfinance
-                market = "BIST" if stock.exchange == "BIST" else "US"
+                market = "US"
                 df = get_historical_data_yfinance(stock.ticker, period="3mo", market=market)
 
             if not df.empty:
                 stock_data[stock.ticker] = (stock.exchange, df)
 
         except Exception as e:
-            logger.debug("Failed to fetch data for %s: %s", stock.ticker, e)
+            logger.warning("Failed to fetch data for %s: %s", stock.ticker, e)
 
     logger.info("Fetched data for %d/%d stocks", len(stock_data), len(stocks))
     return stock_data
@@ -238,32 +238,20 @@ def start_scheduler(
     markets: list[str],
     mode: str = "paper",
 ) -> None:
-    """Start the APScheduler loop that runs scan cycles."""
+    """Start the scan loop using ib_insync's event loop.
+
+    Uses ib.sleep() instead of APScheduler so all IBKR calls stay on the
+    main thread's asyncio event loop (ib_insync requirement).
+    """
+    global _shutting_down
+
     setup_disconnect_handler(ib)
-
-    scheduler = BlockingScheduler(timezone=TIMEZONE)
-
-    # Main scan job
-    scheduler.add_job(
-        run_scan_cycle,
-        "interval",
-        minutes=SCAN_INTERVAL_MINUTES,
-        args=[ib, markets, mode],
-        id="scan_cycle",
-        name="Market scan cycle",
-        next_run_time=datetime.now(_tz),  # run immediately on start
-    )
 
     # Graceful shutdown
     def shutdown(signum, frame):
+        global _shutting_down
+        _shutting_down = True
         logger.info("Received signal %s — shutting down...", signum)
-        scheduler.shutdown(wait=False)
-        # Close day trades before exit
-        positions = get_open_positions()
-        dry_run = mode == "dry-run"
-        close_all_day_trades(ib, positions, dry_run=dry_run)
-        disconnect(ib)
-        sys.exit(0)
 
     sig.signal(sig.SIGINT, shutdown)
     sig.signal(sig.SIGTERM, shutdown)
@@ -274,8 +262,20 @@ def start_scheduler(
     )
 
     try:
-        scheduler.start()
+        while not _shutting_down:
+            run_scan_cycle(ib, markets, mode)
+            if not _shutting_down:
+                ib.sleep(SCAN_INTERVAL_MINUTES * 60)
     except (KeyboardInterrupt, SystemExit):
-        logger.info("Scheduler stopped")
+        pass
     finally:
+        _shutting_down = True
+        logger.info("Scheduler stopped")
+        # Close day trades before exit
+        try:
+            positions = get_open_positions()
+            dry_run = mode == "dry-run"
+            close_all_day_trades(ib, positions, dry_run=dry_run)
+        except Exception:
+            pass
         disconnect(ib)

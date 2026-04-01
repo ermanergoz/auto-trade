@@ -215,9 +215,14 @@ def setup_fill_handler(ib: IB, signal: Signal, quantity: int) -> None:
 
 
 def setup_disconnect_handler(ib: IB) -> None:
-    """Set up handler for connection drops."""
+    """Set up handler for connection drops.
 
+    Skips reconnect during shutdown to avoid reconnect loops.
+    """
     def on_disconnect():
+        from core.scheduler import _shutting_down
+        if _shutting_down:
+            return
         logger.warning("IBKR connection lost! Attempting reconnect...")
         try:
             ensure_connected(ib)
