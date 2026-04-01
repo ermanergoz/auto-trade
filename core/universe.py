@@ -9,7 +9,7 @@ from typing import Optional
 from ib_insync import IB, Stock, ScannerSubscription
 
 from config.settings import (
-    DATA_DIR, EXCLUDED_SECTORS, MIN_DAILY_VOLUME, MIN_MARKET_CAP,
+    DATA_DIR, EXCLUDED_SECTORS, EXCLUDED_TICKERS, MIN_DAILY_VOLUME, MIN_MARKET_CAP,
 )
 from core.models import StockInfo
 
@@ -73,46 +73,68 @@ def _scan_ibkr(ib: IB, market: str) -> list[StockInfo]:
     stocks: list[StockInfo] = []
 
     if market == "US":
-        exchanges = [("NYSE", "STK.US.MAJOR"), ("NASDAQ", "STK.US.MAJOR")]
-    elif market == "BIST":
-        exchanges = [("BIST", "STK.EU.BIST")]
+        # Run multiple scan types to build a larger universe.
+        # Each scan returns ~50 results; dedup combines them.
+        scans = [
+            ("MOST_ACTIVE", "STK.US.MAJOR"),
+            ("TOP_PERC_GAIN", "STK.US.MAJOR"),
+            ("TOP_PERC_LOSE", "STK.US.MAJOR"),
+            ("HOT_BY_VOLUME", "STK.US.MAJOR"),
+            ("TOP_OPEN_PERC_GAIN", "STK.US.MAJOR"),
+            ("TOP_OPEN_PERC_LOSE", "STK.US.MAJOR"),
+            ("HIGH_VS_13W_HL", "STK.US.MAJOR"),
+            ("LOW_VS_13W_HL", "STK.US.MAJOR"),
+            ("TOP_TRADE_COUNT", "STK.US.MAJOR"),
+            ("TOP_TRADE_RATE", "STK.US.MAJOR"),
+        ]
     else:
         logger.warning("Unknown market: %s", market)
         return []
 
-    for exchange_name, location_code in exchanges:
+    seen_tickers: set[str] = set()
+
+    for scan_code, location_code in scans:
         try:
             sub = ScannerSubscription(
                 instrument="STK",
                 locationCode=location_code,
-                scanCode="MOST_ACTIVE",
-                numberOfRows=500,
+                scanCode=scan_code,
+                numberOfRows=50,
             )
             results = ib.reqScannerData(sub)
 
+            added = 0
             for item in results:
                 contract = item.contractDetails.contract
+                if contract.symbol in seen_tickers:
+                    continue
+                seen_tickers.add(contract.symbol)
+
                 details = item.contractDetails
 
                 sector = getattr(details, "category", "") or ""
                 market_cap = 0.0  # IBKR scanner doesn't directly give market cap
                 avg_volume = 0.0
 
+                exchange = getattr(contract, "primaryExchange", "") or "SMART"
+
                 stocks.append(StockInfo(
                     ticker=contract.symbol,
-                    exchange=exchange_name,
+                    exchange=exchange,
                     sector=sector,
                     market_cap=market_cap,
                     avg_volume=avg_volume,
                     currency=contract.currency,
                     name=getattr(details, "longName", ""),
                 ))
+                added += 1
 
             logger.info(
-                "IBKR scanner returned %d results for %s", len(results), exchange_name
+                "IBKR scanner %s returned %d results (%d new)",
+                scan_code, len(results), added,
             )
         except Exception as e:
-            logger.error("IBKR scanner failed for %s: %s", exchange_name, e)
+            logger.error("IBKR scanner %s failed: %s", scan_code, e)
 
     return stocks
 
@@ -132,10 +154,7 @@ def _enrich_with_contract_details(
             continue
 
         try:
-            if stock.exchange == "BIST":
-                contract = Stock(stock.ticker, "BIST", "TRY")
-            else:
-                contract = Stock(stock.ticker, "SMART", "USD")
+            contract = Stock(stock.ticker, "SMART", "USD")
 
             details_list = ib.reqContractDetails(contract)
             if details_list:
@@ -158,6 +177,10 @@ def _filter_universe(stocks: list[StockInfo]) -> list[StockInfo]:
     """Remove financial sector stocks and apply liquidity filters."""
     filtered = []
     for s in stocks:
+        # Exclude specific tickers (e.g. Israel-based companies)
+        if s.ticker in EXCLUDED_TICKERS:
+            continue
+
         # Exclude financial sector
         if _is_financial_sector(s.sector):
             continue
@@ -247,33 +270,6 @@ def _static_fallback(market: str) -> list[StockInfo]:
             for t, s in tickers
         ]
 
-    elif market == "BIST":
-        tickers = [
-            # Industrials / Airlines
-            ("THYAO", "Industrials"), ("TUPRS", "Energy"),
-            ("SISE", "Industrials"), ("EREGL", "Materials"),
-            ("BIMAS", "Consumer Defensive"), ("KCHOL", "Industrials"),
-            ("ASELS", "Industrials"), ("TOASO", "Consumer Cyclical"),
-            ("TAVHL", "Industrials"), ("SAHOL", "Industrials"),
-            ("PETKM", "Energy"), ("SASA", "Materials"),
-            ("KOZAA", "Materials"), ("KOZAL", "Materials"),
-            ("ENKAI", "Industrials"), ("TCELL", "Communication"),
-            ("TTKOM", "Communication"), ("MGROS", "Consumer Defensive"),
-            ("VESTL", "Consumer Cyclical"), ("ARCLK", "Consumer Cyclical"),
-            ("FROTO", "Consumer Cyclical"), ("OTKAR", "Consumer Cyclical"),
-            ("DOHOL", "Industrials"), ("EKGYO", "Real Estate"),
-            ("PGSUS", "Industrials"), ("GUBRF", "Materials"),
-            ("SOKM", "Consumer Defensive"), ("CCOLA", "Consumer Defensive"),
-            ("AKSEN", "Utilities"), ("GESAN", "Energy"),
-        ]
-        return [
-            StockInfo(
-                ticker=t, exchange="BIST", sector=s,
-                market_cap=0, avg_volume=0, currency="TRY",
-            )
-            for t, s in tickers
-        ]
-
     return []
 
 
@@ -334,6 +330,4 @@ def get_tickers_for_market(
     market = market.upper()
     if market == "US":
         return [s for s in universe if s.exchange in ("SMART", "NYSE", "NASDAQ")]
-    elif market == "BIST":
-        return [s for s in universe if s.exchange == "BIST"]
     return universe

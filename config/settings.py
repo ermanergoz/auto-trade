@@ -23,14 +23,22 @@ IBKR_TIMEOUT = 10  # seconds
 # ---------------------------------------------------------------------------
 # Markets
 # ---------------------------------------------------------------------------
-MARKETS = ["US", "BIST"]
+MARKETS = ["US"]
 EXCLUDED_SECTORS = ["Financials"]
+
+# Israel-based companies trading on US exchanges — excluded from universe
+EXCLUDED_TICKERS = {
+    "CHKP", "MNDY", "CYBR", "TEVA", "WIX", "NICE", "INMD", "GILT",
+    "CEVA", "SILC", "RDWR", "MGIC", "DSNY", "SEDG", "FVRR", "GLBE",
+    "RSKD", "GLMD", "ELBM", "AURA", "CRNT", "ORMP", "MRVL",
+    "ARQT", "CPRI", "ELBT", "KRNT", "OPAL", "PERI", "RVSN",
+    "SGHT", "SMWB", "TOVX", "MNDO", "BSQR", "PRGO",
+}
 MIN_DAILY_VOLUME = 100_000
 MIN_MARKET_CAP = 50_000_000  # $50M
 
 # Market hours in Europe/Istanbul timezone (TRT)
 MARKET_HOURS = {
-    "BIST": {"open": "10:00", "close": "18:00"},
     "US": {"open": "16:30", "close": "23:00"},
 }
 
