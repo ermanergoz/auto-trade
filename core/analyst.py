@@ -29,7 +29,7 @@ def _reset_daily_usage_if_needed() -> None:
 # Prompt construction
 # ---------------------------------------------------------------------------
 
-ANALYSIS_PROMPT = """You are a professional stock analyst. Analyze this stock and provide a trading recommendation.
+ANALYSIS_PROMPT = """You are a disciplined stock trader making real money decisions. Analyze this stock using a strict checklist approach.
 
 ## Stock: {ticker} ({exchange})
 
@@ -42,24 +42,31 @@ ANALYSIS_PROMPT = """You are a professional stock analyst. Analyze this stock an
 ## News Headlines
 {news}
 
-## Instructions
-Based on the data above, provide your analysis as a JSON object with these exact fields:
+## Decision Checklist — evaluate each before deciding:
+
+1. TREND: Is the stock in a clear uptrend (for buy) or downtrend (for sell)? Are moving averages aligned (MA5 > MA10 > MA20 for uptrend)?
+2. MOMENTUM: Is momentum confirming the move? Check RSI direction and MACD alignment. Reject if RSI is already extreme (>80 for buy, <20 for sell).
+3. VOLUME: Is there volume confirmation? Moves without volume are unreliable.
+4. RISK/REWARD: Is the reward at least 1.5x the risk? Calculate: (take_profit - entry) / (entry - stop_loss) >= 1.5
+5. NEWS SENTIMENT: Do recent headlines support or contradict the technical signal?
+6. ANTI-CHASE RULE: Has the stock already moved more than 5% in the signal direction recently? If yes, you missed the move — say "hold".
+
+## Response Format
+Return a JSON object with these exact fields:
 - "action": "buy", "sell", or "hold"
-- "confidence": integer 0-100 (how confident you are)
-- "entry_price": recommended entry price (float)
-- "stop_loss": stop-loss price (float)
-- "take_profit": take-profit target (float)
-- "trade_type": "day" or "swing"
-- "reasoning": 2-3 sentence explanation
+- "confidence": integer 0-100
+- "entry_price": specific entry price (float)
+- "stop_loss": stop-loss price (float) — place below recent support for buys, above resistance for sells
+- "take_profit": take-profit price (float) — must give at least 1.5:1 reward/risk
+- "trade_type": "day" (close before market end) or "swing" (hold overnight)
+- "reasoning": 2-3 sentences covering your checklist assessment
 
-Consider:
-- Risk/reward ratio (minimum 1.5:1)
-- Current market conditions and momentum
-- Volume confirmation
-- Multiple indicator alignment
-- News sentiment
-
-Only recommend "buy" or "sell" if you have high conviction. Default to "hold" if unclear."""
+## Discipline Rules
+- Default to "hold" unless at least 4 of 6 checklist items are clearly favorable
+- Never chase: if the stock already ran >5% toward the signal, say "hold"
+- Confidence above 70 only when trend + momentum + volume all align
+- Be honest about uncertainty — a confident "hold" is better than a shaky "buy"
+- Set stop-loss at a technical level (support/resistance), not an arbitrary percentage"""
 
 
 def _build_prompt(
@@ -122,7 +129,7 @@ def _call_ollama(prompt: str) -> Optional[dict]:
         headers={"Content-Type": "application/json"},
     )
 
-    response = urllib.request.urlopen(req, timeout=300)
+    response = urllib.request.urlopen(req, timeout=600)
     result = json.loads(response.read())
 
     # Track usage

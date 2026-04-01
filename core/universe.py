@@ -184,7 +184,7 @@ def _is_financial_sector(sector: str) -> bool:
             return True
     # Also catch common IBKR sector names for financials
     financial_keywords = [
-        "bank", "insurance", "lending", "mortgage",
+        "bank", "insurance", "lending", "mortgage", "loan", "credit",
         "capital markets", "consumer finance", "financial",
     ]
     return any(kw in sector_lower for kw in financial_keywords)

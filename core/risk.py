@@ -14,6 +14,9 @@ from config.settings import (
     MAX_OPEN_POSITIONS,
     DEFAULT_STOP_LOSS_PCT,
     MAX_SECTOR_CONCENTRATION_PCT,
+    ANTI_MOMENTUM_PCT,
+    TREND_CONFIRMATION,
+    MIN_RISK_REWARD_RATIO,
 )
 
 logger = logging.getLogger(__name__)
@@ -146,6 +149,143 @@ def check_no_duplicate(
     return True, ""
 
 
+_FINANCIAL_KEYWORDS = [
+    "bank", "insurance", "lending", "mortgage", "loan", "credit",
+    "capital markets", "consumer finance", "financial",
+]
+
+
+def check_excluded_sector(signal: Signal) -> tuple[bool, str]:
+    """Block financial sector stocks as a safety net.
+
+    The universe builder already filters these, but this catches any
+    that slip through (e.g., missing sector data from IBKR).
+    """
+    sector = getattr(signal, "indicator_values", {}).get("sector", "")
+    if not sector:
+        # Also check the signal's exchange field for known financial tickers
+        return True, ""
+
+    sector_lower = sector.lower()
+    for kw in _FINANCIAL_KEYWORDS:
+        if kw in sector_lower:
+            return False, (
+                f"Excluded sector: '{sector}' (financial/lending companies are blocked)"
+            )
+    return True, ""
+
+
+def check_anti_momentum(
+    signal: Signal,
+    current_price: float,
+    max_pct: float = ANTI_MOMENTUM_PCT,
+) -> tuple[bool, str]:
+    """Reject if price already moved >X% toward the signal direction.
+
+    Prevents chasing stocks that already ran. If the current price is
+    significantly above the entry (for buys) or below (for sells), the
+    move was missed.
+    """
+    if current_price <= 0 or signal.entry_price <= 0:
+        return True, ""
+
+    pct_move = ((current_price - signal.entry_price) / signal.entry_price) * 100
+
+    if signal.action == Action.BUY and pct_move > max_pct:
+        return False, (
+            f"Anti-chase: price already up {pct_move:.1f}% from entry "
+            f"${signal.entry_price:.2f} (limit {max_pct}%)"
+        )
+    if signal.action == Action.SELL and pct_move < -max_pct:
+        return False, (
+            f"Anti-chase: price already down {abs(pct_move):.1f}% from entry "
+            f"${signal.entry_price:.2f} (limit {max_pct}%)"
+        )
+    return True, ""
+
+
+def check_trend_confirmation(
+    signal: Signal,
+    indicator_values: dict,
+    require_confirmation: bool = TREND_CONFIRMATION,
+) -> tuple[bool, str]:
+    """Require MA5 > MA10 > MA20 alignment for buys (inverse for sells).
+
+    Uses indicator values passed from the screener. If MAs are not
+    available, the check passes (don't block on missing data).
+    """
+    if not require_confirmation:
+        return True, ""
+
+    ma5 = indicator_values.get("MA5") or indicator_values.get("ma5")
+    ma20 = indicator_values.get("MA20") or indicator_values.get("ma20")
+
+    if ma5 is None or ma20 is None:
+        return True, ""  # Can't check without MA data
+
+    # Try to get MA10 if available, otherwise just check MA5 vs MA20
+    ma10 = indicator_values.get("MA10") or indicator_values.get("ma10")
+
+    if signal.action == Action.BUY:
+        if ma10 is not None:
+            if not (ma5 > ma10 > ma20):
+                return False, (
+                    f"Trend not confirmed: MA5={ma5:.2f} MA10={ma10:.2f} "
+                    f"MA20={ma20:.2f} (need MA5 > MA10 > MA20 for buy)"
+                )
+        else:
+            if not (ma5 > ma20):
+                return False, (
+                    f"Trend not confirmed: MA5={ma5:.2f} MA20={ma20:.2f} "
+                    f"(need MA5 > MA20 for buy)"
+                )
+
+    if signal.action == Action.SELL:
+        if ma10 is not None:
+            if not (ma5 < ma10 < ma20):
+                return False, (
+                    f"Trend not confirmed: MA5={ma5:.2f} MA10={ma10:.2f} "
+                    f"MA20={ma20:.2f} (need MA5 < MA10 < MA20 for sell)"
+                )
+        else:
+            if not (ma5 < ma20):
+                return False, (
+                    f"Trend not confirmed: MA5={ma5:.2f} MA20={ma20:.2f} "
+                    f"(need MA5 < MA20 for sell)"
+                )
+
+    return True, ""
+
+
+def check_risk_reward(
+    signal: Signal,
+    min_ratio: float = MIN_RISK_REWARD_RATIO,
+) -> tuple[bool, str]:
+    """Take-profit must give at least X:1 reward/risk ratio."""
+    if signal.entry_price <= 0 or signal.stop_loss <= 0 or signal.take_profit <= 0:
+        return True, ""  # Can't check without prices
+
+    if signal.action == Action.BUY:
+        risk = signal.entry_price - signal.stop_loss
+        reward = signal.take_profit - signal.entry_price
+    elif signal.action == Action.SELL:
+        risk = signal.stop_loss - signal.entry_price
+        reward = signal.entry_price - signal.take_profit
+    else:
+        return True, ""
+
+    if risk <= 0:
+        return False, "Risk is zero or negative (stop-loss on wrong side)"
+
+    ratio = reward / risk
+    if ratio < min_ratio:
+        return False, (
+            f"Risk/reward {ratio:.2f}:1 below minimum {min_ratio}:1 "
+            f"(risk=${risk:.2f}, reward=${reward:.2f})"
+        )
+    return True, ""
+
+
 # ---------------------------------------------------------------------------
 # Position sizing
 # ---------------------------------------------------------------------------
@@ -190,12 +330,19 @@ def evaluate(
     open_positions: list[Position],
     portfolio_value: float,
     daily_pnl: float,
+    current_price: float = 0.0,
 ) -> RiskResult:
     """Run all risk checks on a signal. Returns RiskResult.
 
     Pure function — all state passed in as arguments.
     """
     reasons = []
+
+    # Use entry_price as current_price fallback
+    price = current_price if current_price > 0 else signal.entry_price
+
+    # Get indicator values for trend check
+    indicator_values = getattr(signal, "indicator_values", {}) or {}
 
     checks = [
         check_position_size(signal, portfolio_value),
@@ -204,6 +351,11 @@ def evaluate(
         check_stop_loss(signal),
         check_sector_concentration(signal, open_positions, portfolio_value),
         check_no_duplicate(signal, open_positions),
+        # Discipline rules
+        check_excluded_sector(signal),
+        check_risk_reward(signal),
+        check_anti_momentum(signal, price),
+        check_trend_confirmation(signal, indicator_values),
     ]
 
     for passed, reason in checks:
