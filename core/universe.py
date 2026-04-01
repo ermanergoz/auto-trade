@@ -226,6 +226,8 @@ def _is_financial_sector(sector: str) -> bool:
     financial_keywords = [
         "bank", "insurance", "lending", "mortgage", "loan", "credit",
         "capital markets", "consumer finance", "financial",
+        "diversified finan", "investment companies", "private equity",
+        "savings & loans", "closed-end funds", "sovereign",
     ]
     return any(kw in sector_lower for kw in financial_keywords)
 

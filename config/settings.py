@@ -47,7 +47,7 @@ MARKET_HOURS = {
 # ---------------------------------------------------------------------------
 SCAN_INTERVAL_MINUTES = 15
 AI_CONFIDENCE_THRESHOLD = 70
-AI_MAX_CANDIDATES = 20              # Max candidates sent to AI per cycle (0 = unlimited)
+AI_MAX_CANDIDATES = 0               # Max candidates sent to AI per cycle (0 = unlimited)
 AI_MODEL = os.getenv("AI_MODEL", "qwen2.5:7b")
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
 
