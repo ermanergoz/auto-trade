@@ -45,7 +45,7 @@ def place_order(
         )
         return None
 
-    # Create bracket order
+    # Create bracket order with GTC so orders persist outside market hours
     bracket = ib.bracketOrder(
         action=action,
         quantity=quantity,
@@ -55,6 +55,10 @@ def place_order(
     )
 
     parent_order, tp_order, sl_order = bracket
+
+    # GTC ensures orders survive overnight and fill at market open
+    for o in bracket:
+        o.tif = "GTC"
 
     # Place all three orders
     trades = []

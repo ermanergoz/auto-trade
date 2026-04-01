@@ -141,9 +141,9 @@ def run_scan_cycle(
 
         market_stocks = get_tickers_for_market(universe, market)
 
-        # Check for end-of-day close
+        # Check for end-of-day close (skip when force mode)
         mins_left = minutes_to_close(market)
-        if CLOSE_DAY_TRADES_BEFORE_MARKET_CLOSE and mins_left <= CLOSE_MINUTES_BEFORE:
+        if not force and CLOSE_DAY_TRADES_BEFORE_MARKET_CLOSE and mins_left <= CLOSE_MINUTES_BEFORE:
             logger.info(
                 "%s market closing in %d min — closing day trades", market, mins_left,
             )
@@ -191,12 +191,8 @@ def run_scan_cycle(
             })
 
         update_status("ai_analysis", f"{len(ai_input)} candidates for {market}")
-        ai_signals = analyze_batch(ai_input)
+        ai_signals = analyze_batch(ai_input, on_signal=notify_ai_signal)
         summary["ai_approved"] += len(ai_signals)
-
-        # Notify AI signals
-        for signal in ai_signals:
-            notify_ai_signal(signal)
 
         # Step 4: Risk check + execution
         update_status("risk_check", f"{len(ai_signals)} AI-approved signals")
