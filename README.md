@@ -112,7 +112,7 @@ The screener and risk manager are written as **pure functions** that accept data
 Each scan cycle (every 15 minutes by default) executes the following pipeline:
 
 1. **Market hours check** -- Determine if the US market is currently open
-2. **Universe building** -- Build/load the tradeable stock list (cached daily) using 10 IBKR scanner types, filtering out financial sector stocks and applying liquidity thresholds. Typical result: ~200-350 unique stocks
+2. **Universe building** -- Build/load the tradeable stock list (cached daily) using 10 IBKR scanner types, enrich each stock with sector data via contract details, then filter out financial sector stocks and apply liquidity thresholds. Typical result: ~200-350 unique stocks
 3. **Data fetching** -- Fetch historical OHLCV data for all stocks in the universe from IBKR (or YFinance fallback)
 4. **Technical screening** -- Run 6 technical indicators on every stock, score candidates, and pass all qualifying stocks (above min_score) to AI analysis
 5. **AI analysis** -- Send each candidate to the local LLM (via Ollama) with price action, indicators, and news context; receive structured trade recommendations with confidence scores

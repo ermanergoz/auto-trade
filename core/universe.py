@@ -57,6 +57,9 @@ def build_universe(
             )
             stocks = _static_fallback(market)
 
+        # Enrich with sector/name from contract details (needed for filtering)
+        stocks = _enrich_with_contract_details(ib, stocks)
+
         # Filter
         stocks = _filter_universe(stocks)
         logger.info("Universe for %s: %d stocks after filtering", market, len(stocks))
@@ -142,31 +145,45 @@ def _scan_ibkr(ib: IB, market: str) -> list[StockInfo]:
 def _enrich_with_contract_details(
     ib: IB, stocks: list[StockInfo],
 ) -> list[StockInfo]:
-    """Fetch contract details to fill in missing sector/market cap info.
+    """Fetch contract details to fill in missing sector/name info.
 
-    Useful when IBKR scanner doesn't provide full details.
-    Respects IBKR pacing — processes in batches.
+    The IBKR scanner doesn't return sector data, so we need to call
+    reqContractDetails for each stock to get it. This is essential for
+    the financial sector filter to work.
+
+    Respects IBKR pacing with small sleeps between requests.
     """
-    enriched = []
-    for stock in stocks:
-        if stock.sector and stock.sector not in ("", "Unknown"):
-            enriched.append(stock)
-            continue
+    need_enrichment = [s for s in stocks if not s.sector or s.sector in ("", "Unknown")]
 
+    if not need_enrichment:
+        return stocks
+
+    logger.info("Enriching %d stocks with contract details...", len(need_enrichment))
+
+    enriched_count = 0
+    for i, stock in enumerate(need_enrichment, 1):
         try:
             contract = Stock(stock.ticker, "SMART", "USD")
-
             details_list = ib.reqContractDetails(contract)
             if details_list:
                 d = details_list[0]
-                stock.sector = getattr(d, "category", stock.sector) or stock.sector
-                stock.name = getattr(d, "longName", stock.name) or stock.name
-            enriched.append(stock)
+                stock.sector = getattr(d, "category", "") or ""
+                stock.name = getattr(d, "longName", "") or ""
+                enriched_count += 1
+
+            # IBKR pacing: brief pause every 50 requests
+            if i % 50 == 0:
+                logger.info("Enriched %d/%d stocks...", i, len(need_enrichment))
+                ib.sleep(1)
+
         except Exception as e:
             logger.debug("Could not enrich %s: %s", stock.ticker, e)
-            enriched.append(stock)
 
-    return enriched
+    logger.info(
+        "Enrichment complete: %d/%d stocks got sector data",
+        enriched_count, len(need_enrichment),
+    )
+    return stocks
 
 
 # ---------------------------------------------------------------------------

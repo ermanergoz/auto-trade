@@ -340,6 +340,11 @@ Step 3: Combine all results and remove duplicates.
         A stock that appears in 3 different scanners still only appears once.
         Typical result: ~200-350 unique stocks
 
+Step 3.5: Enrich with contract details.
+          The IBKR scanner doesn't return sector or company name data.
+          So we call reqContractDetails for each stock to fill in those fields.
+          This is what makes the financial sector filter actually work.
+
 Step 4: Filter out:
    - Financial sector stocks (banks, insurance, etc.)
    - Stocks with volume below 100K shares/day
