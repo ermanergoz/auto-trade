@@ -11,6 +11,7 @@ from rich.table import Table
 
 from config.settings import (
     IBKR_HOST, IBKR_PORT, IBKR_CLIENT_ID, TIMEZONE, MARKETS, is_paper_mode,
+    IBC_PATH, IBC_INI, TWS_PATH, TWS_VERSION, IBC_USERID, IBC_PASSWORD,
 )
 from core.connection import connect, disconnect, get_account_summary
 from core.portfolio import init_db
@@ -64,6 +65,11 @@ def parse_args() -> argparse.Namespace:
         "--force",
         action="store_true",
         help="Bypass market hours check (orders queue for next open)",
+    )
+    parser.add_argument(
+        "--watchdog",
+        action="store_true",
+        help="Use IBC Watchdog to auto-start gateway and reconnect on restarts",
     )
     parser.add_argument(
         "--backtest-tickers",
@@ -144,6 +150,77 @@ def run_backtest_mode(args: argparse.Namespace) -> None:
     display_metrics(metrics)
 
 
+def run_watchdog_mode(args: argparse.Namespace, markets: list[str]) -> None:
+    """Run with IBC Watchdog — auto-starts gateway and reconnects on restarts."""
+    from ib_insync import IB
+    from ib_insync.ibcontroller import IBC, Watchdog
+
+    trading_mode = "paper" if is_paper_mode() else "live"
+
+    ibc = IBC(
+        twsVersion=TWS_VERSION,
+        gateway=True,
+        tradingMode=trading_mode,
+        twsPath=TWS_PATH,
+        ibcPath=IBC_PATH,
+        ibcIni=IBC_INI,
+        userid=IBC_USERID,
+        password=IBC_PASSWORD,
+    )
+
+    ib = IB()
+    watchdog = Watchdog(
+        controller=ibc,
+        ib=ib,
+        host=IBKR_HOST,
+        port=IBKR_PORT,
+        clientId=IBKR_CLIENT_ID,
+        appStartupTime=60,
+        appTimeout=40,
+        retryDelay=10,
+    )
+
+    first_connect = [True]
+
+    def on_connected(watchdog: Watchdog):
+        _ib = watchdog.ib
+        summary = get_account_summary(_ib)
+
+        if first_connect[0]:
+            first_connect[0] = False
+            logger.info("Watchdog connected to IBKR")
+            display_account_summary(summary)
+
+            from notifications.telegram import notify_startup, start_listener, update_status
+            notify_startup(args.mode, summary)
+            start_listener()
+            update_status("startup_complete")
+
+            tz = ZoneInfo(TIMEZONE)
+            now = datetime.now(tz)
+            console.print(f"\nLocal time ({TIMEZONE}): {now.strftime('%Y-%m-%d %H:%M:%S')}")
+            console.print(f"Mode: [bold]{args.mode}[/bold] | Markets: [bold]{', '.join(markets)}[/bold]")
+
+            console.print("\n[cyan]Starting scheduler...[/cyan]")
+            from core.scheduler import start_scheduler
+            start_scheduler(_ib, markets, mode=args.mode, force=args.force)
+        else:
+            logger.info("Watchdog reconnected to IBKR after gateway restart")
+            from notifications.telegram import update_status
+            update_status("reconnected", "Gateway restarted — reconnected")
+
+    watchdog.startedEvent += on_connected
+
+    console.print("[cyan]Starting IBC Watchdog — gateway will auto-start and reconnect...[/cyan]")
+    watchdog.start()
+
+    try:
+        IB.run()
+    except KeyboardInterrupt:
+        console.print("\n[yellow]Shutting down watchdog...[/yellow]")
+        watchdog.stop()
+
+
 def main() -> None:
     args = parse_args()
     setup_logging(args.mode)
@@ -167,8 +244,14 @@ def main() -> None:
         run_backtest_mode(args)
         return
 
-    # Connect to IBKR
     markets = _resolve_markets(args.market)
+
+    # Watchdog mode: IBC manages gateway lifecycle
+    if args.watchdog:
+        run_watchdog_mode(args, markets)
+        return
+
+    # Direct connection mode (gateway must already be running)
     paper = is_paper_mode()
     mode_label = "PAPER" if paper else "LIVE"
     console.print(f"Connecting to IBKR ({mode_label}) at {IBKR_HOST}:{IBKR_PORT}...")

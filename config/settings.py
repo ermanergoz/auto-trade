@@ -20,6 +20,14 @@ IBKR_PORT = int(os.getenv("IBKR_PORT", "7497"))
 IBKR_CLIENT_ID = int(os.getenv("IBKR_CLIENT_ID", "1"))
 IBKR_TIMEOUT = 10  # seconds
 
+# IBC (IB Controller) — manages gateway lifecycle and auto-login
+IBC_PATH = os.getenv("IBC_PATH", str(Path.home() / "ibc"))
+IBC_INI = os.getenv("IBC_INI", str(Path.home() / "ibc" / "config.ini"))
+TWS_PATH = os.getenv("TWS_PATH", str(Path.home() / "Jts"))
+TWS_VERSION = int(os.getenv("TWS_VERSION", "1037"))
+IBC_USERID = os.getenv("IBC_USERID", "")
+IBC_PASSWORD = os.getenv("IBC_PASSWORD", "")
+
 # ---------------------------------------------------------------------------
 # Markets
 # ---------------------------------------------------------------------------
