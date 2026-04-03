@@ -2,14 +2,17 @@
 
 import json
 import logging
+import urllib.request
 from datetime import date
 from pathlib import Path
 from typing import Optional
 
+import yfinance as yf
 from ib_insync import IB, Stock, ScannerSubscription
 
 from config.settings import (
-    DATA_DIR, EXCLUDED_SECTORS, EXCLUDED_TICKERS, MIN_DAILY_VOLUME, MIN_MARKET_CAP,
+    AI_MODEL, DATA_DIR, EXCLUDED_COUNTRIES, EXCLUDED_SECTORS, EXCLUDED_TICKERS,
+    MIN_DAILY_VOLUME, MIN_MARKET_CAP, OLLAMA_HOST,
 )
 from core.models import StockInfo
 
@@ -59,6 +62,9 @@ def build_universe(
 
         # Enrich with sector/name from contract details (needed for filtering)
         stocks = _enrich_with_contract_details(ib, stocks)
+
+        # YFinance fallback for stocks still missing sector data
+        stocks = _fill_missing_sectors(stocks)
 
         # Filter
         stocks = _filter_universe(stocks)
@@ -187,15 +193,154 @@ def _enrich_with_contract_details(
 
 
 # ---------------------------------------------------------------------------
+# YFinance sector fallback
+# ---------------------------------------------------------------------------
+
+def _classify_sector_yfinance(ticker: str) -> tuple[Optional[str], Optional[str]]:
+    """Look up sector and country via yfinance for a single ticker.
+
+    For regular stocks, returns the sector directly.
+    For ETFs, classifies by category: Equity ETF (kept), Bond/Leveraged/Non-Stock ETF (excluded).
+
+    Returns (sector, country) or (None, None) on failure.
+    """
+    try:
+        info = yf.Ticker(ticker).info
+        sector = info.get("sector") or None
+        country = info.get("country") or None
+        if sector:
+            return sector, country
+
+        # For ETFs: use the category field to classify
+        quote_type = info.get("quoteType", "")
+        category = info.get("category", "")
+        if quote_type == "ETF" and category:
+            cat_lower = category.lower()
+            if any(kw in cat_lower for kw in ("bond", "income", "treasury", "debt", "money market")):
+                return "Bond ETF", country
+            elif any(kw in cat_lower for kw in ("leverag", "inverse")):
+                return "Leveraged ETF", country
+            elif any(kw in cat_lower for kw in ("commodity", "volatility", "crypto", "currency")):
+                return "Non-Stock ETF", country
+            else:
+                return "Equity ETF", country
+
+        return None, None
+    except Exception as e:
+        logger.debug("yfinance lookup failed for %s: %s", ticker, e)
+        return None, None
+
+
+def _classify_sector_ollama(
+    ticker: str, name: str = "", max_retries: int = 2,
+) -> tuple[Optional[str], Optional[str]]:
+    """Use Ollama LLM to classify sector and country for a ticker.
+
+    Returns (sector, country) or (None, None) on failure.
+    """
+    prompt = (
+        f"What sector and country does the stock ticker '{ticker}'"
+        f"{f' ({name})' if name else ''} belong to?\n\n"
+        "If this is an ETF, leveraged product, warrant, unit, right, or "
+        "preferred share — return sector as 'ETF' or 'Non-Stock'.\n\n"
+        'Return JSON: {{"sector": "...", "country": "..."}}\n'
+        "Use standard sector names: Technology, Healthcare, Energy, "
+        "Consumer Cyclical, Consumer Defensive, Industrials, Materials, "
+        "Utilities, Real Estate, Communication, Financials, ETF, Non-Stock."
+    )
+    for attempt in range(1, max_retries + 1):
+        try:
+            payload = json.dumps({
+                "model": AI_MODEL,
+                "prompt": prompt,
+                "format": "json",
+                "stream": False,
+                "options": {"num_predict": 128},
+            }).encode()
+
+            req = urllib.request.Request(
+                f"{OLLAMA_HOST}/api/generate",
+                data=payload,
+                headers={"Content-Type": "application/json"},
+            )
+            response = urllib.request.urlopen(req, timeout=30)
+            result = json.loads(response.read())
+            data = json.loads(result["response"])
+
+            sector = data.get("sector") or None
+            country = data.get("country") or None
+            if sector:
+                return sector, country
+        except Exception as e:
+            logger.debug(
+                "Ollama sector lookup failed for %s (attempt %d): %s",
+                ticker, attempt, e,
+            )
+    return None, None
+
+
+def _fill_missing_sectors(stocks: list[StockInfo]) -> list[StockInfo]:
+    """Fill sector/country for stocks missing it: yfinance -> Ollama -> exclude.
+
+    Stocks that remain unclassified after all fallbacks are excluded entirely.
+    """
+    result = []
+    need_lookup = 0
+    excluded = 0
+    ollama_used = 0
+
+    for stock in stocks:
+        if stock.sector and stock.sector not in ("", "Unknown"):
+            result.append(stock)
+            continue
+
+        need_lookup += 1
+
+        # Try yfinance first
+        sector, country = _classify_sector_yfinance(stock.ticker)
+        if sector:
+            stock.sector = sector
+            stock.country = country or ""
+            result.append(stock)
+            continue
+
+        # Try Ollama as last resort
+        sector, country = _classify_sector_ollama(stock.ticker, stock.name)
+        if sector:
+            stock.sector = sector
+            stock.country = country or ""
+            ollama_used += 1
+            result.append(stock)
+            continue
+
+        excluded += 1
+        logger.warning(
+            "Excluding %s: no sector data from IBKR, yfinance, or Ollama",
+            stock.ticker,
+        )
+
+    if need_lookup:
+        logger.info(
+            "Sector fallback: %d lookups, %d via Ollama, %d excluded",
+            need_lookup, ollama_used, excluded,
+        )
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Filtering
 # ---------------------------------------------------------------------------
 
 def _filter_universe(stocks: list[StockInfo]) -> list[StockInfo]:
-    """Remove financial sector stocks and apply liquidity filters."""
+    """Remove financial sector stocks, excluded countries, and apply liquidity filters."""
     filtered = []
     for s in stocks:
-        # Exclude specific tickers (e.g. Israel-based companies)
+        # Exclude specific tickers
         if s.ticker in EXCLUDED_TICKERS:
+            continue
+
+        # Exclude by country
+        if s.country and s.country in EXCLUDED_COUNTRIES:
             continue
 
         # Exclude financial sector
@@ -215,19 +360,27 @@ def _filter_universe(stocks: list[StockInfo]) -> list[StockInfo]:
 
 
 def _is_financial_sector(sector: str) -> bool:
-    """Check if the sector is in the excluded list (Financials)."""
+    """Check if the sector should be excluded (financials + non-equity ETFs)."""
     if not sector:
         return False
     sector_lower = sector.lower()
+
+    # Exclude non-equity ETFs (bond, leveraged, commodity, etc.)
+    # "Equity ETF" intentionally NOT in this list — those are kept
+    non_equity_etf_types = ["bond etf", "leveraged etf", "non-stock etf"]
+    if any(t in sector_lower for t in non_equity_etf_types):
+        return True
+
     for excluded in EXCLUDED_SECTORS:
         if excluded.lower() in sector_lower:
             return True
-    # Also catch common IBKR sector names for financials
+    # Also catch common IBKR/yfinance sector names for financials
     financial_keywords = [
         "bank", "insurance", "lending", "mortgage", "loan", "credit",
         "capital markets", "consumer finance", "financial",
         "diversified finan", "investment companies", "private equity",
         "savings & loans", "closed-end funds", "sovereign",
+        "microfinance", "payday", "debt", "usury",
     ]
     return any(kw in sector_lower for kw in financial_keywords)
 
@@ -310,6 +463,7 @@ def cache_universe(stocks: list[StockInfo], market: str) -> None:
             "avg_volume": s.avg_volume,
             "currency": s.currency,
             "name": s.name,
+            "country": s.country,
         }
         for s in stocks
     ]
@@ -334,6 +488,7 @@ def load_cached_universe(market: str) -> Optional[list[StockInfo]]:
                 avg_volume=d.get("avg_volume", 0),
                 currency=d.get("currency", "USD"),
                 name=d.get("name", ""),
+                country=d.get("country", ""),
             )
             for d in data
         ]

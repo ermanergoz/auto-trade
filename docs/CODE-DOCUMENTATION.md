@@ -71,7 +71,7 @@ Every 15 minutes during market hours:
               - Indicator values (RSI, MACD, etc.)
               - News headlines
               The AI returns: BUY/SELL/HOLD + confidence + prices + reasoning
-              Only signals with confidence >= 70 pass through
+              Only signals with confidence >= 65 pass through
                     ↓
   6. RISK CHECK — For each AI-approved signal, run 11 safety checks:
                   Position size, daily loss limit, sector concentration,
@@ -200,7 +200,7 @@ Trade:
 ### Other models
 
 - **DailySummary** — End-of-day snapshot: portfolio value, P&L, win/loss counts
-- **StockInfo** — Basic info about a tradeable stock: ticker, sector, market cap, volume
+- **StockInfo** — Basic info about a tradeable stock: ticker, sector, market cap, volume, country
 - **Action** (enum) — BUY, SELL, HOLD
 - **TradeType** (enum) — DAY (close same day), SWING (hold days/weeks)
 
@@ -230,7 +230,7 @@ Why exclude financials? Banks and insurance companies behave very differently fr
 ### Strategy Settings
 ```python
 SCAN_INTERVAL_MINUTES = 15         # Run the full pipeline every 15 min
-AI_CONFIDENCE_THRESHOLD = 70       # AI must be 70%+ confident
+AI_CONFIDENCE_THRESHOLD = 65       # AI must be 65%+ confident
 AI_MAX_CANDIDATES = 20             # Max stocks sent to AI per cycle (0 = no limit)
 AI_MODEL = "qwen2.5:7b"           # The local AI model
 OLLAMA_HOST = "http://localhost:11434"  # Where Ollama runs
@@ -297,7 +297,7 @@ This module fetches prices and news. It has two data sources and caching to avoi
 
 ### News
 
-**`get_news(ticker, market, max_results)`** — Fetches recent news headlines using the Tavily API. The AI analyst uses these to factor in recent events (earnings, lawsuits, FDA approvals, etc.).
+**`get_news(ticker, market, max_results)`** — Fetches recent news headlines for AI context. Tries Tavily API first; if Tavily fails or is rate-limited, falls back to yfinance (`yf.Ticker().news`). This ensures the AI always has news context even when external APIs hit limits.
 
 ### Caching
 
@@ -346,24 +346,47 @@ Step 3.5: Enrich with contract details.
           So we call reqContractDetails for each stock to fill in those fields.
           This is what makes the financial sector filter actually work.
 
+Step 3.6: 3-tier sector fallback for stocks still missing sector data:
+          1. yfinance — looks up sector and country via yf.Ticker().info
+             For ETFs, checks the "category" field to classify as:
+               - "Equity ETF" (SPY, QQQ, IWM — kept in universe)
+               - "Bond ETF" (HYG, SGOV — excluded)
+               - "Leveraged ETF" (TQQQ, SQQQ, SOXL — excluded)
+               - "Non-Stock ETF" (BITO, USO, UVIX — excluded)
+          2. Ollama LLM — asks the local AI model to classify the stock
+             by sector and country (fast, ~128 tokens per query)
+          3. Exclude — if all three sources fail, the stock is excluded
+             since we can't safely filter financials without knowing the sector
+
 Step 4: Filter out:
    - Financial sector stocks (banks, insurance, etc.)
+   - Non-equity ETFs (bond, leveraged, inverse, commodity, volatility)
    - Stocks with volume below 100K shares/day
    - Stocks with market cap below $50M
-   - Explicitly excluded tickers (like certain Israel-based companies)
+   - Stocks from excluded countries
+   - Explicitly excluded tickers
 
 Step 5: Cache the result as a JSON file for the rest of the day
 ```
 
-### The Fallback Chain
+### The Fallback Chains
 
-What if IBKR scanners aren't available (maybe TWS just started and isn't ready)?
-
+**Universe source fallback** — what if IBKR scanners aren't available?
 1. **Try cache** — maybe we already built it today
 2. **Try IBKR scanners** — the main approach
-3. **Static fallback** — a hardcoded list of ~100 well-known US stocks (AAPL, MSFT, GOOGL, etc.)
+3. **Static fallback** — a hardcoded list of ~100 well-known US stocks
 
-This means the system ALWAYS has stocks to trade, even if IBKR is being flaky.
+**Sector classification fallback** — what if IBKR doesn't know the sector?
+1. **IBKR contract details** — `reqContractDetails` returns `category` for most stocks
+2. **yfinance** — `yf.Ticker().info["sector"]` for stocks, `.info["category"]` for ETFs
+3. **Ollama LLM** — asks the local AI model to classify by sector and country
+4. **Exclude** — unclassifiable stocks are dropped (can't safely filter financials)
+
+**News fallback** — what if Tavily is rate-limited or unavailable?
+1. **Tavily API** — primary source, best quality
+2. **yfinance** — `yf.Ticker().news` returns recent headlines for free
+
+This means the system ALWAYS has stocks to trade and context for AI analysis, even if external APIs are flaky.
 
 ---
 
@@ -541,7 +564,7 @@ Invalid responses are rejected and retried (up to 3 times with exponential backo
 
 #### Step 4: Filter by Confidence
 
-Only signals with confidence >= 70 pass through. The AI is encouraged to be honest — if it's uncertain, it should say confidence 40, and we'll skip it.
+Only signals with confidence >= 65 pass through. The AI is encouraged to be honest — if it's uncertain, it should say confidence 40, and we'll skip it.
 
 ### The Discipline Rules
 
@@ -549,7 +572,7 @@ These are embedded in the prompt to prevent common trading mistakes:
 
 1. **Require 4/6 checklist items favorable** — Don't buy just because RSI is oversold. Need multiple confirmations.
 2. **Anti-chase** — If a stock already moved 5%+ in the direction of the signal, reject it. You missed the move.
-3. **Conservative confidence** — Only give 70+ when trend + momentum + volume align. Be honest about uncertainty.
+3. **Conservative confidence** — Only give 65+ when trend + momentum + volume align. Be honest about uncertainty.
 4. **No FOMO** — It's okay to say HOLD. Missing a trade is better than taking a bad one.
 
 ### Batch Processing
@@ -699,9 +722,11 @@ This is **atomic** — all three orders are placed as a unit. You never end up w
 
 **`close_all_day_trades(ib, positions, dry_run)`** — Called 15 minutes before market close. Finds all positions marked as DAY trades and closes them with market orders.
 
-**`handle_fill(signal, quantity, fill_price)`** — Called when IBKR confirms an order filled. Records the position in the SQLite database.
+**`handle_fill(signal, quantity, fill_price)`** — Records a filled order in the SQLite database.
 
-**`setup_disconnect_handler(ib)`** — Attaches a callback for connection drops. Important because IBKR connections are notoriously unstable.
+**`setup_fill_handler(ib, signal, quantity, on_fill)`** — Attaches an async callback to IBKR's order status events. When the parent order status changes to "Filled", it records the position in the database and calls the optional `on_fill` callback (used by the scheduler to send Telegram notifications). This ensures positions are only recorded and notifications sent after IBKR confirms an actual fill — not when the limit order is merely submitted.
+
+**`setup_disconnect_handler(ib)`** — Attaches a callback for connection drops. Important because IBKR connections are notoriously unstable. Uses a re-entrancy guard (`_reconnecting` flag) to prevent cascading reconnect loops where a reconnect triggers another disconnect event.
 
 ### Dry-Run Mode
 
@@ -759,16 +784,16 @@ def run_scan_cycle(ib, markets, mode="paper", force=False):
         # 6. Run the screener
         candidates = screen_stocks(stock_data)
 
-        # 7. AI analysis on candidates (notifies Telegram immediately per signal)
-        ai_signals = analyze_batch(candidates, stock_data, on_signal=notify_ai_signal)
+        # 7. AI analysis on candidates (progress tracked via on_progress callback)
+        ai_signals = analyze_batch(candidates, on_progress=update_ai_progress)
 
         # 8. Risk check and execute
         for signal in ai_signals:
             result = evaluate(signal, open_positions, portfolio_value, daily_pnl)
             if result.approved:
                 place_order(ib, signal, result.position_size, dry_run=...)
-                add_position(...)
-                notify_trade(...)
+                setup_fill_handler(ib, signal, ...)  # async: records + notifies on actual fill
+                notify_trade(signal, ..., action_type="SUBMITTED")
 ```
 
 ### The Main Loop — `start_scheduler()`
@@ -912,14 +937,16 @@ Sends alerts to your phone via Telegram. You create a Telegram bot (using @BotFa
 - **Error** — "IBKR connection lost. Attempting reconnect."
 - **System stopped** — Sent when the trader shuts down (Ctrl+C or signal).
 
-### Interactive Status ("Whatsup")
+### Interactive Status
 
-The system runs a background listener thread that polls for incoming Telegram messages. When you send **"Whatsup"** (or "status", "what's up", "/status") to the bot, it replies with:
+The system runs a background listener thread that polls for incoming Telegram messages. When you send **"status"** (or "/status") to the bot, it replies with:
 
-- Current phase (fetching data, AI analyzing, waiting, etc.)
+- Current phase (fetching data, AI analyzing with progress e.g. "3/90", waiting, etc.)
 - Mode (paper/live)
+- Account summary (portfolio value, cash available, invested amount, unrealized P&L)
+- Daily realized P&L
+- Open positions (ticker, quantity, entry price)
 - Last scan summary
-- Current time
 
 This runs on a daemon thread so it doesn't interfere with trading. The polling uses Telegram's long-polling with a 10-second timeout, so responses come within seconds.
 
