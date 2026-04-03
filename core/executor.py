@@ -206,14 +206,21 @@ def handle_fill(
     return position
 
 
-def setup_fill_handler(ib: IB, signal: Signal, quantity: int) -> None:
-    """Attach a callback to handle order fills asynchronously."""
+def setup_fill_handler(ib: IB, signal: Signal, quantity: int, on_fill=None) -> None:
+    """Attach a callback to handle order fills asynchronously.
+
+    Args:
+        on_fill: Optional callback(signal, filled_qty, fill_price) called on fill.
+    """
 
     def on_order_status(trade: IBTrade):
         if trade.orderStatus.status == "Filled":
             fill_price = trade.orderStatus.avgFillPrice
+            filled_qty = int(trade.orderStatus.filled)
             if trade.order.action in ("BUY", "SELL") and trade.order.orderType != "STP":
-                handle_fill(signal, quantity, fill_price)
+                handle_fill(signal, filled_qty, fill_price)
+                if on_fill:
+                    on_fill(signal, filled_qty, fill_price)
 
     ib.orderStatusEvent += on_order_status
 
@@ -221,17 +228,24 @@ def setup_fill_handler(ib: IB, signal: Signal, quantity: int) -> None:
 def setup_disconnect_handler(ib: IB) -> None:
     """Set up handler for connection drops.
 
-    Skips reconnect during shutdown to avoid reconnect loops.
+    Skips reconnect during shutdown and uses a guard to prevent
+    re-entrant reconnect loops.
     """
+    _reconnecting = False
+
     def on_disconnect():
+        nonlocal _reconnecting
         from core.scheduler import _shutting_down
-        if _shutting_down:
+        if _shutting_down or _reconnecting:
             return
+        _reconnecting = True
         logger.warning("IBKR connection lost! Attempting reconnect...")
         try:
             ensure_connected(ib)
             logger.info("Reconnected successfully")
         except ConnectionError:
             logger.error("Failed to reconnect to IBKR")
+        finally:
+            _reconnecting = False
 
     ib.disconnectedEvent += on_disconnect

@@ -125,3 +125,4 @@ class StockInfo:
     avg_volume: float
     currency: str = "USD"
     name: str = ""
+    country: str = ""

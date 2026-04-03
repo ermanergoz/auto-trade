@@ -152,8 +152,12 @@ def run_backtest_mode(args: argparse.Namespace) -> None:
 
 def run_watchdog_mode(args: argparse.Namespace, markets: list[str]) -> None:
     """Run with IBC Watchdog — auto-starts gateway and reconnects on restarts."""
+    import nest_asyncio
     from ib_insync import IB
     from ib_insync.ibcontroller import IBC, Watchdog
+
+    # Allow nested event loops so sync ib_insync calls work inside Watchdog callbacks
+    nest_asyncio.apply()
 
     trading_mode = "paper" if is_paper_mode() else "live"
 
