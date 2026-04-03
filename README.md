@@ -114,7 +114,7 @@ The screener and risk manager are written as **pure functions** that accept data
 Each scan cycle (every 15 minutes by default) executes the following pipeline:
 
 1. **Market hours check** -- Determine if the US market is currently open
-2. **Universe building** -- Build/load the tradeable stock list (cached daily) using 10 IBKR scanner types, enrich each stock with sector data via contract details, then filter out financial sector stocks and apply liquidity thresholds. Typical result: ~200-350 unique stocks
+2. **Universe building** -- Build/load the tradeable stock list (cached daily) using 10 IBKR scanner types, enrich each stock with sector data via a 3-tier fallback chain (IBKR contract details -> yfinance -> Ollama LLM), classify ETFs by category (equity ETFs kept, bond/leveraged/commodity ETFs excluded), then filter out financial sector stocks and apply liquidity thresholds. Typical result: ~200-350 unique stocks
 3. **Data fetching** -- Fetch historical OHLCV data for all stocks in the universe from IBKR (or YFinance fallback)
 4. **Technical screening** -- Run 6 technical indicators on every stock, score candidates, and pass all qualifying stocks (above min_score) to AI analysis
 5. **AI analysis** -- Send each candidate to the local LLM (via Ollama) with price action, indicators, and news context; receive structured trade recommendations with confidence scores
@@ -355,7 +355,7 @@ All trading parameters are configured in `config/settings.py`. Key settings:
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `SCAN_INTERVAL_MINUTES` | `15` | Minutes between scan cycles |
-| `AI_CONFIDENCE_THRESHOLD` | `70` | Minimum AI confidence to act (0-100) |
+| `AI_CONFIDENCE_THRESHOLD` | `65` | Minimum AI confidence to act (0-100) |
 | `AI_MAX_CANDIDATES` | `20` | Max candidates sent to AI per cycle (0 = unlimited) |
 | `AI_MODEL` | `qwen2.5:7b` | Ollama model for analysis |
 
@@ -521,7 +521,7 @@ The AI analyst performs deep analysis on each screener candidate using a local L
 For each candidate, the analyst gathers:
 - **5-day price action**: Recent OHLCV data showing price movement
 - **Technical indicator values**: All computed indicator values from the screener
-- **News headlines**: Top 5 recent news articles via Tavily API
+- **News headlines**: Top 5 recent news articles via Tavily API (falls back to yfinance if Tavily is unavailable or rate-limited)
 - **Sector context**: Current sector performance
 
 ### Structured Output
@@ -541,7 +541,7 @@ The LLM returns a structured JSON response:
 
 ### Filtering
 
-Only signals with `confidence >= AI_CONFIDENCE_THRESHOLD` (default: 70) are forwarded to the risk manager. Lower-confidence signals are logged but not acted upon.
+Only signals with `confidence >= AI_CONFIDENCE_THRESHOLD` (default: 65) are forwarded to the risk manager. Lower-confidence signals are logged but not acted upon.
 
 ### Cost
 
@@ -637,6 +637,7 @@ The Telegram bot sends real-time alerts for all trading activity.
 | Event | Content |
 |-------|---------|
 | **System Started** | Mode, portfolio value, cash balance |
+| **Risk-Approved Signals** | Consolidated summary of all signals that passed risk checks: ticker, action, confidence, entry/SL/TP |
 | **Scan Summary** | Per-cycle summary: candidates found, AI-approved signals, risk-approved trades, orders placed |
 | **Trade Opened** | Ticker, action (BUY/SELL), quantity, price, stop-loss, take-profit, confidence score, AI reasoning |
 | **Trade Closed** | Ticker, exit price, P&L percentage, profit/loss amount |
@@ -650,7 +651,7 @@ The Telegram bot sends real-time alerts for all trading activity.
 1. Create a Telegram bot via @BotFather (see [Prerequisites](#3-telegram-bot-for-notifications))
 2. Add `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` to your `.env` file
 3. Notifications are fire-and-forget -- Telegram failures will not crash the trading system
-4. **Interactive status**: Send "Whatsup" (or "status") to the bot to get a real-time status update of what the system is currently doing
+4. **Interactive status**: Send "status" to the bot to get a detailed status update including portfolio value, cash, open positions, P&L, and current phase with AI analysis progress
 
 ---
 
@@ -841,6 +842,12 @@ This system is designed with multiple layers of safety:
 10. **Full audit trail** -- Every signal, trade, and risk decision is logged to SQLite and CSV for review.
 
 11. **Financial sector exclusion** -- Banks, insurance companies, and lending institutions are permanently excluded from the trading universe.
+
+12. **Non-equity ETF exclusion** -- Bond ETFs, leveraged/inverse ETFs, commodity ETFs, and volatility products are automatically filtered out. Equity index ETFs (SPY, QQQ, etc.) are kept.
+
+13. **3-tier sector fallback** -- Stock sector data is resolved through IBKR contract details, then yfinance, then Ollama LLM classification. Only stocks that fail all three are excluded.
+
+14. **News fallback** -- News headlines for AI context are fetched from Tavily API first, falling back to yfinance news when Tavily is unavailable or rate-limited.
 
 ---
 

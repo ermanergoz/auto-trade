@@ -113,7 +113,7 @@ For each candidate:
 - Gathers: technical indicator values, recent price action, news headlines, sector performance
 - Sends structured prompt to Claude or GPT API
 - Receives structured response: `{action: buy|sell|hold, confidence: 0-100, entry_price, stop_loss, take_profit, reasoning}`
-- Confidence threshold: only act on signals with confidence >= 70 (configurable)
+- Confidence threshold: only act on signals with confidence >= 65 (configurable)
 
 ### 6. Risk Manager
 
@@ -232,7 +232,7 @@ MIN_MARKET_CAP = 50_000_000  # $50M
 
 # Strategy
 SCAN_INTERVAL_MINUTES = 15
-AI_CONFIDENCE_THRESHOLD = 70
+AI_CONFIDENCE_THRESHOLD = 65
 AI_MODEL = "claude-sonnet-4-6"
 
 # Risk

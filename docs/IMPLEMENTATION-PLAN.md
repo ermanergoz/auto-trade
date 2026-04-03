@@ -167,7 +167,7 @@ LLM-powered analyst:
 - Prompt construction: build a structured prompt that includes all context and asks for a JSON response with: `action` (buy/sell/hold), `confidence` (0-100), `entry_price`, `stop_loss`, `take_profit`, `reasoning`.
 - LLM call: use `anthropic` SDK for Claude (default) or `openai` SDK for GPT. Model configurable via `AI_MODEL` setting. Use JSON mode / tool_use for structured output.
 - Response parsing: validate JSON response, ensure all fields present, confidence is numeric, prices are reasonable relative to current price.
-- Filtering: only return signals with `confidence >= AI_CONFIDENCE_THRESHOLD` (default 70).
+- Filtering: only return signals with `confidence >= AI_CONFIDENCE_THRESHOLD` (default 65).
 - `analyze_batch(candidates)` — processes all candidates sequentially (to stay within rate limits). Returns list of `Signal` objects with `source="ai"`.
 
 ### Verification Steps
@@ -345,7 +345,7 @@ Performance reporting:
 3. **Review every trade** in the trade journal. Check AI reasoning quality.
 4. **Tune parameters based on observations**:
    - `SCAN_INTERVAL_MINUTES` — are 15-minute scans too frequent or too sparse?
-   - `AI_CONFIDENCE_THRESHOLD` — are good trades being filtered at 70? Lower to 60? Or raise to 80?
+   - `AI_CONFIDENCE_THRESHOLD` — are good trades being filtered at 65? Lower to 60? Or raise to 80?
    - `MAX_POSITION_SIZE_PCT` — is 5% appropriate for the account size?
    - `DEFAULT_STOP_LOSS_PCT` — is 3% too tight (getting stopped out on noise)?
    - Screener indicator thresholds (RSI boundaries, volume spike multiplier)
