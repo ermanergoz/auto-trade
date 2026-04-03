@@ -7,17 +7,7 @@ import pytest
 from core.models import Trade, TradeType
 from backtest.engine import SimulatedPortfolio, BacktestConfig
 from backtest.report import calculate_metrics, _calculate_max_drawdown, _std
-from core.models import Signal, Action
-
-
-def _make_signal(**kwargs) -> Signal:
-    defaults = dict(
-        ticker="AAPL", action=Action.BUY, confidence=80,
-        entry_price=150.0, stop_loss=145.0, take_profit=165.0,
-        reasoning="test", source="screener", exchange="SMART",
-    )
-    defaults.update(kwargs)
-    return Signal(**defaults)
+from tests.conftest import make_signal as _make_signal
 
 
 class TestSimulatedPortfolio:
