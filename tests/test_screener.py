@@ -64,18 +64,18 @@ class TestRSI:
         closes = _trending_down(40, 200, 3)
         df = _make_df(closes)
         result = check_rsi(df)
-        if result:
-            assert result["action"] == Action.BUY
-            assert result["indicator"] == "RSI"
+        assert result is not None, "Steep downtrend should trigger RSI oversold"
+        assert result["action"] == Action.BUY
+        assert result["indicator"] == "RSI"
 
     def test_overbought(self):
         # Steep uptrend should produce RSI > 70
         closes = _trending_up(40, 50, 3)
         df = _make_df(closes)
         result = check_rsi(df)
-        if result:
-            assert result["action"] == Action.SELL
-            assert result["indicator"] == "RSI"
+        assert result is not None, "Steep uptrend should trigger RSI overbought"
+        assert result["action"] == Action.SELL
+        assert result["indicator"] == "RSI"
 
     def test_neutral_returns_none(self):
         # Flat price — RSI ~50
@@ -116,8 +116,9 @@ class TestMACD:
 
 class TestMACrossover:
     def test_golden_cross(self):
-        # Long flat then sharp rise — MA5 will cross above MA20
-        closes = _flat(25, 100) + _trending_up(10, 100, 5)
+        # Gentle downtrend then just enough uptick for MA5 to cross above MA20
+        # at exactly the last bar (prev: fast <= slow, curr: fast > slow)
+        closes = _trending_down(25, 120, 0.5) + _trending_up(5, 107, 2)
         df = _make_df(closes)
         result = check_ma_crossover(df)
         if result:
@@ -125,8 +126,8 @@ class TestMACrossover:
             assert result["indicator"] == "MA_CROSSOVER"
 
     def test_death_cross(self):
-        # Long flat then sharp drop
-        closes = _flat(25, 100) + _trending_down(10, 100, 5)
+        # Gentle uptrend then enough downtick for MA5 to cross below MA20
+        closes = _trending_up(25, 80, 0.5) + _trending_down(5, 93, 2)
         df = _make_df(closes)
         result = check_ma_crossover(df)
         if result:
@@ -150,7 +151,7 @@ class TestVolumeSpike:
         closes[-1] = 102
         df = _make_df(closes, volumes)
         result = check_volume_spike(df)
-        assert result is not None
+        assert result is not None, "4x volume spike should be detected"
         assert result["indicator"] == "VOLUME_SPIKE"
         assert result["action"] == Action.BUY
 
@@ -172,21 +173,21 @@ class TestVolumeSpike:
 
 class TestBollinger:
     def test_below_lower_band(self):
-        # Stable then sudden drop
+        # Stable then sudden drop — should breach lower Bollinger band
         closes = _flat(25, 100) + [70]
         df = _make_df(closes)
         result = check_bollinger(df)
-        if result:
-            assert result["action"] == Action.BUY
-            assert result["indicator"] == "BOLLINGER"
+        assert result is not None, "30% drop should breach lower Bollinger band"
+        assert result["action"] == Action.BUY
+        assert result["indicator"] == "BOLLINGER"
 
     def test_above_upper_band(self):
-        # Stable then sudden spike
+        # Stable then sudden spike — should breach upper Bollinger band
         closes = _flat(25, 100) + [130]
         df = _make_df(closes)
         result = check_bollinger(df)
-        if result:
-            assert result["action"] == Action.SELL
+        assert result is not None, "30% spike should breach upper Bollinger band"
+        assert result["action"] == Action.SELL
 
     def test_within_bands(self):
         df = _make_df(_flat(25))
@@ -200,22 +201,26 @@ class TestBollinger:
 
 class TestSupportResistance:
     def test_near_support(self):
-        # 20-day low is 95, current close near 95
-        closes = [100] * 10 + [95] + [100] * 10 + [95.5]
+        # _make_df creates low = close * 0.98, so close=95 gives low=93.1
+        # Current close must be within 2% of that low: 93.1 * 1.02 = 94.96
+        # So current close ~93.5 is within range of 20-day low 93.1
+        closes = [100] * 10 + [95] + [100] * 10 + [93.5]
         df = _make_df(closes)
         result = check_support_resistance(df)
-        if result:
-            assert result["action"] == Action.BUY
-            assert result["indicator"] == "SUPPORT"
+        assert result is not None, "Close near 20-day low should trigger support signal"
+        assert result["action"] == Action.BUY
+        assert result["indicator"] == "SUPPORT"
 
     def test_near_resistance(self):
-        # 20-day high is 110, current close near 110
-        closes = [100] * 10 + [110] + [100] * 10 + [109.5]
+        # _make_df creates high = close * 1.01, so close=110 gives high=111.1
+        # Current close must be within 2% of that high: 111.1 * 0.98 = 108.88
+        # So current close ~110 is within range of 20-day high 111.1
+        closes = [100] * 10 + [110] + [100] * 10 + [110.0]
         df = _make_df(closes)
         result = check_support_resistance(df)
-        if result:
-            assert result["action"] == Action.SELL
-            assert result["indicator"] == "RESISTANCE"
+        assert result is not None, "Close near 20-day high should trigger resistance signal"
+        assert result["action"] == Action.SELL
+        assert result["indicator"] == "RESISTANCE"
 
 
 # ---------------------------------------------------------------------------

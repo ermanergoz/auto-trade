@@ -1,10 +1,8 @@
 """Tests for core/risk.py."""
 
-from datetime import datetime
-
 import pytest
 
-from core.models import Signal, Position, Action, TradeType
+from core.models import Action
 from core.risk import (
     check_position_size,
     check_daily_loss_limit,
@@ -14,37 +12,7 @@ from core.risk import (
     calculate_position_size,
     evaluate,
 )
-
-
-def _make_signal(**kwargs) -> Signal:
-    defaults = dict(
-        ticker="AAPL",
-        action=Action.BUY,
-        confidence=85,
-        entry_price=150.0,
-        stop_loss=145.0,
-        take_profit=165.0,
-        reasoning="Test signal",
-        source="ai",
-        exchange="SMART",
-    )
-    defaults.update(kwargs)
-    return Signal(**defaults)
-
-
-def _make_position(**kwargs) -> Position:
-    defaults = dict(
-        ticker="MSFT",
-        exchange="SMART",
-        quantity=10,
-        entry_price=300.0,
-        entry_time=datetime(2024, 1, 15),
-        stop_loss=291.0,
-        take_profit=318.0,
-        trade_type=TradeType.DAY,
-    )
-    defaults.update(kwargs)
-    return Position(**defaults)
+from tests.conftest import make_signal as _make_signal, make_position as _make_position
 
 
 class TestPositionSize:

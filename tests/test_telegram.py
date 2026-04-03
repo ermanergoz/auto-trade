@@ -1,43 +1,11 @@
 """Tests for notifications/telegram.py — TDD: written before implementation."""
 
-from datetime import datetime
 from unittest.mock import patch, MagicMock
 
 import pytest
 
-from core.models import Signal, Position, Action, TradeType
-
-
-def _make_signal(**kwargs) -> Signal:
-    defaults = dict(
-        ticker="AAPL",
-        action=Action.BUY,
-        confidence=80,
-        entry_price=150.0,
-        stop_loss=145.0,
-        take_profit=165.0,
-        reasoning="Strong uptrend with volume",
-        source="ai",
-        exchange="SMART",
-        trade_type=TradeType.DAY,
-    )
-    defaults.update(kwargs)
-    return Signal(**defaults)
-
-
-def _make_position(**kwargs) -> Position:
-    defaults = dict(
-        ticker="MSFT",
-        exchange="SMART",
-        quantity=10,
-        entry_price=300.0,
-        entry_time=datetime(2024, 1, 15),
-        stop_loss=291.0,
-        take_profit=318.0,
-        trade_type=TradeType.DAY,
-    )
-    defaults.update(kwargs)
-    return Position(**defaults)
+from core.models import Action, TradeType
+from tests.conftest import make_signal as _make_signal, make_position as _make_position
 
 
 # ---------------------------------------------------------------------------
