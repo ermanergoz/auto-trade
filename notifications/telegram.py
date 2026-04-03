@@ -162,14 +162,20 @@ def _build_status_response() -> str:
     return "\n".join(lines)
 
 
+_MAX_LISTENER_ERRORS = 10
+
+
 def _poll_loop() -> None:
     """Background thread that polls for incoming Telegram messages."""
+    import time
     logger.info("Telegram listener started — send 'status' to get status")
     offset = None
+    consecutive_errors = 0
 
     while True:
         try:
             updates = _get_updates_sync(offset=offset)
+            consecutive_errors = 0  # Reset on success
             for update in updates:
                 offset = update.update_id + 1
 
@@ -187,10 +193,15 @@ def _poll_loop() -> None:
                     _send_sync(response)
 
         except Exception as e:
-            logger.debug("Telegram poll error: %s", e)
+            consecutive_errors += 1
+            logger.warning(
+                "Telegram poll error (%d/%d): %s",
+                consecutive_errors, _MAX_LISTENER_ERRORS, e,
+            )
+            if consecutive_errors >= _MAX_LISTENER_ERRORS:
+                logger.error("Telegram listener exceeded max errors — stopping")
+                return
 
-        # Small sleep between polls (the timeout in get_updates does most of the waiting)
-        import time
         time.sleep(1)
 
 
