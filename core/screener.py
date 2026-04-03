@@ -208,11 +208,12 @@ def check_bollinger(df: pd.DataFrame) -> Optional[dict]:
     if bbands is None or bbands.empty:
         return None
 
-    lower_col = f"BBL_{BOLLINGER_PERIOD}_{BOLLINGER_STD}"
-    upper_col = f"BBU_{BOLLINGER_PERIOD}_{BOLLINGER_STD}"
-    mid_col = f"BBM_{BOLLINGER_PERIOD}_{BOLLINGER_STD}"
+    # pandas_ta column naming varies by version (e.g. "BBL_20_2.0" vs "BBL_20_2.0_2.0")
+    lower_col = next((c for c in bbands.columns if c.startswith("BBL_")), None)
+    upper_col = next((c for c in bbands.columns if c.startswith("BBU_")), None)
+    mid_col = next((c for c in bbands.columns if c.startswith("BBM_")), None)
 
-    if lower_col not in bbands.columns or upper_col not in bbands.columns:
+    if not lower_col or not upper_col or not mid_col:
         return None
 
     price = df["close"].iloc[-1]
