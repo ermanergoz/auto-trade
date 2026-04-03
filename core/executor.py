@@ -56,11 +56,16 @@ def place_order(
 
     parent_order, tp_order, sl_order = bracket
 
-    # GTC ensures orders survive overnight and fill at market open
+    # GTC ensures orders survive overnight and fill at market open.
+    # transmit=False on parent and TP so all three transmit atomically
+    # when the last order (SL) is placed with transmit=True.
     for o in bracket:
         o.tif = "GTC"
+    parent_order.transmit = False
+    tp_order.transmit = False
+    sl_order.transmit = True
 
-    # Place all three orders
+    # Place all three orders (only the last one triggers transmission)
     trades = []
     try:
         parent_trade = ib.placeOrder(contract, parent_order)
@@ -235,8 +240,8 @@ def setup_disconnect_handler(ib: IB) -> None:
 
     def on_disconnect():
         nonlocal _reconnecting
-        from core.scheduler import _shutting_down
-        if _shutting_down or _reconnecting:
+        from core import state as _state
+        if _state.shutting_down or _reconnecting:
             return
         _reconnecting = True
         logger.warning("IBKR connection lost! Attempting reconnect...")
