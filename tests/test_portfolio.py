@@ -153,3 +153,47 @@ class TestDailySummary:
     def test_get_nonexistent(self, db_path):
         result = get_daily_summary(date(2024, 6, 1), db_path)
         assert result is None
+
+
+class TestReconcilePositions:
+    """Verify position reconciliation between DB and IBKR."""
+
+    def test_in_sync(self, db_path):
+        from core.portfolio import reconcile_positions
+
+        pos = _make_position(ticker="AAPL")
+        add_position(pos, db_path)
+
+        ibkr_positions = [{"ticker": "AAPL", "quantity": 100}]
+        report = reconcile_positions(ibkr_positions, db_path)
+
+        assert report["in_sync"] is True
+        assert report["orphaned_db"] == []
+        assert report["orphaned_ibkr"] == []
+
+    def test_orphaned_in_db(self, db_path):
+        from core.portfolio import reconcile_positions
+
+        pos = _make_position(ticker="AAPL")
+        add_position(pos, db_path)
+
+        ibkr_positions = []  # IBKR has nothing
+        report = reconcile_positions(ibkr_positions, db_path)
+
+        assert report["in_sync"] is False
+        assert "AAPL" in report["orphaned_db"]
+
+    def test_orphaned_in_ibkr(self, db_path):
+        from core.portfolio import reconcile_positions
+
+        ibkr_positions = [{"ticker": "MSFT", "quantity": 50}]
+        report = reconcile_positions(ibkr_positions, db_path)
+
+        assert report["in_sync"] is False
+        assert "MSFT" in report["orphaned_ibkr"]
+
+    def test_empty_both(self, db_path):
+        from core.portfolio import reconcile_positions
+
+        report = reconcile_positions([], db_path)
+        assert report["in_sync"] is True

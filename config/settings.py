@@ -140,3 +140,28 @@ TIMEZONE = "Europe/Istanbul"
 def is_paper_mode() -> bool:
     """Check if connected to paper trading (port 7497) vs live (port 7496)."""
     return IBKR_PORT == 7497
+
+
+def validate_settings() -> list[str]:
+    """Validate configuration values at startup. Returns list of errors (empty = OK)."""
+    errors = []
+
+    if IBKR_PORT not in (7496, 7497):
+        errors.append(f"IBKR_PORT must be 7496 (live) or 7497 (paper), got {IBKR_PORT}")
+
+    if MAX_POSITION_SIZE_PCT <= 0 or MAX_POSITION_SIZE_PCT > 100:
+        errors.append(f"MAX_POSITION_SIZE_PCT must be 0-100, got {MAX_POSITION_SIZE_PCT}")
+
+    if DAILY_LOSS_LIMIT_PCT <= 0 or DAILY_LOSS_LIMIT_PCT > 50:
+        errors.append(f"DAILY_LOSS_LIMIT_PCT must be 0-50, got {DAILY_LOSS_LIMIT_PCT}")
+
+    if MAX_OPEN_POSITIONS <= 0:
+        errors.append(f"MAX_OPEN_POSITIONS must be positive, got {MAX_OPEN_POSITIONS}")
+
+    if MIN_RISK_REWARD_RATIO <= 0:
+        errors.append(f"MIN_RISK_REWARD_RATIO must be positive, got {MIN_RISK_REWARD_RATIO}")
+
+    if SCAN_INTERVAL_MINUTES < 1:
+        errors.append(f"SCAN_INTERVAL_MINUTES must be >= 1, got {SCAN_INTERVAL_MINUTES}")
+
+    return errors

@@ -241,6 +241,14 @@ def main() -> None:
             console.print("Aborted.")
             sys.exit(0)
 
+    # Validate configuration
+    from config.settings import validate_settings
+    config_errors = validate_settings()
+    if config_errors:
+        for err in config_errors:
+            console.print(f"[bold red]Config error:[/bold red] {err}")
+        sys.exit(1)
+
     # Initialize database
     init_db()
     logger.info("Portfolio database initialized")
@@ -276,6 +284,21 @@ def main() -> None:
         # Display account info
         summary = get_account_summary(ib)
         display_account_summary(summary)
+
+        # Reconcile positions with IBKR
+        from core.portfolio import reconcile_positions, get_open_positions, get_daily_pnl
+        ibkr_positions = [
+            {"ticker": p.contract.symbol, "quantity": int(p.position)}
+            for p in ib.positions()
+        ]
+        recon = reconcile_positions(ibkr_positions)
+        if not recon["in_sync"]:
+            console.print(
+                f"[yellow]Position mismatch: DB has {recon['orphaned_db']}, "
+                f"IBKR has {recon['orphaned_ibkr']}[/yellow]"
+            )
+        else:
+            logger.info("Position reconciliation OK: %d in sync", recon["db_count"])
 
         # Start Telegram notifications + listener
         from notifications.telegram import notify_startup, start_listener, update_status, update_portfolio_data
