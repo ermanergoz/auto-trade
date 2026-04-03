@@ -197,35 +197,51 @@ def unsubscribe_realtime(ib: IB, contract: Contract) -> None:
 
 
 # ---------------------------------------------------------------------------
-# News (Tavily API)
+# News (Tavily API + yfinance fallback)
 # ---------------------------------------------------------------------------
 
-def get_news(ticker: str, market: str = "US", max_results: int = 5) -> list[str]:
-    """Fetch recent news headlines for a ticker via Tavily API.
-
-    Returns a list of headline strings.
-    """
-    if not TAVILY_API_KEY:
-        logger.debug("No Tavily API key configured — skipping news")
+def _get_news_yfinance(ticker: str, max_results: int = 5) -> list[str]:
+    """Fetch recent news headlines via yfinance (free, no API key)."""
+    try:
+        import yfinance as yf
+        news = yf.Ticker(ticker).news
+        if not news:
+            return []
+        headlines = [item.get("title", "") for item in news[:max_results] if item.get("title")]
+        return headlines
+    except Exception as e:
+        logger.debug("yfinance news fetch failed for %s: %s", ticker, e)
         return []
 
+
+def get_news(ticker: str, market: str = "US", max_results: int = 5) -> list[str]:
+    """Fetch recent news headlines for a ticker.
+
+    Tries Tavily API first, falls back to yfinance if Tavily fails or is not configured.
+    Returns a list of headline strings.
+    """
     cache_key = f"news:{ticker}:{market}"
     cached = _cache_get(cache_key)
     if cached is not None:
         return cached
 
-    try:
-        from tavily import TavilyClient
-        client = TavilyClient(api_key=TAVILY_API_KEY)
+    # Try Tavily first
+    if TAVILY_API_KEY:
+        try:
+            from tavily import TavilyClient
+            client = TavilyClient(api_key=TAVILY_API_KEY)
 
-        query = f"{ticker} stock"
+            query = f"{ticker} stock"
+            response = client.search(query, max_results=max_results, search_depth="basic")
+            headlines = [r.get("title", "") for r in response.get("results", [])]
 
-        response = client.search(query, max_results=max_results, search_depth="basic")
-        headlines = [r.get("title", "") for r in response.get("results", [])]
+            _cache_set(cache_key, headlines, ttl=900)
+            return headlines
 
-        _cache_set(cache_key, headlines, ttl=900)  # 15 min cache
-        return headlines
+        except Exception as e:
+            logger.debug("Tavily failed for %s, falling back to yfinance: %s", ticker, e)
 
-    except Exception as e:
-        logger.error("Tavily news fetch failed for %s: %s", ticker, e)
-        return []
+    # Fallback to yfinance
+    headlines = _get_news_yfinance(ticker, max_results)
+    _cache_set(cache_key, headlines, ttl=900)
+    return headlines
