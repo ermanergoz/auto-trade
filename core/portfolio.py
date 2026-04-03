@@ -254,6 +254,44 @@ def get_trades(
     ]
 
 
+def reconcile_positions(
+    ibkr_positions: list[dict],
+    db_path: Path = DB_PATH,
+) -> dict:
+    """Compare IBKR positions with database. Returns reconciliation report.
+
+    Args:
+        ibkr_positions: List of dicts with 'ticker' and 'quantity' from ib.positions().
+
+    Returns:
+        Dict with db_count, ibkr_count, orphaned_db, orphaned_ibkr, in_sync.
+    """
+    db_positions = get_open_positions(db_path)
+    db_tickers = {p.ticker for p in db_positions}
+    ibkr_tickers = {p["ticker"] for p in ibkr_positions}
+
+    orphaned_db = sorted(db_tickers - ibkr_tickers)
+    orphaned_ibkr = sorted(ibkr_tickers - db_tickers)
+
+    report = {
+        "db_count": len(db_positions),
+        "ibkr_count": len(ibkr_positions),
+        "orphaned_db": orphaned_db,
+        "orphaned_ibkr": orphaned_ibkr,
+        "in_sync": len(orphaned_db) == 0 and len(orphaned_ibkr) == 0,
+    }
+
+    if not report["in_sync"]:
+        logger.warning(
+            "Position mismatch! DB: %d, IBKR: %d. "
+            "In DB only: %s. In IBKR only: %s",
+            report["db_count"], report["ibkr_count"],
+            orphaned_db, orphaned_ibkr,
+        )
+
+    return report
+
+
 def get_daily_pnl(day: Optional[date] = None, db_path: Path = DB_PATH) -> float:
     """Calculate realized P&L for a given day (default: today)."""
     day = day or date.today()
