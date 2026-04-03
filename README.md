@@ -143,7 +143,8 @@ auto-trade/
 │   ├── risk.py                  # Risk manager (pure functions)
 │   ├── executor.py              # IBKR order execution
 │   ├── scheduler.py             # Main orchestration loop
-│   └── logger.py                # Structured logging + Rich dashboard
+│   ├── logger.py                # Structured logging + Rich dashboard
+│   └── state.py                 # Shared mutable state (shutdown flag)
 ├── backtest/
 │   ├── __init__.py
 │   ├── engine.py                # Backtesting engine
@@ -153,6 +154,7 @@ auto-trade/
 │   └── telegram.py              # Telegram bot notifications
 ├── tests/
 │   ├── __init__.py
+│   ├── conftest.py              # Shared test fixtures (make_signal, make_position)
 │   ├── test_models.py           # Data class tests
 │   ├── test_connection.py       # IBKR connection tests
 │   ├── test_data.py             # Market data tests
@@ -161,6 +163,8 @@ auto-trade/
 │   ├── test_screener.py         # Technical screener tests
 │   ├── test_analyst.py          # AI analyst tests
 │   ├── test_risk.py             # Risk manager tests
+│   ├── test_scheduler.py        # Streaming pipeline tests
+│   ├── test_telegram.py         # Telegram notification tests
 │   └── test_backtest.py         # Backtesting engine tests
 ├── docs/
 │   ├── DESIGN.md                # Full design specification
@@ -292,7 +296,7 @@ cp .env.example .env
 | `pandas-ta` | >= 0.3.14b | Technical indicators (RSI, MACD, Bollinger, etc.) |
 | `python-telegram-bot` | >= 20.7 | Telegram notification bot |
 | `python-dotenv` | >= 1.0.0 | Environment variable loading |
-| `rich` | >= 13.7.0 | Terminal UI, tables, and dashboard |
+| `rich` | >= 13.7.0 | Terminal UI, tables, and Rich dashboard |
 | `tavily-python` | >= 0.3.0 | News API integration |
 | `pytest` | >= 7.4.0 | Test framework |
 | `pytest-asyncio` | >= 0.23.0 | Async test support |
@@ -356,7 +360,7 @@ All trading parameters are configured in `config/settings.py`. Key settings:
 |-----------|---------|-------------|
 | `SCAN_INTERVAL_MINUTES` | `15` | Minutes between scan cycles |
 | `AI_CONFIDENCE_THRESHOLD` | `65` | Minimum AI confidence to act (0-100) |
-| `AI_MAX_CANDIDATES` | `20` | Max candidates sent to AI per cycle (0 = unlimited) |
+| `AI_MAX_CANDIDATES` | `0` | Max candidates sent to AI per cycle (0 = unlimited) |
 | `AI_MODEL` | `qwen2.5:7b` | Ollama model for analysis |
 
 #### Risk Settings
@@ -739,6 +743,7 @@ pytest tests/ --cov=core --cov=backtest --cov=notifications
 
 | Module | Tests |
 |--------|-------|
+| `conftest.py` | Shared fixtures: `make_signal()`, `make_position()` factories |
 | `test_models.py` | Data class construction, properties, P&L calculations |
 | `test_connection.py` | IBKR connection, reconnection, contract creation |
 | `test_data.py` | Historical data fetching, caching, news API |
@@ -747,6 +752,8 @@ pytest tests/ --cov=core --cov=backtest --cov=notifications
 | `test_screener.py` | Technical indicator calculations, scoring, signal generation |
 | `test_analyst.py` | LLM integration, response validation, cost tracking |
 | `test_risk.py` | All 11 risk checks, position sizing calculations |
+| `test_scheduler.py` | Streaming signal pipeline, callback-based risk check flow |
+| `test_telegram.py` | Status commands, portfolio display, risk notifications |
 | `test_backtest.py` | Backtesting engine, simulated portfolio, no look-ahead bias |
 
 ---

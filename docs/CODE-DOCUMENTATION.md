@@ -119,7 +119,8 @@ auto-trade/
 │   ├── executor.py          # Actually place and manage orders on IBKR
 │   ├── scheduler.py         # The main loop that orchestrates everything
 │   ├── portfolio.py         # SQLite database for tracking positions and trades
-│   └── logger.py            # Pretty terminal output and CSV trade journals
+│   ├── logger.py            # Pretty terminal output and CSV trade journals
+│   └── state.py             # Shared mutable state (shutdown flag)
 │
 ├── backtest/                # Historical testing
 │   ├── engine.py            # Replay historical data day-by-day
@@ -129,6 +130,7 @@ auto-trade/
 │   └── telegram.py          # Send alerts to your phone via Telegram
 │
 ├── tests/                   # Automated tests for every module
+│   ├── conftest.py          # Shared fixtures (make_signal, make_position)
 │   ├── test_screener.py
 │   ├── test_risk.py
 │   ├── test_analyst.py
@@ -137,6 +139,8 @@ auto-trade/
 │   ├── test_portfolio.py
 │   ├── test_models.py
 │   ├── test_universe.py
+│   ├── test_scheduler.py
+│   ├── test_telegram.py
 │   └── test_backtest.py
 │
 ├── data/                    # Runtime data (gitignored)
@@ -221,6 +225,8 @@ IBKR_CLIENT_ID = 1          # Identifies our connection to IBKR
 ```python
 MARKETS = ["US"]                    # Only US stocks
 EXCLUDED_SECTORS = ["Financials"]   # No banks, insurance, lending
+FINANCIAL_KEYWORDS = [...]          # Shared keyword list used by both universe
+                                    # builder and risk manager to detect financials
 MIN_DAILY_VOLUME = 100_000          # Stock must trade 100K shares/day minimum
 MIN_MARKET_CAP = 50_000_000         # $50M minimum market cap
 ```
@@ -231,7 +237,7 @@ Why exclude financials? Banks and insurance companies behave very differently fr
 ```python
 SCAN_INTERVAL_MINUTES = 15         # Run the full pipeline every 15 min
 AI_CONFIDENCE_THRESHOLD = 65       # AI must be 65%+ confident
-AI_MAX_CANDIDATES = 20             # Max stocks sent to AI per cycle (0 = no limit)
+AI_MAX_CANDIDATES = 0              # Max stocks sent to AI per cycle (0 = no limit)
 AI_MODEL = "qwen2.5:7b"           # The local AI model
 OLLAMA_HOST = "http://localhost:11434"  # Where Ollama runs
 ```
@@ -716,7 +722,7 @@ This is **atomic** — all three orders are placed as a unit. You never end up w
 
 ### Key Functions
 
-**`place_order(ib, signal, quantity, dry_run)`** — The main function. Creates a bracket order from the signal's entry, stop-loss, and take-profit prices. All legs use `tif='GTC'` (Good Till Cancelled) so orders placed outside market hours persist and execute at market open. In dry-run mode, it just logs what WOULD happen.
+**`place_order(ib, signal, quantity, dry_run)`** — The main function. Creates a bracket order from the signal's entry, stop-loss, and take-profit prices. All legs use `tif='GTC'` (Good Till Cancelled) so orders placed outside market hours persist and execute at market open. The parent and take-profit orders are placed with `transmit=False`, and only the stop-loss (last order) has `transmit=True` — this ensures all three legs transmit atomically to IBKR, preventing the parent from filling before child orders are registered. In dry-run mode, it just logs what WOULD happen.
 
 **`close_position_market(ib, position, dry_run)`** — Immediately close a position with a market order. Used when day-trade positions need to be closed before market close.
 
@@ -726,7 +732,7 @@ This is **atomic** — all three orders are placed as a unit. You never end up w
 
 **`setup_fill_handler(ib, signal, quantity, on_fill)`** — Attaches an async callback to IBKR's order status events. When the parent order status changes to "Filled", it records the position in the database and calls the optional `on_fill` callback (used by the scheduler to send Telegram notifications). This ensures positions are only recorded and notifications sent after IBKR confirms an actual fill — not when the limit order is merely submitted.
 
-**`setup_disconnect_handler(ib)`** — Attaches a callback for connection drops. Important because IBKR connections are notoriously unstable. Uses a re-entrancy guard (`_reconnecting` flag) to prevent cascading reconnect loops where a reconnect triggers another disconnect event.
+**`setup_disconnect_handler(ib)`** — Attaches a callback for connection drops. Important because IBKR connections are notoriously unstable. Uses a re-entrancy guard (`_reconnecting` flag) to prevent cascading reconnect loops where a reconnect triggers another disconnect event. Reads the shared `shutting_down` flag from `core.state` to skip reconnection during intentional shutdown (avoiding the circular import that would result from importing directly from `scheduler.py`).
 
 ### Dry-Run Mode
 
@@ -818,7 +824,7 @@ This was one of our challenges (see Section 21). `ib_insync` needs its event loo
 ### Graceful Shutdown
 
 When you press Ctrl+C:
-1. Sets a `_shutting_down` flag to prevent reconnection attempts
+1. Sets `state.shutting_down = True` (in `core/state.py`) to prevent reconnection attempts
 2. Closes all open day-trade positions (so you don't accidentally hold them overnight)
 3. Disconnects from IBKR cleanly
 
@@ -858,7 +864,8 @@ signals (every signal ever generated — audit trail):
 2. Create a Trade record with entry AND exit info
 3. Insert into trades table
 4. Delete from positions table
-5. All in one transaction (either everything succeeds or nothing does)
+5. Log the trade to the daily CSV journal (`core/logger.log_trade_to_csv`)
+6. All in one transaction (either everything succeeds or nothing does)
 
 **`get_daily_pnl()`** — Calculate today's realized P&L by summing all trades closed today.
 
@@ -1124,12 +1131,13 @@ This prevents accidentally trading with real money.
 
 ### Test Philosophy
 
-Every module has its own test file. Tests use **synthetic data** — hand-built DataFrames and mock objects — so they don't need an IBKR connection or internet access.
+Every module has its own test file. Tests use **synthetic data** — hand-built DataFrames and mock objects — so they don't need an IBKR connection or internet access. Shared test fixtures (`make_signal()`, `make_position()`) live in `tests/conftest.py` to avoid duplication across test files.
 
 ### What's Tested
 
 | Test File | What It Verifies |
 |-----------|-----------------|
+| `conftest.py` | Shared fixtures: `make_signal()`, `make_position()` factories |
 | `test_screener.py` | Each indicator triggers correctly on crafted price data |
 | `test_risk.py` | Each safety check accepts/rejects correctly |
 | `test_analyst.py` | Prompt building, response parsing, validation |
@@ -1138,6 +1146,8 @@ Every module has its own test file. Tests use **synthetic data** — hand-built 
 | `test_portfolio.py` | DB operations, position lifecycle |
 | `test_models.py` | Dataclass construction, computed properties (P&L, duration) |
 | `test_universe.py` | Universe building, filtering, caching |
+| `test_scheduler.py` | Streaming signal pipeline, callback-based risk check + execution |
+| `test_telegram.py` | Status commands, portfolio display, risk notifications |
 | `test_backtest.py` | Full backtest loop, exit checking, no look-ahead |
 
 ### Running Tests
@@ -1213,13 +1223,13 @@ pytest tests/test_risk.py::test_daily_loss_limit -v
 
 **The problem**: IBKR's TWS/Gateway connections drop randomly. Network hiccup? Connection lost. TWS auto-restarts? Connection lost. IBKR does daily server resets around midnight? Connection lost.
 
-**The solution**: The `ensure_connected()` function at the top of every scan cycle. Before doing anything, check the connection. If it's dead, reconnect. Plus: the graceful shutdown handler sets a `_shutting_down` flag to prevent the reconnection logic from fighting a deliberate disconnect (this was a bug where Ctrl+C would try to reconnect instead of shutting down).
+**The solution**: The `ensure_connected()` function at the top of every scan cycle. Before doing anything, check the connection. If it's dead, reconnect. Plus: the graceful shutdown handler sets a `shutting_down` flag (in the shared `core/state.py` module) to prevent the reconnection logic from fighting a deliberate disconnect (this was a bug where Ctrl+C would try to reconnect instead of shutting down). The flag lives in a shared module to avoid a circular import between `scheduler.py` and `executor.py`.
 
 ### Challenge 8: Financial Sector Stocks Slipping Through
 
 **The problem**: IBKR's sector data isn't always reliable. Sometimes a bank stock would have sector = "N/A" or a wrong sector, passing through the universe filter.
 
-**The solution**: **Double filtering**. The universe builder filters by sector at build time. Then the risk manager has its OWN `check_excluded_sector()` that catches any stragglers. Belt AND suspenders. Also added an explicit exclusion list of ~40 specific tickers known to be problematic.
+**The solution**: **Double filtering**. The universe builder filters by sector at build time. Then the risk manager has its OWN `check_excluded_sector()` that catches any stragglers. Belt AND suspenders. Both use the same `FINANCIAL_KEYWORDS` list from `config/settings.py` to stay in sync. Also added an explicit exclusion list of ~40 specific tickers known to be problematic.
 
 ---
 
@@ -1247,7 +1257,7 @@ pytest tests/test_risk.py::test_daily_loss_limit -v
 
 **Decision**: Every trade is placed as a bracket order (entry + take-profit + stop-loss).
 
-**Why**: Atomicity. With separate orders, there's a window where you have a position but no stop-loss (if the system crashes between placing the entry and the stop-loss). With bracket orders, IBKR handles all three as a unit. Your stop-loss exists from the very first moment.
+**Why**: Atomicity. With separate orders, there's a window where you have a position but no stop-loss (if the system crashes between placing the entry and the stop-loss). With bracket orders, IBKR handles all three as a unit. Your stop-loss exists from the very first moment. The parent and take-profit orders use `transmit=False` and only the stop-loss (last leg) uses `transmit=True`, ensuring all three transmit to IBKR as a single atomic unit.
 
 ### Paper Mode as Default
 
