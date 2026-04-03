@@ -56,3 +56,17 @@ class TestNews:
         # With no API key configured, should return empty list
         headlines = get_news("AAPL")
         assert isinstance(headlines, list)
+
+    def test_yfinance_news_fallback(self):
+        from core.data import _get_news_yfinance
+        headlines = _get_news_yfinance("AAPL", max_results=3)
+        assert isinstance(headlines, list)
+        # AAPL should have some news
+        if headlines:
+            assert all(isinstance(h, str) for h in headlines)
+            assert len(headlines) <= 3
+
+    def test_yfinance_news_invalid_ticker(self):
+        from core.data import _get_news_yfinance
+        headlines = _get_news_yfinance("ZZZZZNOTREAL123")
+        assert isinstance(headlines, list)  # should not crash
