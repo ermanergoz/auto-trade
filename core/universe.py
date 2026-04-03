@@ -12,7 +12,7 @@ from ib_insync import IB, Stock, ScannerSubscription
 
 from config.settings import (
     AI_MODEL, DATA_DIR, EXCLUDED_COUNTRIES, EXCLUDED_SECTORS, EXCLUDED_TICKERS,
-    MIN_DAILY_VOLUME, MIN_MARKET_CAP, OLLAMA_HOST,
+    FINANCIAL_KEYWORDS, MIN_DAILY_VOLUME, MIN_MARKET_CAP, OLLAMA_HOST,
 )
 from core.models import StockInfo
 
@@ -374,15 +374,7 @@ def _is_financial_sector(sector: str) -> bool:
     for excluded in EXCLUDED_SECTORS:
         if excluded.lower() in sector_lower:
             return True
-    # Also catch common IBKR/yfinance sector names for financials
-    financial_keywords = [
-        "bank", "insurance", "lending", "mortgage", "loan", "credit",
-        "capital markets", "consumer finance", "financial",
-        "diversified finan", "investment companies", "private equity",
-        "savings & loans", "closed-end funds", "sovereign",
-        "microfinance", "payday", "debt", "usury",
-    ]
-    return any(kw in sector_lower for kw in financial_keywords)
+    return any(kw in sector_lower for kw in FINANCIAL_KEYWORDS)
 
 
 # ---------------------------------------------------------------------------

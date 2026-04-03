@@ -176,6 +176,14 @@ def close_position(
         )
         logger.info("Closed position: %s @ %.2f (P&L: %.2f)",
                      ticker, exit_price, trade.pnl)
+
+        # Log to CSV trade journal
+        try:
+            from core.logger import log_trade_to_csv
+            log_trade_to_csv(trade)
+        except Exception as e:
+            logger.debug("CSV trade journal write failed: %s", e)
+
         return trade
 
 

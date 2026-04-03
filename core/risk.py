@@ -18,6 +18,7 @@ from config.settings import (
     TREND_CONFIRMATION,
     MIN_RISK_REWARD_RATIO,
     ALLOW_SHORT_SELLING,
+    FINANCIAL_KEYWORDS,
 )
 
 logger = logging.getLogger(__name__)
@@ -40,16 +41,20 @@ def check_position_size(
     portfolio_value: float,
     max_pct: float = MAX_POSITION_SIZE_PCT,
 ) -> tuple[bool, str]:
-    """Proposed position must be <= MAX_POSITION_SIZE_PCT of portfolio."""
+    """Single share price must not exceed max position value.
+
+    This is a pre-check that rejects stocks too expensive for even one
+    share to fit within the position limit. The actual quantity-based
+    constraint is enforced by calculate_position_size() after approval.
+    """
     if portfolio_value <= 0:
         return False, "Portfolio value is zero or negative"
 
     max_value = portfolio_value * (max_pct / 100)
-    position_value = signal.entry_price  # per share; actual check uses calculated qty
 
-    if position_value > max_value:
+    if signal.entry_price > max_value:
         return False, (
-            f"Single share ${position_value:.2f} exceeds max position "
+            f"Single share ${signal.entry_price:.2f} exceeds max position "
             f"${max_value:.2f} ({max_pct}% of ${portfolio_value:.2f})"
         )
     return True, ""
@@ -169,12 +174,6 @@ def check_short_selling(
     return False, f"Short selling blocked for {signal.ticker} (not currently held)"
 
 
-_FINANCIAL_KEYWORDS = [
-    "bank", "insurance", "lending", "mortgage", "loan", "credit",
-    "capital markets", "consumer finance", "financial",
-]
-
-
 def check_excluded_sector(signal: Signal) -> tuple[bool, str]:
     """Block financial sector stocks as a safety net.
 
@@ -183,11 +182,10 @@ def check_excluded_sector(signal: Signal) -> tuple[bool, str]:
     """
     sector = getattr(signal, "indicator_values", {}).get("sector", "")
     if not sector:
-        # Also check the signal's exchange field for known financial tickers
         return True, ""
 
     sector_lower = sector.lower()
-    for kw in _FINANCIAL_KEYWORDS:
+    for kw in FINANCIAL_KEYWORDS:
         if kw in sector_lower:
             return False, (
                 f"Excluded sector: '{sector}' (financial/lending companies are blocked)"

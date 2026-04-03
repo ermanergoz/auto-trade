@@ -199,7 +199,7 @@ def run_backtest(config: BacktestConfig) -> SimulatedPortfolio:
     # Get common date range
     all_dates = set()
     for df in all_data.values():
-        all_dates.update(df.index.date if hasattr(df.index, 'date') else df.index)
+        all_dates.update(df.index.date if isinstance(df.index, pd.DatetimeIndex) else df.index)
 
     sorted_dates = sorted(all_dates)
 
@@ -228,13 +228,14 @@ def run_backtest(config: BacktestConfig) -> SimulatedPortfolio:
     )
 
     # Iterate day by day (skip warmup period)
+    current_dt = datetime.combine(sorted_dates[warmup], datetime.min.time())
     for i, current_date in enumerate(sorted_dates[warmup:], start=warmup):
         current_dt = datetime.combine(current_date, datetime.min.time())
 
         # Get current day's data for exit checks
         day_data: dict[str, pd.Series] = {}
         for ticker, df in all_data.items():
-            mask = df.index.date == current_date if hasattr(df.index, 'date') else df.index == current_date
+            mask = df.index.date == current_date if isinstance(df.index, pd.DatetimeIndex) else df.index == current_date
             day_rows = df[mask]
             if not day_rows.empty:
                 day_data[ticker] = day_rows.iloc[-1]
@@ -245,7 +246,7 @@ def run_backtest(config: BacktestConfig) -> SimulatedPortfolio:
         # Step 2: Build stock_data up to current date (NO LOOK-AHEAD)
         stock_data: dict[str, tuple[str, pd.DataFrame]] = {}
         for ticker, df in all_data.items():
-            if hasattr(df.index, 'date'):
+            if isinstance(df.index, pd.DatetimeIndex):
                 hist = df[df.index.date <= current_date]
             else:
                 hist = df[df.index <= current_date]

@@ -33,6 +33,13 @@ IBC_PASSWORD = os.getenv("IBC_PASSWORD", "")
 # ---------------------------------------------------------------------------
 MARKETS = ["US"]
 EXCLUDED_SECTORS = ["Financials"]
+FINANCIAL_KEYWORDS = [
+    "bank", "insurance", "lending", "mortgage", "loan", "credit",
+    "capital markets", "consumer finance", "financial",
+    "diversified finan", "investment companies", "private equity",
+    "savings & loans", "closed-end funds", "sovereign",
+    "microfinance", "payday", "debt", "usury",
+]
 EXCLUDED_COUNTRIES = {"Israel"}
 
 # Specific tickers to always exclude from universe

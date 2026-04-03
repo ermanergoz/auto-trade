@@ -73,11 +73,18 @@ def ensure_connected(
     )
 
 
-def create_contract(ticker: str, exchange: str) -> Stock:
-    """Create an ib_insync Stock contract for the given ticker and exchange.
+def create_contract(ticker: str, exchange: str = "SMART") -> Stock:
+    """Create an ib_insync Stock contract for the given ticker.
 
-    US stocks use SMART routing for best execution.
+    Currently only US stocks are supported — always uses SMART routing
+    for best execution. The exchange parameter is accepted for future
+    multi-market support but is not used.
     """
+    if exchange and exchange not in ("SMART", "NYSE", "NASDAQ", ""):
+        logger.warning(
+            "Exchange '%s' for %s ignored — only US/SMART routing is supported",
+            exchange, ticker,
+        )
     return Stock(ticker, "SMART", "USD")
 
 
