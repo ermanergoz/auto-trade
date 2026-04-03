@@ -195,10 +195,12 @@ def run_watchdog_mode(args: argparse.Namespace, markets: list[str]) -> None:
             logger.info("Watchdog connected to IBKR")
             display_account_summary(summary)
 
-            from notifications.telegram import notify_startup, start_listener, update_status
+            from notifications.telegram import notify_startup, start_listener, update_status, update_portfolio_data
+            from core.portfolio import get_open_positions, get_daily_pnl
             notify_startup(args.mode, summary)
             start_listener()
             update_status("startup_complete")
+            update_portfolio_data(summary, get_open_positions(), get_daily_pnl())
 
             tz = ZoneInfo(TIMEZONE)
             now = datetime.now(tz)
@@ -276,10 +278,11 @@ def main() -> None:
         display_account_summary(summary)
 
         # Start Telegram notifications + listener
-        from notifications.telegram import notify_startup, start_listener, update_status
+        from notifications.telegram import notify_startup, start_listener, update_status, update_portfolio_data
         notify_startup(args.mode, summary)
         start_listener()
         update_status("startup_complete")
+        update_portfolio_data(summary, get_open_positions(), get_daily_pnl())
 
         tz = ZoneInfo(TIMEZONE)
         now = datetime.now(tz)

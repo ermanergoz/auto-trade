@@ -135,6 +135,7 @@ def run_scan_cycle(
     update_portfolio_data(account, open_positions, daily_pnl)
 
     # Build universe (cached daily)
+    update_status("building_universe", f"Markets: {', '.join(active_markets)}")
     universe = build_universe(ib, active_markets)
 
     for market in active_markets:
