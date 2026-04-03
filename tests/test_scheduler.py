@@ -17,6 +17,7 @@ from tests.conftest import make_signal as _make_signal, make_position as _make_p
 _PATCHES = [
     "core.scheduler.notify_risk_results",
     "core.scheduler.setup_fill_handler",
+    "core.scheduler.setup_exit_handler",
     "core.scheduler.notify_trade",
     "core.scheduler.place_order",
     "core.scheduler.record_signal",
@@ -39,7 +40,7 @@ def _make_stock_data(tickers):
     """Build a minimal stock_data dict for _fetch_market_data mock."""
     import pandas as pd
 
-    df = pd.DataFrame({"Close": [100.0]})
+    df = pd.DataFrame({"close": [100.0], "open": [99.0], "high": [101.0], "low": [98.0], "volume": [1000000]})
     return {t: ("SMART", df) for t in tickers}
 
 
@@ -202,3 +203,39 @@ class TestStreamingPipeline:
         assert summary["ai_approved"] == 3
         assert summary["risk_approved"] == 2
         assert summary["orders_placed"] == 2
+
+    def test_fill_handler_attached_before_order(self):
+        """setup_fill_handler must be called BEFORE place_order to avoid race."""
+        sig = _make_signal(ticker="RACE")
+        _setup_mocks(self.m, [sig], risk_approved=[True])
+
+        call_order = []
+        self.m["setup_fill_handler"].side_effect = lambda *a, **kw: call_order.append("handler")
+        self.m["place_order"].side_effect = lambda *a, **kw: (call_order.append("order"), [MagicMock()])[1]
+
+        _run_cycle(self.m)
+
+        assert call_order == ["handler", "order"], (
+            f"Fill handler must be attached before order placement, got: {call_order}"
+        )
+
+    def test_exit_handler_attached_for_approved_signals(self):
+        """setup_exit_handler must be called for risk-approved signals."""
+        sig = _make_signal(ticker="EXIT")
+        _setup_mocks(self.m, [sig], risk_approved=[True])
+
+        _run_cycle(self.m)
+
+        self.m["setup_exit_handler"].assert_called_once()
+
+    def test_evaluate_receives_current_price(self):
+        """evaluate() must receive current_price (not default 0) for anti-momentum."""
+        sig = _make_signal(ticker="AMOM", entry_price=100.0)
+        _setup_mocks(self.m, [sig], risk_approved=[True])
+
+        _run_cycle(self.m)
+
+        self.m["evaluate"].assert_called_once()
+        kwargs = self.m["evaluate"].call_args[1]
+        assert "current_price" in kwargs
+        assert kwargs["current_price"] > 0, "current_price must not be 0"

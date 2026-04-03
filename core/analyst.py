@@ -129,7 +129,7 @@ def _call_ollama(prompt: str) -> Optional[dict]:
         headers={"Content-Type": "application/json"},
     )
 
-    response = urllib.request.urlopen(req, timeout=600)
+    response = urllib.request.urlopen(req, timeout=60)
     result = json.loads(response.read())
 
     # Track usage
@@ -181,6 +181,26 @@ def _validate_response(data: dict) -> bool:
         for price_field in ("entry_price", "stop_loss", "take_profit"):
             if not isinstance(data[price_field], (int, float)) or data[price_field] <= 0:
                 logger.warning("LLM response invalid %s: %r", price_field, data[price_field])
+                return False
+
+        # Validate price relationships
+        entry = data["entry_price"]
+        sl = data["stop_loss"]
+        tp = data["take_profit"]
+
+        if data["action"] == "buy":
+            if sl >= entry:
+                logger.warning("BUY stop_loss %.2f must be below entry %.2f", sl, entry)
+                return False
+            if tp <= entry:
+                logger.warning("BUY take_profit %.2f must be above entry %.2f", tp, entry)
+                return False
+        elif data["action"] == "sell":
+            if sl <= entry:
+                logger.warning("SELL stop_loss %.2f must be above entry %.2f", sl, entry)
+                return False
+            if tp >= entry:
+                logger.warning("SELL take_profit %.2f must be below entry %.2f", tp, entry)
                 return False
 
     return True

@@ -149,3 +149,68 @@ class TestAnalyzeCandidate:
         df = _make_df()
         signal = analyze_candidate("AAPL", "SMART", df, {}, [])
         assert signal is None
+
+
+class TestPriceRelationshipValidation:
+    """Verify LLM response validation catches invalid price relationships."""
+
+    def test_buy_stop_above_entry_rejected(self):
+        data = {
+            "action": "buy", "confidence": 80,
+            "entry_price": 150.0, "stop_loss": 160.0, "take_profit": 170.0,
+            "reasoning": "test",
+        }
+        assert _validate_response(data) is False
+
+    def test_buy_tp_below_entry_rejected(self):
+        data = {
+            "action": "buy", "confidence": 80,
+            "entry_price": 150.0, "stop_loss": 145.0, "take_profit": 140.0,
+            "reasoning": "test",
+        }
+        assert _validate_response(data) is False
+
+    def test_sell_stop_below_entry_rejected(self):
+        data = {
+            "action": "sell", "confidence": 80,
+            "entry_price": 150.0, "stop_loss": 140.0, "take_profit": 130.0,
+            "reasoning": "test",
+        }
+        assert _validate_response(data) is False
+
+    def test_sell_tp_above_entry_rejected(self):
+        data = {
+            "action": "sell", "confidence": 80,
+            "entry_price": 150.0, "stop_loss": 160.0, "take_profit": 155.0,
+            "reasoning": "test",
+        }
+        assert _validate_response(data) is False
+
+    def test_valid_buy_passes(self):
+        data = {
+            "action": "buy", "confidence": 80,
+            "entry_price": 150.0, "stop_loss": 145.0, "take_profit": 160.0,
+            "reasoning": "test",
+        }
+        assert _validate_response(data) is True
+
+    def test_valid_sell_passes(self):
+        data = {
+            "action": "sell", "confidence": 80,
+            "entry_price": 150.0, "stop_loss": 155.0, "take_profit": 140.0,
+            "reasoning": "test",
+        }
+        assert _validate_response(data) is True
+
+
+class TestOllamaTimeout:
+    """Verify Ollama timeout is reasonable (not 600s)."""
+
+    def test_timeout_is_reasonable(self):
+        """Ollama timeout must be <= 120s to avoid blocking scan cycles."""
+        import core.analyst as analyst_module
+        import inspect
+        source = inspect.getsource(analyst_module._call_ollama)
+        # Check that timeout is not 600
+        assert "timeout=600" not in source, "Ollama timeout must not be 600s"
+        assert "timeout=60" in source, "Ollama timeout should be 60s"

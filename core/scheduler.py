@@ -21,7 +21,7 @@ from core.analyst import analyze_batch
 from core.risk import evaluate
 from core.executor import (
     place_order, close_all_day_trades, setup_fill_handler,
-    setup_disconnect_handler,
+    setup_exit_handler, setup_disconnect_handler,
 )
 from core.portfolio import (
     get_open_positions, get_daily_pnl, record_signal,
@@ -210,7 +210,10 @@ def run_scan_cycle(
             summary["ai_approved"] += 1
             record_signal(signal)
 
-            result = evaluate(signal, open_positions, portfolio_value, daily_pnl)
+            # Fetch current price for anti-momentum check
+            sig_df = stock_data.get(signal.ticker, (None, None))[1]
+            current_price = sig_df["close"].iloc[-1] if sig_df is not None and not sig_df.empty else 0.0
+            result = evaluate(signal, open_positions, portfolio_value, daily_pnl, current_price=current_price)
             if not result.approved:
                 logger.info("Risk rejected %s: %s", signal.ticker, "; ".join(result.reasons))
                 return
@@ -219,19 +222,30 @@ def run_scan_cycle(
             risk_approved_signals.append(signal)
 
             dry_run = mode in ("dry-run", "backtest")
+
+            # Attach fill handlers BEFORE placing order to avoid race
+            # where a fast fill fires before handler is attached.
+            def _on_fill(sig, filled_qty, fill_price):
+                notify_trade(sig, filled_qty)
+                logger.info(
+                    "Order filled: %s %d @ $%.2f",
+                    sig.ticker, filled_qty, fill_price,
+                )
+
+            def _on_exit(ticker, exit_price, exit_type):
+                from notifications.telegram import notify_trade_closed
+                from core.portfolio import get_trades
+                trades_list = get_trades()
+                if trades_list:
+                    notify_trade_closed(trades_list[0])
+
+            setup_fill_handler(ib, signal, result.position_size, on_fill=_on_fill)
+            setup_exit_handler(ib, signal, on_exit=_on_exit)
+
             trades = place_order(ib, signal, result.position_size, dry_run=dry_run)
 
             if trades:
                 summary["orders_placed"] += 1
-
-                def _on_fill(sig, filled_qty, fill_price):
-                    notify_trade(sig, filled_qty)
-                    logger.info(
-                        "Order filled: %s %d @ $%.2f",
-                        sig.ticker, filled_qty, fill_price,
-                    )
-
-                setup_fill_handler(ib, signal, result.position_size, on_fill=_on_fill)
                 notify_trade(signal, result.position_size, action_type="SUBMITTED")
                 open_positions = get_open_positions()
 

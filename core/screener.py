@@ -390,6 +390,20 @@ def _build_signal(
     reasoning = "; ".join(t["detail"] for t in triggered)
     indicator_values = {t["indicator"]: t["value"] for t in triggered}
 
+    # Always compute and store MA values for trend confirmation in risk manager,
+    # even if MA crossover didn't trigger (risk.check_trend_confirmation needs these).
+    if len(df) >= MA_SLOW:
+        ma_fast = ta.sma(df["close"], length=MA_FAST)
+        ma_slow = ta.sma(df["close"], length=MA_SLOW)
+        if ma_fast is not None and not pd.isna(ma_fast.iloc[-1]):
+            indicator_values["MA5"] = float(ma_fast.iloc[-1])
+        if ma_slow is not None and not pd.isna(ma_slow.iloc[-1]):
+            indicator_values["MA20"] = float(ma_slow.iloc[-1])
+        # Also compute MA10 if possible
+        ma_mid = ta.sma(df["close"], length=10)
+        if ma_mid is not None and not pd.isna(ma_mid.iloc[-1]):
+            indicator_values["MA10"] = float(ma_mid.iloc[-1])
+
     return Signal(
         ticker=ticker,
         action=action,
