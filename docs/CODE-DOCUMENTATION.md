@@ -255,6 +255,10 @@ MIN_RISK_REWARD_RATIO = 1.5         # Potential profit must be 1.5x potential lo
 ALLOW_SHORT_SELLING = False         # Block sells for stocks not held (no shorting)
 ```
 
+The risk manager also includes a **cumulative risk check** that ensures total open risk (all positions' max loss via stop-loss) stays within the daily loss limit. This prevents a scenario where 5 positions each sized at 1% risk = 5% total risk, exceeding the 2% daily limit.
+
+A **`validate_settings()`** function validates all configuration at startup and rejects invalid values (e.g., port not 7496/7497, negative ratios, zero positions).
+
 ### Technical Indicator Settings
 ```python
 RSI_PERIOD = 14                # Standard RSI lookback window
@@ -726,11 +730,13 @@ This is **atomic** — all three orders are placed as a unit. You never end up w
 
 **`close_position_market(ib, position, dry_run)`** — Immediately close a position with a market order. Used when day-trade positions need to be closed before market close.
 
-**`close_all_day_trades(ib, positions, dry_run)`** — Called 15 minutes before market close. Finds all positions marked as DAY trades and closes them with market orders.
+**`close_all_day_trades(ib, positions, dry_run)`** — Called 15 minutes before market close. Finds all positions marked as DAY trades and closes them with market orders. After placing all close orders, waits briefly and logs a warning for any that haven't filled yet — critical because unfilled orders mean positions stay open overnight.
 
 **`handle_fill(signal, quantity, fill_price)`** — Records a filled order in the SQLite database.
 
-**`setup_fill_handler(ib, signal, quantity, on_fill)`** — Attaches an async callback to IBKR's order status events. When the parent order status changes to "Filled", it records the position in the database and calls the optional `on_fill` callback (used by the scheduler to send Telegram notifications). This ensures positions are only recorded and notifications sent after IBKR confirms an actual fill — not when the limit order is merely submitted.
+**`setup_fill_handler(ib, signal, quantity, on_fill)`** — Attaches an async callback to handle entry order fills. When the parent order status changes to "Filled", it records the position in the database and calls the optional `on_fill` callback. Also logs warnings for partial fills (when filled_qty < requested quantity). The scheduler attaches this handler BEFORE placing the order to avoid a race condition where fast fills fire before the handler is registered.
+
+**`setup_exit_handler(ib, signal, on_exit)`** — Attaches a callback to handle exit order fills (take-profit and stop-loss). When a child order fills, it closes the position in the database via `portfolio.close_position()`, which also writes to the CSV trade journal. Calls the optional `on_exit` callback for Telegram notifications.
 
 **`setup_disconnect_handler(ib)`** — Attaches a callback for connection drops. Important because IBKR connections are notoriously unstable. Uses a re-entrancy guard (`_reconnecting` flag) to prevent cascading reconnect loops where a reconnect triggers another disconnect event. Reads the shared `shutting_down` flag from `core.state` to skip reconnection during intentional shutdown (avoiding the circular import that would result from importing directly from `scheduler.py`).
 

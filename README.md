@@ -751,10 +751,11 @@ pytest tests/ --cov=core --cov=backtest --cov=notifications
 | `test_universe.py` | Universe building, financial sector filtering, caching |
 | `test_screener.py` | Technical indicator calculations, scoring, signal generation |
 | `test_analyst.py` | LLM integration, response validation, cost tracking |
-| `test_risk.py` | All 11 risk checks, position sizing calculations |
-| `test_scheduler.py` | Streaming signal pipeline, callback-based risk check flow |
+| `test_risk.py` | All 12 risk checks, cumulative risk, sector concentration |
+| `test_scheduler.py` | Streaming pipeline, fill handler ordering, exit tracking |
 | `test_telegram.py` | Status commands, portfolio display, risk notifications |
-| `test_backtest.py` | Backtesting engine, simulated portfolio, no look-ahead bias |
+| `test_backtest.py` | Backtest engine, gap-down stops, look-ahead bias checks |
+| `test_settings.py` | Configuration validation at startup |
 
 ---
 
