@@ -180,6 +180,20 @@ def close_all_day_trades(
         if trade:
             trades.append(trade)
 
+    # Verify fills with timeout
+    if trades and not dry_run:
+        ib.sleep(3)  # Give time for fills to arrive
+        unfilled = [
+            t.contract.symbol for t in trades
+            if t.orderStatus.status != "Filled"
+        ]
+        if unfilled:
+            logger.warning(
+                "Day trade close orders NOT confirmed filled: %s — "
+                "positions may remain open overnight",
+                unfilled,
+            )
+
     return trades
 
 
@@ -212,7 +226,7 @@ def handle_fill(
 
 
 def setup_fill_handler(ib: IB, signal: Signal, quantity: int, on_fill=None) -> None:
-    """Attach a callback to handle order fills asynchronously.
+    """Attach a callback to handle entry order fills asynchronously.
 
     Args:
         on_fill: Optional callback(signal, filled_qty, fill_price) called on fill.
@@ -223,9 +237,61 @@ def setup_fill_handler(ib: IB, signal: Signal, quantity: int, on_fill=None) -> N
             fill_price = trade.orderStatus.avgFillPrice
             filled_qty = int(trade.orderStatus.filled)
             if trade.order.action in ("BUY", "SELL") and trade.order.orderType != "STP":
+                if filled_qty < quantity:
+                    logger.warning(
+                        "Partial fill for %s: %d/%d shares @ $%.2f",
+                        signal.ticker, filled_qty, quantity, fill_price,
+                    )
                 handle_fill(signal, filled_qty, fill_price)
                 if on_fill:
                     on_fill(signal, filled_qty, fill_price)
+
+    ib.orderStatusEvent += on_order_status
+
+
+def setup_exit_handler(ib: IB, signal: Signal, on_exit=None) -> None:
+    """Attach a callback to handle exit order fills (TP/SL) asynchronously.
+
+    When a take-profit or stop-loss child order fills, close the position
+    in the database and optionally notify via callback.
+
+    Args:
+        on_exit: Optional callback(ticker, exit_price, exit_type) called on exit fill.
+    """
+
+    def on_order_status(trade: IBTrade):
+        if trade.orderStatus.status != "Filled":
+            return
+        if trade.contract.symbol != signal.ticker:
+            return
+
+        fill_price = trade.orderStatus.avgFillPrice
+
+        # Detect exit type: STP = stop-loss, LMT on child = take-profit
+        is_stop = trade.order.orderType in ("STP", "STP LMT")
+        # Child orders have a parentId linking them to the parent
+        is_child = getattr(trade.order, "parentId", 0) > 0
+
+        if not is_child:
+            return  # This is the parent entry order, handled by setup_fill_handler
+
+        exit_type = "stop-loss" if is_stop else "take-profit"
+
+        logger.info(
+            "Exit fill: %s %s @ $%.2f (%s)",
+            signal.ticker, trade.order.action, fill_price, exit_type,
+        )
+
+        # Close position in database
+        trade_record = db_close_position(signal.ticker, fill_price)
+        if trade_record:
+            logger.info(
+                "Position closed: %s P&L: $%.2f (%.1f%%)",
+                signal.ticker, trade_record.pnl, trade_record.pnl_pct,
+            )
+
+        if on_exit:
+            on_exit(signal.ticker, fill_price, exit_type)
 
     ib.orderStatusEvent += on_order_status
 

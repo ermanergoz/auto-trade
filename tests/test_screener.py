@@ -319,3 +319,24 @@ class TestScreenStocks:
         signals = screen_stocks(stock_data, min_score=0.1)
         if len(signals) >= 2:
             assert signals[0].confidence >= signals[1].confidence
+
+
+class TestMAValuesAlwaysStored:
+    """Verify that MA5, MA10, MA20 are always in indicator_values for trend confirmation."""
+
+    def test_ma_values_present_in_signal(self):
+        # Data that triggers at least one indicator (volume spike + bollinger)
+        volumes = [500_000] * 25 + [3_000_000]
+        closes = _flat(25, 100) + [70]
+        df = _make_df(closes, volumes)
+
+        stock_data = {"MATEST": ("SMART", df)}
+        signals = screen_stocks(stock_data, min_score=0.1)
+
+        assert len(signals) > 0, "Should produce at least one signal"
+        sig = signals[0]
+        assert "MA5" in sig.indicator_values, "MA5 must always be in indicator_values"
+        assert "MA20" in sig.indicator_values, "MA20 must always be in indicator_values"
+        assert "MA10" in sig.indicator_values, "MA10 must always be in indicator_values"
+        assert isinstance(sig.indicator_values["MA5"], float)
+        assert isinstance(sig.indicator_values["MA20"], float)
