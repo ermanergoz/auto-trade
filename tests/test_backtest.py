@@ -98,3 +98,65 @@ class TestMetrics:
         assert _std([]) == 0.0
         assert _std([5.0]) == 0.0
         assert _std([1, 2, 3, 4, 5]) > 0
+
+
+class TestGapDownStopLoss:
+    """Verify stop-loss uses min(low, stop_loss) for gap-down modeling."""
+
+    def test_gap_down_fills_at_low(self):
+        import pandas as pd
+        from backtest.engine import SimulatedPortfolio, _check_exits
+        from core.models import Position, TradeType
+
+        portfolio = SimulatedPortfolio(initial_capital=100_000)
+        # Position with stop-loss at $95
+        portfolio.positions.append(Position(
+            ticker="GAP", exchange="SMART", quantity=100,
+            entry_price=100.0, entry_time=datetime(2024, 1, 1),
+            stop_loss=95.0, take_profit=110.0, trade_type=TradeType.DAY,
+        ))
+
+        # Day bar gaps down to $90 (below stop of $95)
+        day_data = {
+            "GAP": pd.Series({"open": 91.0, "high": 92.0, "low": 90.0, "close": 91.0}),
+        }
+
+        _check_exits(portfolio, day_data, datetime(2024, 1, 2))
+
+        assert len(portfolio.positions) == 0, "Position should be closed"
+        assert len(portfolio.trades) == 1
+        # Fill should be at $90 (the low), not $95 (the stop price)
+        assert portfolio.trades[0].exit_price < 95.0, (
+            f"Gap-down should fill below stop price, got {portfolio.trades[0].exit_price}"
+        )
+
+
+class TestDailyPnlBaseline:
+    """Verify daily PnL calculation is clean."""
+
+    def test_daily_pnl_zero_when_no_equity_history(self):
+        p = SimulatedPortfolio(initial_capital=100_000)
+        assert p.daily_pnl == 0.0
+
+    def test_daily_pnl_after_one_day(self):
+        p = SimulatedPortfolio(initial_capital=100_000)
+        p.record_equity(date(2024, 1, 1))
+        # Cash unchanged, so PnL should be 0
+        assert p.daily_pnl == 0.0
+
+
+class TestLookAheadBias:
+    """Verify screener only sees data strictly before current date."""
+
+    def test_stock_data_excludes_current_date(self):
+        """The backtest must feed the screener data < current_date, not <=."""
+        import pandas as pd
+        import inspect
+        from backtest.engine import run_backtest
+
+        # Check the source code for the correct comparison operator
+        source = inspect.getsource(run_backtest)
+        # Should use < not <= for date filtering in stock_data construction
+        assert "df.index.date < current_date" in source or "df.index < current_date" in source, (
+            "Backtester must use strict < for date filtering to avoid look-ahead bias"
+        )

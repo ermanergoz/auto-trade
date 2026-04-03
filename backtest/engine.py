@@ -53,7 +53,7 @@ class SimulatedPortfolio:
     def daily_pnl(self) -> float:
         if not self.equity_curve:
             return 0.0
-        return self.portfolio_value - self.equity_curve[-1][1] if self.equity_curve else 0.0
+        return self.portfolio_value - self.equity_curve[-1][1]
 
     def open_position(self, signal: Signal, quantity: int, fill_price: float, current_date: datetime) -> None:
         """Open a new position with slippage and commission."""
@@ -132,10 +132,11 @@ def _check_exits(portfolio: SimulatedPortfolio, day_data: dict[str, pd.Series], 
         low = bar["low"]
         high = bar["high"]
 
-        # Stop-loss hit
+        # Stop-loss hit — fill at the worse of stop price or bar low (gap-down)
         if low <= pos.stop_loss:
-            to_close.append((pos.ticker, pos.stop_loss, "stop-loss"))
-        # Take-profit hit
+            actual_exit = min(low, pos.stop_loss)
+            to_close.append((pos.ticker, actual_exit, "stop-loss"))
+        # Take-profit hit — limit order fills at target price
         elif high >= pos.take_profit:
             to_close.append((pos.ticker, pos.take_profit, "take-profit"))
 
@@ -243,13 +244,16 @@ def run_backtest(config: BacktestConfig) -> SimulatedPortfolio:
         # Step 1: Check exits on open positions
         _check_exits(portfolio, day_data, current_dt)
 
-        # Step 2: Build stock_data up to current date (NO LOOK-AHEAD)
+        # Step 2: Build stock_data strictly BEFORE current date (no look-ahead).
+        # The screener must only see data up to yesterday's close. Using
+        # current date's full OHLC would give it information about today's
+        # high/low/close that isn't available at decision time.
         stock_data: dict[str, tuple[str, pd.DataFrame]] = {}
         for ticker, df in all_data.items():
             if isinstance(df.index, pd.DatetimeIndex):
-                hist = df[df.index.date <= current_date]
+                hist = df[df.index.date < current_date]
             else:
-                hist = df[df.index <= current_date]
+                hist = df[df.index < current_date]
 
             if len(hist) >= warmup:
                 exchange = "SMART"
@@ -273,9 +277,10 @@ def run_backtest(config: BacktestConfig) -> SimulatedPortfolio:
             if not result.approved:
                 continue
 
-            # Get fill price from today's data
+            # Fill at today's open price (realistic: signal from yesterday's close,
+            # execution at today's open)
             if signal.ticker in day_data:
-                fill_price = day_data[signal.ticker]["close"]
+                fill_price = day_data[signal.ticker]["open"]
             else:
                 fill_price = signal.entry_price
 

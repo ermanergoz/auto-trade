@@ -127,7 +127,7 @@ def check_sector_concentration(
         return True, ""  # Unknown sector, let it through
 
     sector_value = sum(
-        p.entry_price * p.quantity
+        (p.current_price or p.entry_price) * p.quantity
         for p in open_positions
         if p.sector.lower() == sector.lower()
     )
@@ -190,6 +190,45 @@ def check_excluded_sector(signal: Signal) -> tuple[bool, str]:
             return False, (
                 f"Excluded sector: '{sector}' (financial/lending companies are blocked)"
             )
+    return True, ""
+
+
+def check_cumulative_risk(
+    signal: Signal,
+    open_positions: list[Position],
+    portfolio_value: float,
+    limit_pct: float = DAILY_LOSS_LIMIT_PCT,
+) -> tuple[bool, str]:
+    """Ensure total open risk across all positions stays within daily loss limit.
+
+    If all open positions hit their stop-losses simultaneously (correlated
+    market move), total loss must not exceed the daily loss limit.
+    """
+    if portfolio_value <= 0:
+        return False, "Portfolio value is zero or negative"
+
+    existing_risk = sum(
+        abs(p.entry_price - p.stop_loss) * p.quantity
+        for p in open_positions
+    )
+
+    # Estimate new position risk using risk-based sizing (1% of portfolio)
+    stop_distance = abs(signal.entry_price - signal.stop_loss)
+    if stop_distance > 0:
+        risk_per_trade = portfolio_value * 0.01
+        estimated_qty = int(risk_per_trade / stop_distance)
+        new_risk = stop_distance * estimated_qty
+    else:
+        new_risk = 0
+
+    total_risk = existing_risk + new_risk
+    max_daily_risk = portfolio_value * (limit_pct / 100)
+
+    if total_risk > max_daily_risk:
+        return False, (
+            f"Cumulative risk ${total_risk:.2f} would exceed daily loss limit "
+            f"${max_daily_risk:.2f} ({limit_pct}% of ${portfolio_value:.2f})"
+        )
     return True, ""
 
 
@@ -366,6 +405,7 @@ def evaluate(
         check_short_selling(signal, open_positions),
         check_position_size(signal, portfolio_value),
         check_daily_loss_limit(daily_pnl, portfolio_value),
+        check_cumulative_risk(signal, open_positions, portfolio_value),
         check_max_positions(open_positions),
         check_stop_loss(signal),
         check_sector_concentration(signal, open_positions, portfolio_value),
