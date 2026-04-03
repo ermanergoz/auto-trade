@@ -20,7 +20,7 @@ from core.screener import screen_stocks
 from core.analyst import analyze_batch
 from core.risk import evaluate
 from core.executor import (
-    place_order, close_all_day_trades, handle_fill,
+    place_order, close_all_day_trades, setup_fill_handler,
     setup_disconnect_handler,
 )
 from core.portfolio import (
@@ -29,8 +29,9 @@ from core.portfolio import (
 )
 from core.models import StockInfo
 from notifications.telegram import (
-    notify_scan_summary, notify_trade, notify_ai_signal, notify_error,
-    notify_shutdown, update_status,
+    notify_scan_summary, notify_trade, notify_error,
+    notify_shutdown, update_status, notify_risk_results,
+    update_portfolio_data,
 )
 
 logger = logging.getLogger(__name__)
@@ -131,6 +132,7 @@ def run_scan_cycle(
     portfolio_value = account.get("NetLiquidation", 0)
     daily_pnl = get_daily_pnl()
     open_positions = get_open_positions()
+    update_portfolio_data(account, open_positions, daily_pnl)
 
     # Build universe (cached daily)
     universe = build_universe(ib, active_markets)
@@ -190,12 +192,17 @@ def run_scan_cycle(
                 "news": news,
             })
 
-        update_status("ai_analysis", f"{len(ai_input)} candidates for {market}")
-        ai_signals = analyze_batch(ai_input, on_signal=notify_ai_signal)
+        update_status("ai_analysis", f"0/{len(ai_input)} candidates for {market}")
+
+        def _on_ai_progress(current, total):
+            update_status("ai_analysis", f"{current}/{total} candidates for {market}")
+
+        ai_signals = analyze_batch(ai_input, on_progress=_on_ai_progress)
         summary["ai_approved"] += len(ai_signals)
 
         # Step 4: Risk check + execution
         update_status("risk_check", f"{len(ai_signals)} AI-approved signals")
+        risk_approved_signals = []
         for signal in ai_signals:
             record_signal(signal)
 
@@ -205,6 +212,7 @@ def run_scan_cycle(
                 continue
 
             summary["risk_approved"] += 1
+            risk_approved_signals.append(signal)
 
             # Place order
             dry_run = mode in ("dry-run", "backtest")
@@ -212,10 +220,21 @@ def run_scan_cycle(
 
             if trades:
                 summary["orders_placed"] += 1
-                handle_fill(signal, result.position_size, signal.entry_price)
-                notify_trade(signal, result.position_size)
+
+                def _on_fill(sig, filled_qty, fill_price):
+                    notify_trade(sig, filled_qty)
+                    logger.info(
+                        "Order filled: %s %d @ $%.2f",
+                        sig.ticker, filled_qty, fill_price,
+                    )
+
+                setup_fill_handler(ib, signal, result.position_size, on_fill=_on_fill)
+                notify_trade(signal, result.position_size, action_type="SUBMITTED")
                 # Refresh positions for subsequent risk checks
                 open_positions = get_open_positions()
+
+        if risk_approved_signals:
+            notify_risk_results(risk_approved_signals)
 
     logger.info(
         "Scan complete: %d candidates, %d AI approved, %d risk approved, %d orders",

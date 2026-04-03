@@ -33,8 +33,9 @@ IBC_PASSWORD = os.getenv("IBC_PASSWORD", "")
 # ---------------------------------------------------------------------------
 MARKETS = ["US"]
 EXCLUDED_SECTORS = ["Financials"]
+EXCLUDED_COUNTRIES = {"Israel"}
 
-# Israel-based companies trading on US exchanges — excluded from universe
+# Specific tickers to always exclude from universe
 EXCLUDED_TICKERS = {
     "CHKP", "MNDY", "CYBR", "TEVA", "WIX", "NICE", "INMD", "GILT",
     "CEVA", "SILC", "RDWR", "MGIC", "DSNY", "SEDG", "FVRR", "GLBE",
@@ -54,7 +55,7 @@ MARKET_HOURS = {
 # Strategy
 # ---------------------------------------------------------------------------
 SCAN_INTERVAL_MINUTES = 15
-AI_CONFIDENCE_THRESHOLD = 70
+AI_CONFIDENCE_THRESHOLD = 65
 AI_MAX_CANDIDATES = 0               # Max candidates sent to AI per cycle (0 = unlimited)
 AI_MODEL = os.getenv("AI_MODEL", "qwen2.5:7b")
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")

@@ -64,7 +64,7 @@ Return a JSON object with these exact fields:
 ## Discipline Rules
 - Default to "hold" unless at least 4 of 6 checklist items are clearly favorable
 - Never chase: if the stock already ran >5% toward the signal, say "hold"
-- Confidence above 70 only when trend + momentum + volume all align
+- Confidence above 65 only when trend + momentum + volume all align
 - Be honest about uncertainty — a confident "hold" is better than a shaky "buy"
 - Set stop-loss at a technical level (support/resistance), not an arbitrary percentage"""
 
@@ -244,6 +244,7 @@ def analyze_candidate(
 def analyze_batch(
     candidates: list[dict],
     on_signal=None,
+    on_progress=None,
 ) -> list[Signal]:
     """Analyze a batch of screener candidates sequentially.
 
@@ -251,13 +252,15 @@ def analyze_batch(
         candidates: List of dicts with keys:
             ticker, exchange, df, indicator_values, news
         on_signal: Optional callback called immediately when a signal is approved.
+        on_progress: Optional callback(current, total) called after each candidate.
 
     Returns list of approved Signal objects.
     """
     signals = []
+    total = len(candidates)
 
     for i, c in enumerate(candidates, 1):
-        logger.info("Analyzing candidate %d/%d: %s", i, len(candidates), c["ticker"])
+        logger.info("Analyzing candidate %d/%d: %s", i, total, c["ticker"])
         signal = analyze_candidate(
             ticker=c["ticker"],
             exchange=c["exchange"],
@@ -273,6 +276,9 @@ def analyze_batch(
             )
             if on_signal:
                 on_signal(signal)
+
+        if on_progress:
+            on_progress(i, total)
 
     logger.info(
         "AI analysis complete: %d/%d candidates approved",

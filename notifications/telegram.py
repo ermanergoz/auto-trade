@@ -11,13 +11,16 @@ from core.models import Trade, DailySummary, Signal
 
 logger = logging.getLogger(__name__)
 
-# Shared system state for "Whatsup" responses
+# Shared system state for status responses
 _system_status = {
     "phase": "initializing",
     "mode": "",
     "detail": "",
     "last_scan": None,
     "last_summary": None,
+    "account": None,
+    "positions": None,
+    "daily_pnl": None,
 }
 
 
@@ -72,8 +75,20 @@ def _get_updates_sync(offset: Optional[int] = None) -> list:
         return []
 
 
+def _is_status_command(text: str) -> bool:
+    """Check if incoming text is a status command."""
+    return text.strip().lower() in ("status", "/status")
+
+
+def update_portfolio_data(account: dict, positions: list, daily_pnl: float) -> None:
+    """Cache portfolio data for status responses (called from scheduler)."""
+    _system_status["account"] = account
+    _system_status["positions"] = positions
+    _system_status["daily_pnl"] = daily_pnl
+
+
 def _build_status_response() -> str:
-    """Build a human-readable status message."""
+    """Build a human-readable status message with portfolio data."""
     from zoneinfo import ZoneInfo
     tz = ZoneInfo(TIMEZONE)
     now = datetime.now(tz).strftime("%H:%M:%S")
@@ -109,6 +124,37 @@ def _build_status_response() -> str:
     if detail:
         lines.append(f"Detail: {detail}")
 
+    # Account summary
+    account = _system_status.get("account")
+    if account:
+        lines.append("")
+        lines.append("<b>Account</b>")
+        nlv = account.get("NetLiquidation", 0)
+        cash = account.get("TotalCashValue", 0)
+        invested = account.get("GrossPositionValue", 0)
+        unrealized = account.get("UnrealizedPnL", 0)
+        lines.append(f"Portfolio Value: ${nlv:,.2f}")
+        lines.append(f"Cash Available: ${cash:,.2f}")
+        lines.append(f"Invested: ${invested:,.2f}")
+        lines.append(f"Unrealized P&L: ${unrealized:+,.2f}")
+
+    daily_pnl = _system_status.get("daily_pnl")
+    if daily_pnl is not None:
+        lines.append(f"Daily P&L (realized): ${daily_pnl:+,.2f}")
+
+    # Open positions
+    positions = _system_status.get("positions")
+    if positions:
+        lines.append("")
+        lines.append(f"<b>Open Positions ({len(positions)})</b>")
+        for pos in positions:
+            line = f"  {pos.ticker}: {pos.quantity} @ ${pos.entry_price:.2f}"
+            if pos.current_price is not None:
+                pnl = pos.unrealized_pnl
+                line += f" (now ${pos.current_price:.2f}, P&L ${pnl:+,.2f})"
+            lines.append(line)
+
+    # Last scan summary
     last = _system_status.get("last_summary")
     if last:
         lines.append(f"\nLast scan: {last}")
@@ -118,7 +164,7 @@ def _build_status_response() -> str:
 
 def _poll_loop() -> None:
     """Background thread that polls for incoming Telegram messages."""
-    logger.info("Telegram listener started — send 'Whatsup' to get status")
+    logger.info("Telegram listener started — send 'status' to get status")
     offset = None
 
     while True:
@@ -135,8 +181,8 @@ def _poll_loop() -> None:
                 if str(msg.chat_id) != str(TELEGRAM_CHAT_ID):
                     continue
 
-                text = msg.text.strip().lower()
-                if text in ("whatsup", "whats up", "what's up", "status", "/status"):
+                text = msg.text.strip()
+                if _is_status_command(text):
                     response = _build_status_response()
                     _send_sync(response)
 
@@ -201,6 +247,25 @@ def notify_ai_signal(signal: Signal) -> bool:
         f"<i>{signal.reasoning[:200]}</i>"
     )
     return _send_sync(text)
+
+
+def notify_risk_results(signals: list[Signal]) -> bool:
+    """Send a consolidated summary of all risk-approved signals."""
+    if not signals:
+        return False
+
+    lines = ["\u2705 <b>Risk-Approved Signals</b>\n"]
+    for sig in signals:
+        action = sig.action.value.upper()
+        emoji = "\U0001f7e2" if action == "BUY" else "\U0001f534"
+        lines.append(
+            f"{emoji} <b>{sig.ticker}</b> \u2014 {action}\n"
+            f"   Confidence: {sig.confidence:.0f}% | "
+            f"Entry: ${sig.entry_price:.2f} | "
+            f"SL: ${sig.stop_loss:.2f} | TP: ${sig.take_profit:.2f}"
+        )
+    lines.append(f"\nTotal: {len(signals)} signal(s) approved")
+    return _send_sync("\n".join(lines))
 
 
 def notify_trade(signal: Signal, quantity: int, action_type: str = "OPENED") -> bool:
