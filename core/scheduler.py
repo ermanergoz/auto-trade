@@ -34,10 +34,11 @@ from notifications.telegram import (
     update_portfolio_data,
 )
 
+from core import state as _state
+
 logger = logging.getLogger(__name__)
 
 _tz = ZoneInfo(TIMEZONE)
-_shutting_down = False
 
 
 # ---------------------------------------------------------------------------
@@ -198,24 +199,25 @@ def run_scan_cycle(
         def _on_ai_progress(current, total):
             update_status("ai_analysis", f"{current}/{total} candidates for {market}")
 
-        ai_signals = analyze_batch(ai_input, on_progress=_on_ai_progress)
-        summary["ai_approved"] += len(ai_signals)
-
-        # Step 4: Risk check + execution
-        update_status("risk_check", f"{len(ai_signals)} AI-approved signals")
+        # Step 3+4: AI analysis with streaming risk check + execution.
+        # Each AI-approved signal is immediately sent to risk check and
+        # order placement via the on_signal callback, instead of waiting
+        # for all AI analysis to complete first.
         risk_approved_signals = []
-        for signal in ai_signals:
+
+        def _on_signal(signal):
+            nonlocal open_positions
+            summary["ai_approved"] += 1
             record_signal(signal)
 
             result = evaluate(signal, open_positions, portfolio_value, daily_pnl)
             if not result.approved:
                 logger.info("Risk rejected %s: %s", signal.ticker, "; ".join(result.reasons))
-                continue
+                return
 
             summary["risk_approved"] += 1
             risk_approved_signals.append(signal)
 
-            # Place order
             dry_run = mode in ("dry-run", "backtest")
             trades = place_order(ib, signal, result.position_size, dry_run=dry_run)
 
@@ -231,8 +233,9 @@ def run_scan_cycle(
 
                 setup_fill_handler(ib, signal, result.position_size, on_fill=_on_fill)
                 notify_trade(signal, result.position_size, action_type="SUBMITTED")
-                # Refresh positions for subsequent risk checks
                 open_positions = get_open_positions()
+
+        analyze_batch(ai_input, on_signal=_on_signal, on_progress=_on_ai_progress)
 
         if risk_approved_signals:
             notify_risk_results(risk_approved_signals)
@@ -297,14 +300,12 @@ def start_scheduler(
     Uses ib.sleep() instead of APScheduler so all IBKR calls stay on the
     main thread's asyncio event loop (ib_insync requirement).
     """
-    global _shutting_down
 
     setup_disconnect_handler(ib)
 
     # Graceful shutdown
     def shutdown(signum, frame):
-        global _shutting_down
-        _shutting_down = True
+        _state.shutting_down = True
         logger.info("Received signal %s — shutting down...", signum)
 
     sig.signal(sig.SIGINT, shutdown)
@@ -316,14 +317,14 @@ def start_scheduler(
     )
 
     try:
-        while not _shutting_down:
+        while not _state.shutting_down:
             run_scan_cycle(ib, markets, mode, force=force)
-            if not _shutting_down:
+            if not _state.shutting_down:
                 ib.sleep(SCAN_INTERVAL_MINUTES * 60)
     except (KeyboardInterrupt, SystemExit):
         pass
     finally:
-        _shutting_down = True
+        _state.shutting_down = True
         logger.info("Scheduler stopped")
         # Close day trades before exit
         try:
