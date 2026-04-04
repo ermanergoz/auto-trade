@@ -118,7 +118,7 @@ Each scan cycle (every 15 minutes by default) executes the following pipeline:
 3. **Data fetching** -- Fetch historical OHLCV data for all stocks in the universe from IBKR (or YFinance fallback)
 4. **Technical screening** -- Run 6 technical indicators on every stock, score candidates, and pass all qualifying stocks (above min_score) to AI analysis
 5. **AI analysis** -- Send each candidate to the local LLM (via Ollama) with price action, indicators, and news context; receive structured trade recommendations with confidence scores
-6. **Risk evaluation** -- Pass every AI-approved signal through 11 risk checks (short selling block, position size, daily loss, max positions, stop-loss, sector concentration, no duplicates, excluded sector, risk/reward, anti-momentum, trend confirmation)
+6. **Risk evaluation** -- Pass every AI-approved signal through 12 risk checks (short selling block, position size, daily loss, max positions, stop-loss, sector concentration, no duplicates, excluded sector, risk/reward, anti-momentum, trend confirmation, circuit breaker)
 7. **Order execution** -- Place bracket orders (entry + stop-loss + take-profit) through IBKR for approved signals
 8. **Logging and notifications** -- Record everything to SQLite and CSV, send Telegram alerts, update terminal dashboard
 
@@ -372,6 +372,8 @@ All trading parameters are configured in `config/settings.py`. Key settings:
 | `DEFAULT_STOP_LOSS_PCT` | `3.0` | Default stop-loss percentage |
 | `MAX_SECTOR_CONCENTRATION_PCT` | `25.0` | Max portfolio % in one sector |
 | `ALLOW_SHORT_SELLING` | `False` | Allow sell signals for stocks not held |
+| `CIRCUIT_BREAKER_LOSSES` | `3` | Consecutive losses to pause trading |
+| `CIRCUIT_BREAKER_WINDOW_MIN` | `60` | Time window (minutes) for circuit breaker |
 
 #### Technical Indicator Settings
 | Parameter | Default | Description |
@@ -555,7 +557,7 @@ Zero. The AI runs locally via Ollama -- no cloud API fees. Each analysis takes ~
 
 ## Risk Management
 
-Every trade must pass through **all 11 risk checks** before execution. If any check fails, the trade is rejected and the reasons are logged.
+Every trade must pass through **all 12 risk checks** before execution. If any check fails, the trade is rejected and the reasons are logged.
 
 ### Risk Checks
 
@@ -568,6 +570,7 @@ Every trade must pass through **all 11 risk checks** before execution. If any ch
 | **Stop-Loss Required** | Every trade must have a valid stop-loss order | Required |
 | **Sector Concentration** | No sector can exceed X% of total portfolio | 25% |
 | **No Duplicates** | Cannot open a second position in an already-held stock | Enforced |
+| **Circuit Breaker** | Pause trading after N consecutive losses within a time window | 3 losses / 60 min |
 
 ### Position Sizing
 
@@ -751,7 +754,7 @@ pytest tests/ --cov=core --cov=backtest --cov=notifications
 | `test_universe.py` | Universe building, financial sector filtering, caching |
 | `test_screener.py` | Technical indicator calculations, scoring, signal generation |
 | `test_analyst.py` | LLM integration, response validation, cost tracking |
-| `test_risk.py` | All 12 risk checks, cumulative risk, sector concentration |
+| `test_risk.py` | All 12 risk checks, cumulative risk, sector concentration, circuit breaker |
 | `test_scheduler.py` | Streaming pipeline, fill handler ordering, exit tracking |
 | `test_telegram.py` | Status commands, portfolio display, risk notifications |
 | `test_backtest.py` | Backtest engine, gap-down stops, look-ahead bias checks |
@@ -852,6 +855,8 @@ This system is designed with multiple layers of safety:
 11. **Financial sector exclusion** -- Banks, insurance companies, and lending institutions are permanently excluded from the trading universe.
 
 12. **Non-equity ETF exclusion** -- Bond ETFs, leveraged/inverse ETFs, commodity ETFs, and volatility products are automatically filtered out. Equity index ETFs (SPY, QQQ, etc.) are kept.
+
+13. **Circuit breaker** -- If the system takes 3 consecutive losing trades within 60 minutes (both configurable), all new trading is paused and a Telegram alert is sent. This catches regime changes, stale data, or systematic issues before the daily loss limit is hit.
 
 13. **3-tier sector fallback** -- Stock sector data is resolved through IBKR contract details, then yfinance, then Ollama LLM classification. Only stocks that fail all three are excluded.
 

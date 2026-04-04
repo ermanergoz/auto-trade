@@ -42,7 +42,7 @@ Think of it like a 3-person trading desk, automated:
 
 2. **The AI Analyst** — A local AI model (Qwen 2.5 7B running on Ollama) that takes those 15 candidates and does deep analysis. It looks at price trends, momentum, volume, news headlines, and a strict 6-point checklist. It's the senior analyst who says "of those 15, I'd actually buy these 3."
 
-3. **The Risk Manager** — A paranoid rule-checker that gates every trade with 11 different safety checks. Position too big? Rejected. Already lost too much today? Rejected. Chasing a stock that already moved 5%? Rejected. It's the compliance officer who makes sure we never blow up.
+3. **The Risk Manager** — A paranoid rule-checker that gates every trade with 12 different safety checks. Position too big? Rejected. Already lost too much today? Rejected. Chasing a stock that already moved 5%? Rejected. Three losses in a row? Circuit breaker pauses everything. It's the compliance officer who makes sure we never blow up.
 
 Only after all three agree does an order actually get placed.
 
@@ -253,6 +253,8 @@ MAX_SECTOR_CONCENTRATION_PCT = 25.0 # Max 25% in one sector (like tech)
 ANTI_MOMENTUM_PCT = 5.0             # Don't buy if already moved 5%
 MIN_RISK_REWARD_RATIO = 1.5         # Potential profit must be 1.5x potential loss
 ALLOW_SHORT_SELLING = False         # Block sells for stocks not held (no shorting)
+CIRCUIT_BREAKER_LOSSES = 3          # Pause after 3 consecutive losses
+CIRCUIT_BREAKER_WINDOW_MIN = 60     # Within this many minutes
 ```
 
 The risk manager also includes a **cumulative risk check** that ensures total open risk (all positions' max loss via stop-loss) stays within the daily loss limit. This prevents a scenario where 5 positions each sized at 1% risk = 5% total risk, exceeding the 2% daily limit.
@@ -597,7 +599,7 @@ The risk manager is the **last line of defense** before real money moves. Even i
 
 Like the screener, it's **pure functions** — takes portfolio state as input, returns approval/rejection. No data fetching, no side effects. Same code works in live trading and backtesting.
 
-### The 11 Safety Checks
+### The 12 Safety Checks
 
 Every signal must pass ALL of these. Fail one, the trade is rejected.
 
@@ -677,6 +679,13 @@ Why: Trading against the trend is fighting the market. This check ensures we're 
 Rule: (take_profit - entry) / (entry - stop_loss) must be >= 1.5
 
 Why: If you risk $1 to make $1, you need to be right >50% of the time to profit. At 1.5:1, you only need to be right ~40% of the time. The math works in your favor.
+
+#### 12. Circuit Breaker — `check_circuit_breaker()`
+"Have we been losing too many trades in a row?"
+
+Rule: If the last 3 consecutive closed trades (within a 60-minute window) are all losses, pause all new trading and send a Telegram alert. A win or breakeven trade resets the streak. Both the loss count and time window are configurable via `CIRCUIT_BREAKER_LOSSES` and `CIRCUIT_BREAKER_WINDOW_MIN`.
+
+Why: The daily loss limit is reactive — it triggers after you've already bled money. The circuit breaker is proactive: 3 rapid losses in a row usually signals something systemic (market regime change, stale data feed, broken model). Better to pause and review than keep firing. Think of it as a smoke detector vs. a fire extinguisher.
 
 ### Position Sizing
 
@@ -1145,7 +1154,7 @@ Every module has its own test file. Tests use **synthetic data** — hand-built 
 |-----------|-----------------|
 | `conftest.py` | Shared fixtures: `make_signal()`, `make_position()` factories |
 | `test_screener.py` | Each indicator triggers correctly on crafted price data |
-| `test_risk.py` | Each safety check accepts/rejects correctly |
+| `test_risk.py` | Each safety check accepts/rejects correctly, circuit breaker streak logic |
 | `test_analyst.py` | Prompt building, response parsing, validation |
 | `test_data.py` | Data fetching, caching, column normalization |
 | `test_connection.py` | Contract creation, connection handling |
