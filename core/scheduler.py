@@ -25,13 +25,13 @@ from core.executor import (
 )
 from core.portfolio import (
     get_open_positions, get_daily_pnl, record_signal,
-    get_portfolio_value,
+    get_portfolio_value, get_trades,
 )
 from core.models import StockInfo
 from notifications.telegram import (
     notify_scan_summary, notify_trade, notify_error,
     notify_shutdown, update_status, notify_risk_results,
-    update_portfolio_data,
+    update_portfolio_data, notify_risk_warning,
 )
 
 from core import state as _state
@@ -213,9 +213,15 @@ def run_scan_cycle(
             # Fetch current price for anti-momentum check
             sig_df = stock_data.get(signal.ticker, (None, None))[1]
             current_price = sig_df["close"].iloc[-1] if sig_df is not None and not sig_df.empty else 0.0
-            result = evaluate(signal, open_positions, portfolio_value, daily_pnl, current_price=current_price)
+            recent_trades = get_trades(start_date=datetime.now().date())
+            result = evaluate(signal, open_positions, portfolio_value, daily_pnl, current_price=current_price, recent_trades=recent_trades)
             if not result.approved:
                 logger.info("Risk rejected %s: %s", signal.ticker, "; ".join(result.reasons))
+                if any("circuit breaker" in r.lower() for r in result.reasons):
+                    notify_risk_warning(
+                        "Circuit breaker tripped — consecutive losses detected. "
+                        "Trading paused. Review manually."
+                    )
                 return
 
             summary["risk_approved"] += 1
