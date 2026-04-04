@@ -6,8 +6,9 @@ never fetch data themselves. This allows the backtester to reuse them.
 
 import logging
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 
-from core.models import Signal, Position, Action
+from core.models import Signal, Position, Trade, Action
 from config.settings import (
     MAX_POSITION_SIZE_PCT,
     DAILY_LOSS_LIMIT_PCT,
@@ -19,6 +20,8 @@ from config.settings import (
     MIN_RISK_REWARD_RATIO,
     ALLOW_SHORT_SELLING,
     FINANCIAL_KEYWORDS,
+    CIRCUIT_BREAKER_LOSSES,
+    CIRCUIT_BREAKER_WINDOW_MIN,
 )
 
 logger = logging.getLogger(__name__)
@@ -343,6 +346,44 @@ def check_risk_reward(
     return True, ""
 
 
+def check_circuit_breaker(
+    recent_trades: list[Trade],
+    max_losses: int = CIRCUIT_BREAKER_LOSSES,
+    window_minutes: int = CIRCUIT_BREAKER_WINDOW_MIN,
+) -> tuple[bool, str]:
+    """Pause trading after N consecutive losing trades within a time window.
+
+    Catches regime changes, stale data, or systematic issues early —
+    before the daily loss limit is hit.
+    """
+    if not recent_trades or max_losses <= 0:
+        return True, ""
+
+    cutoff = datetime.now() - timedelta(minutes=window_minutes)
+
+    # Filter to trades within the window, sorted newest-first
+    windowed = sorted(
+        (t for t in recent_trades if t.exit_time >= cutoff),
+        key=lambda t: t.exit_time,
+        reverse=True,
+    )
+
+    # Count consecutive losses from the most recent trade backward
+    consecutive = 0
+    for trade in windowed:
+        if trade.pnl < 0:
+            consecutive += 1
+        else:
+            break  # win or breakeven resets the streak
+
+    if consecutive >= max_losses:
+        return False, (
+            f"Circuit breaker: {consecutive} consecutive losses in the last "
+            f"{window_minutes} minutes. Trading paused — review manually."
+        )
+    return True, ""
+
+
 # ---------------------------------------------------------------------------
 # Position sizing
 # ---------------------------------------------------------------------------
@@ -388,6 +429,7 @@ def evaluate(
     portfolio_value: float,
     daily_pnl: float,
     current_price: float = 0.0,
+    recent_trades: list[Trade] | None = None,
 ) -> RiskResult:
     """Run all risk checks on a signal. Returns RiskResult.
 
@@ -415,6 +457,7 @@ def evaluate(
         check_risk_reward(signal),
         check_anti_momentum(signal, price),
         check_trend_confirmation(signal, indicator_values),
+        check_circuit_breaker(recent_trades or []),
     ]
 
     for passed, reason in checks:

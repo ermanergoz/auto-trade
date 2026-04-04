@@ -83,6 +83,10 @@ TREND_CONFIRMATION = True       # Require MA5 > MA10 > MA20 alignment for buys
 MIN_RISK_REWARD_RATIO = 1.5     # Minimum reward/risk ratio
 ALLOW_SHORT_SELLING = False     # Block sell signals for stocks not currently held
 
+# Circuit breaker — pause trading after consecutive losses
+CIRCUIT_BREAKER_LOSSES = 3      # Number of consecutive losses to trip
+CIRCUIT_BREAKER_WINDOW_MIN = 60 # Time window in minutes to look back
+
 # ---------------------------------------------------------------------------
 # Day Trading
 # ---------------------------------------------------------------------------
