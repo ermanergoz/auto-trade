@@ -11,7 +11,7 @@ from ib_insync import IB
 from config.settings import (
     SCAN_INTERVAL_MINUTES, TIMEZONE, MARKET_HOURS,
     CLOSE_DAY_TRADES_BEFORE_MARKET_CLOSE, CLOSE_MINUTES_BEFORE,
-    AI_MAX_CANDIDATES,
+    AI_MAX_CANDIDATES, STALE_ORDER_MINUTES,
 )
 from core.connection import ensure_connected, create_contract, disconnect
 from core.data import get_historical_data, get_news, get_historical_data_yfinance
@@ -22,6 +22,7 @@ from core.risk import evaluate
 from core.executor import (
     place_order, close_all_day_trades, setup_fill_handler,
     setup_exit_handler, setup_disconnect_handler,
+    get_stale_orders, cancel_bracket_order,
 )
 from core.portfolio import (
     get_open_positions, get_daily_pnl, record_signal,
@@ -32,6 +33,7 @@ from notifications.telegram import (
     notify_scan_summary, notify_trade, notify_error,
     notify_shutdown, update_status, notify_risk_results,
     update_portfolio_data, notify_risk_warning,
+    notify_stale_order_cancelled,
 )
 
 from core import state as _state
@@ -116,6 +118,14 @@ def run_scan_cycle(
         logger.error("Cannot run scan — IBKR not connected")
         notify_error("Cannot run scan — IBKR not connected")
         return summary
+
+    # Re-evaluate stale unfilled orders before scanning
+    stale_result = check_stale_orders(ib, mode)
+    if stale_result["cancelled"] > 0:
+        logger.info(
+            "Cancelled %d stale orders: %s",
+            stale_result["cancelled"], stale_result["tickers_cancelled"],
+        )
 
     if force:
         active_markets = [m.upper() for m in markets]
@@ -271,6 +281,64 @@ def run_scan_cycle(
     )
     update_status("scan_complete", f"Next scan in {SCAN_INTERVAL_MINUTES} min")
     return summary
+
+
+def check_stale_orders(ib: IB, mode: str = "paper") -> dict:
+    """Re-screen unfilled orders older than STALE_ORDER_MINUTES.
+
+    For each stale order, fetches fresh data and runs the screener.
+    Orders that no longer pass screening are cancelled.
+    """
+    result = {"stale_found": 0, "kept": 0, "cancelled": 0, "tickers_cancelled": []}
+
+    if STALE_ORDER_MINUTES <= 0:
+        return result
+
+    stale = get_stale_orders(ib, STALE_ORDER_MINUTES)
+    result["stale_found"] = len(stale)
+
+    if not stale:
+        return result
+
+    logger.info("Found %d stale unfilled orders, re-screening...", len(stale))
+
+    for entry in stale:
+        trade = entry["trade"]
+        ticker = entry["ticker"]
+        exchange = entry["exchange"]
+        age_hours = entry["age_minutes"] / 60
+
+        # Fetch fresh data and re-screen
+        try:
+            contract = create_contract(ticker, exchange)
+            df = get_historical_data(ib, contract, duration="60 D", bar_size="1 day")
+            if df.empty:
+                df = get_historical_data_yfinance(ticker, period="3mo", market="US")
+
+            still_valid = False
+            if not df.empty:
+                stock_data = {ticker: (exchange, df)}
+                candidates = screen_stocks(stock_data)
+                still_valid = any(c.ticker == ticker for c in candidates)
+        except Exception as e:
+            logger.warning("Failed to re-screen %s: %s — keeping order", ticker, e)
+            result["kept"] += 1
+            continue
+
+        if still_valid:
+            logger.info("Stale order for %s still passes screening (%.1fh old), keeping", ticker, age_hours)
+            result["kept"] += 1
+        else:
+            dry_run = mode in ("dry-run", "backtest")
+            if dry_run:
+                logger.info("[DRY-RUN] Would cancel stale order for %s (%.1fh old)", ticker, age_hours)
+            else:
+                cancel_bracket_order(ib, trade)
+                notify_stale_order_cancelled(ticker, age_hours)
+            result["cancelled"] += 1
+            result["tickers_cancelled"].append(ticker)
+
+    return result
 
 
 def _fetch_market_data(
