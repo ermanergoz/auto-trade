@@ -1,7 +1,7 @@
 """IBKR order execution — bracket orders, monitoring, fill handling."""
 
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 
 from ib_insync import IB, Trade as IBTrade, Order, LimitOrder, MarketOrder, StopOrder
@@ -145,6 +145,51 @@ def cancel_order(ib: IB, trade: IBTrade) -> None:
         logger.info("Cancelled order %s for %s", trade.order.orderId, trade.contract.symbol)
     except Exception as e:
         logger.error("Failed to cancel order: %s", e)
+
+
+def get_stale_orders(ib: IB, stale_minutes: int = 1440) -> list[dict]:
+    """Return unfilled parent limit orders older than *stale_minutes*.
+
+    Only considers parent entry orders (parentId == 0) with status
+    Submitted or PreSubmitted.  Each returned dict contains the Trade
+    object, ticker, exchange, and age in minutes.
+    """
+    stale = []
+    now = datetime.now(timezone.utc)
+    for trade in ib.openTrades():
+        order = trade.order
+        # Only parent entry limit orders
+        if order.parentId != 0 or order.orderType != "LMT":
+            continue
+        status = trade.orderStatus.status
+        if status not in ("Submitted", "PreSubmitted"):
+            continue
+        # Age from the first log entry (submission time)
+        if not trade.log:
+            continue
+        submitted_at = trade.log[0].time
+        age_minutes = (now - submitted_at).total_seconds() / 60
+        if age_minutes >= stale_minutes:
+            stale.append({
+                "trade": trade,
+                "ticker": trade.contract.symbol,
+                "exchange": trade.contract.exchange or trade.contract.primaryExchange,
+                "age_minutes": age_minutes,
+            })
+    return stale
+
+
+def cancel_bracket_order(ib: IB, trade: IBTrade) -> bool:
+    """Cancel a parent entry order (IBKR auto-cancels attached TP/SL children)."""
+    ticker = trade.contract.symbol
+    order_id = trade.order.orderId
+    try:
+        ib.cancelOrder(trade.order)
+        logger.info("Cancelled stale bracket order %s for %s", order_id, ticker)
+        return True
+    except Exception as e:
+        logger.error("Failed to cancel stale order %s for %s: %s", order_id, ticker, e)
+        return False
 
 
 def close_position_market(
