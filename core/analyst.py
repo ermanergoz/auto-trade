@@ -129,7 +129,7 @@ def _call_ollama(prompt: str) -> Optional[dict]:
         headers={"Content-Type": "application/json"},
     )
 
-    response = urllib.request.urlopen(req, timeout=60)
+    response = urllib.request.urlopen(req, timeout=1800)
     result = json.loads(response.read())
 
     # Track usage
