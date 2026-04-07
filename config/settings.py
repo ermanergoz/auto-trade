@@ -87,6 +87,9 @@ ALLOW_SHORT_SELLING = False     # Block sell signals for stocks not currently he
 CIRCUIT_BREAKER_LOSSES = 3      # Number of consecutive losses to trip
 CIRCUIT_BREAKER_WINDOW_MIN = 60 # Time window in minutes to look back
 
+# Stale order re-evaluation
+STALE_ORDER_MINUTES = 1440      # Re-screen unfilled orders after 24 hours
+
 # ---------------------------------------------------------------------------
 # Day Trading
 # ---------------------------------------------------------------------------

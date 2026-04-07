@@ -337,6 +337,17 @@ def notify_error(error: str) -> bool:
     return _send_sync(text)
 
 
+def notify_stale_order_cancelled(ticker: str, age_hours: float, reason: str = "Failed re-screening") -> bool:
+    """Notify that a stale unfilled order was cancelled after re-evaluation."""
+    text = (
+        f"\U0001f6ab <b>Stale Order Cancelled</b>\n\n"
+        f"Ticker: <code>{ticker}</code>\n"
+        f"Age: {age_hours:.1f}h\n"
+        f"Reason: {reason}"
+    )
+    return _send_sync(text)
+
+
 def notify_scan_summary(
     candidates: int,
     ai_approved: int,
