@@ -113,14 +113,15 @@ The screener and risk manager are written as **pure functions** that accept data
 
 Each scan cycle (every 15 minutes by default) executes the following pipeline:
 
-1. **Market hours check** -- Determine if the US market is currently open
-2. **Universe building** -- Build/load the tradeable stock list (cached daily) using 10 IBKR scanner types, enrich each stock with sector data via a 3-tier fallback chain (IBKR contract details -> yfinance -> Ollama LLM), classify ETFs by category (equity ETFs kept, bond/leveraged/commodity ETFs excluded), then filter out financial sector stocks and apply liquidity thresholds. Typical result: ~200-350 unique stocks
-3. **Data fetching** -- Fetch historical OHLCV data for all stocks in the universe from IBKR (or YFinance fallback)
-4. **Technical screening** -- Run 6 technical indicators on every stock, score candidates, and pass all qualifying stocks (above min_score) to AI analysis
-5. **AI analysis** -- Send each candidate to the local LLM (via Ollama) with price action, indicators, and news context; receive structured trade recommendations with confidence scores
-6. **Risk evaluation** -- Pass every AI-approved signal through 12 risk checks (short selling block, position size, daily loss, max positions, stop-loss, sector concentration, no duplicates, excluded sector, risk/reward, anti-momentum, trend confirmation, circuit breaker)
-7. **Order execution** -- Place bracket orders (entry + stop-loss + take-profit) through IBKR for approved signals
-8. **Logging and notifications** -- Record everything to SQLite and CSV, send Telegram alerts, update terminal dashboard
+1. **Stale order re-evaluation** -- Check unfilled limit orders older than 24 hours, re-run the screener on each, and cancel orders that no longer pass technical screening
+2. **Market hours check** -- Determine if the US market is currently open
+3. **Universe building** -- Build/load the tradeable stock list (cached daily) using 10 IBKR scanner types, enrich each stock with sector data via a 3-tier fallback chain (IBKR contract details -> yfinance -> Ollama LLM), classify ETFs by category (equity ETFs kept, bond/leveraged/commodity ETFs excluded), then filter out financial sector stocks and apply liquidity thresholds. Typical result: ~200-350 unique stocks
+4. **Data fetching** -- Fetch historical OHLCV data for all stocks in the universe from IBKR (or YFinance fallback)
+5. **Technical screening** -- Run 6 technical indicators on every stock, score candidates, and pass all qualifying stocks (above min_score) to AI analysis
+6. **AI analysis** -- Send each candidate to the local LLM (via Ollama) with price action, indicators, and news context; receive structured trade recommendations with confidence scores
+7. **Risk evaluation** -- Pass every AI-approved signal through 12 risk checks (short selling block, position size, daily loss, max positions, stop-loss, sector concentration, no duplicates, excluded sector, risk/reward, anti-momentum, trend confirmation, circuit breaker)
+8. **Order execution** -- Place bracket orders (entry + stop-loss + take-profit) through IBKR for approved signals
+9. **Logging and notifications** -- Record everything to SQLite and CSV, send Telegram alerts, update terminal dashboard
 
 ---
 
@@ -374,6 +375,7 @@ All trading parameters are configured in `config/settings.py`. Key settings:
 | `ALLOW_SHORT_SELLING` | `False` | Allow sell signals for stocks not held |
 | `CIRCUIT_BREAKER_LOSSES` | `3` | Consecutive losses to pause trading |
 | `CIRCUIT_BREAKER_WINDOW_MIN` | `60` | Time window (minutes) for circuit breaker |
+| `STALE_ORDER_MINUTES` | `1440` | Re-screen unfilled orders after N minutes (24h) |
 
 #### Technical Indicator Settings
 | Parameter | Default | Description |
@@ -571,6 +573,10 @@ Every trade must pass through **all 12 risk checks** before execution. If any ch
 | **Sector Concentration** | No sector can exceed X% of total portfolio | 25% |
 | **No Duplicates** | Cannot open a second position in an already-held stock | Enforced |
 | **Circuit Breaker** | Pause trading after N consecutive losses within a time window | 3 losses / 60 min |
+
+### Stale Order Re-evaluation
+
+Unfilled limit orders are re-evaluated at the start of every scan cycle. If an order has been pending longer than `STALE_ORDER_MINUTES` (default: 24 hours), the system fetches fresh data and re-runs the technical screener on that stock. Orders that no longer pass screening are automatically cancelled (cancelling the parent entry order also cancels its attached stop-loss and take-profit children). Orders that still pass are kept alive. Telegram notifications are sent for each cancellation.
 
 ### Position Sizing
 

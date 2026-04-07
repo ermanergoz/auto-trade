@@ -749,6 +749,14 @@ This is **atomic** — all three orders are placed as a unit. You never end up w
 
 **`setup_disconnect_handler(ib)`** — Attaches a callback for connection drops. Important because IBKR connections are notoriously unstable. Uses a re-entrancy guard (`_reconnecting` flag) to prevent cascading reconnect loops where a reconnect triggers another disconnect event. Reads the shared `shutting_down` flag from `core.state` to skip reconnection during intentional shutdown (avoiding the circular import that would result from importing directly from `scheduler.py`).
 
+### Stale Order Re-evaluation
+
+**`get_stale_orders(ib, stale_minutes)`** — Queries IBKR via `ib.openTrades()` for all unfilled parent limit orders (where `parentId == 0` and `orderType == "LMT"` with status `Submitted` or `PreSubmitted`). Calculates order age from the first log entry timestamp (`trade.log[0].time`). Returns a list of dicts with the Trade object, ticker, exchange, and age in minutes for orders older than the threshold.
+
+**`cancel_bracket_order(ib, trade)`** — Cancels a parent entry order. IBKR automatically cancels the attached child orders (take-profit and stop-loss) when the parent is cancelled. Follows the same try/except pattern as `cancel_order()`.
+
+The scheduler's `check_stale_orders()` orchestrates the full flow: for each stale order, it fetches fresh historical data, re-runs the screener, and cancels orders where the stock no longer passes technical screening. This runs at the beginning of every scan cycle to free up capital and position slots before new candidates are evaluated.
+
 ### Dry-Run Mode
 
 When the system runs in `dry-run` mode, the executor does everything EXCEPT actually calling `ib.placeOrder()`. It logs the exact order it would have placed. This is invaluable for testing the full pipeline without risking money.
@@ -779,6 +787,9 @@ This is the heart of the system. Called every 15 minutes:
 def run_scan_cycle(ib, markets, mode="paper", force=False):
     # 1. Make sure we're connected
     ensure_connected(ib, ...)
+
+    # 1.5 Re-evaluate stale unfilled orders (cancel if they no longer pass screening)
+    check_stale_orders(ib, mode)
 
     # 2. Get account info
     account = get_account_summary(ib)
