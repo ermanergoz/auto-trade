@@ -207,10 +207,8 @@ class TestOllamaTimeout:
     """Verify Ollama timeout is reasonable (not 600s)."""
 
     def test_timeout_is_reasonable(self):
-        """Ollama timeout must be <= 120s to avoid blocking scan cycles."""
+        """Ollama timeout must be 1800s to allow slow local models to complete."""
         import core.analyst as analyst_module
         import inspect
         source = inspect.getsource(analyst_module._call_ollama)
-        # Check that timeout is not 600
-        assert "timeout=600" not in source, "Ollama timeout must not be 600s"
-        assert "timeout=60" in source, "Ollama timeout should be 60s"
+        assert "timeout=1800" in source, "Ollama timeout should be 1800s"
