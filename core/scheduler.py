@@ -298,6 +298,15 @@ def check_stale_orders(ib: IB, mode: str = "paper") -> dict:
     result["stale_found"] = len(stale)
 
     if not stale:
+        open_parents = sum(
+            1 for t in ib.openTrades()
+            if t.order.parentId == 0 and t.order.orderType == "LMT"
+        )
+        if open_parents:
+            logger.info(
+                "Stale order check: %d open parent orders, none older than %dh",
+                open_parents, STALE_ORDER_MINUTES // 60,
+            )
         return result
 
     logger.info("Found %d stale unfilled orders, re-screening...", len(stale))
@@ -335,8 +344,8 @@ def check_stale_orders(ib: IB, mode: str = "paper") -> dict:
             else:
                 cancel_bracket_order(ib, trade)
                 notify_stale_order_cancelled(ticker, age_hours)
-            result["cancelled"] += 1
-            result["tickers_cancelled"].append(ticker)
+                result["cancelled"] += 1
+                result["tickers_cancelled"].append(ticker)
 
     return result
 
