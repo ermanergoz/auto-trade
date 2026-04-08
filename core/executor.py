@@ -8,7 +8,10 @@ from ib_insync import IB, Trade as IBTrade, Order, LimitOrder, MarketOrder, Stop
 
 from core.models import Signal, Position, Trade, Action, TradeType
 from core.connection import create_contract, ensure_connected
-from core.portfolio import add_position, close_position as db_close_position
+from core.portfolio import (
+    add_position, close_position as db_close_position,
+    save_pending_order, get_pending_order_time, remove_pending_order,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -84,6 +87,18 @@ def place_order(
             signal.entry_price, signal.stop_loss, signal.take_profit,
             parent_order.orderId, tp_order.orderId, sl_order.orderId,
         )
+
+        # Persist placement time for stale order detection
+        ib.sleep(0.5)  # Allow permId assignment
+        if parent_order.permId:
+            save_pending_order(parent_order.permId, signal.ticker)
+        else:
+            logger.warning(
+                "permId not assigned for %s order after 0.5s — "
+                "stale detection will fall back to trade.log",
+                signal.ticker,
+            )
+
         return trades
 
     except Exception as e:
@@ -143,6 +158,8 @@ def cancel_order(ib: IB, trade: IBTrade) -> None:
     try:
         ib.cancelOrder(trade.order)
         logger.info("Cancelled order %s for %s", trade.order.orderId, trade.contract.symbol)
+        if trade.order.permId:
+            remove_pending_order(trade.order.permId)
     except Exception as e:
         logger.error("Failed to cancel order: %s", e)
 
@@ -164,11 +181,27 @@ def get_stale_orders(ib: IB, stale_minutes: int = 1440) -> list[dict]:
         status = trade.orderStatus.status
         if status not in ("Submitted", "PreSubmitted"):
             continue
-        # Age from the first log entry (submission time)
-        if not trade.log:
-            continue
-        submitted_at = trade.log[0].time
+        # Use persistent DB timestamp (survives reconnections)
+        submitted_at = None
+        ticker = trade.contract.symbol
+        if order.permId:
+            db_time = get_pending_order_time(order.permId)
+            if db_time:
+                submitted_at = db_time.replace(tzinfo=timezone.utc)
+                logger.debug("Order %s (%s): using DB timestamp %s", order.permId, ticker, submitted_at)
+        # Fallback to trade log (only accurate within same session)
+        if submitted_at is None:
+            if not trade.log:
+                logger.debug("Order %s (%s): no DB record and no log — skipping", order.permId, ticker)
+                continue
+            log_time = trade.log[0].time
+            if log_time.tzinfo is None:
+                log_time = log_time.replace(tzinfo=timezone.utc)
+            submitted_at = log_time
+            logger.debug("Order %s (%s): no DB record, using log timestamp %s", order.permId, ticker, submitted_at)
         age_minutes = (now - submitted_at).total_seconds() / 60
+        logger.info("Order %s (%s): age %.1fh, threshold %dh",
+                     order.permId, ticker, age_minutes / 60, stale_minutes // 60)
         if age_minutes >= stale_minutes:
             stale.append({
                 "trade": trade,
@@ -186,6 +219,8 @@ def cancel_bracket_order(ib: IB, trade: IBTrade) -> bool:
     try:
         ib.cancelOrder(trade.order)
         logger.info("Cancelled stale bracket order %s for %s", order_id, ticker)
+        if trade.order.permId:
+            remove_pending_order(trade.order.permId)
         return True
     except Exception as e:
         logger.error("Failed to cancel stale order %s for %s: %s", order_id, ticker, e)
@@ -288,6 +323,8 @@ def setup_fill_handler(ib: IB, signal: Signal, quantity: int, on_fill=None) -> N
                         signal.ticker, filled_qty, quantity, fill_price,
                     )
                 handle_fill(signal, filled_qty, fill_price)
+                if trade.order.permId:
+                    remove_pending_order(trade.order.permId)
                 if on_fill:
                     on_fill(signal, filled_qty, fill_price)
 
