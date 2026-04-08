@@ -578,6 +578,8 @@ Every trade must pass through **all 12 risk checks** before execution. If any ch
 
 Unfilled limit orders are re-evaluated at the start of every scan cycle. If an order has been pending longer than `STALE_ORDER_MINUTES` (default: 24 hours), the system fetches fresh data and re-runs the technical screener on that stock. Orders that no longer pass screening are automatically cancelled (cancelling the parent entry order also cancels its attached stop-loss and take-profit children). Orders that still pass are kept alive. Telegram notifications are sent for each cancellation.
 
+Order placement timestamps are persisted in the `pending_orders` database table to survive IBKR reconnections (the `ib_insync` trade log resets on every reconnect, which would otherwise make all orders appear brand new). Records are cleaned up automatically when orders fill or are cancelled.
+
 ### Position Sizing
 
 Position size is calculated using the more conservative of two methods:

@@ -751,9 +751,9 @@ This is **atomic** — all three orders are placed as a unit. You never end up w
 
 ### Stale Order Re-evaluation
 
-**`get_stale_orders(ib, stale_minutes)`** — Queries IBKR via `ib.openTrades()` for all unfilled parent limit orders (where `parentId == 0` and `orderType == "LMT"` with status `Submitted` or `PreSubmitted`). Calculates order age from the first log entry timestamp (`trade.log[0].time`). Returns a list of dicts with the Trade object, ticker, exchange, and age in minutes for orders older than the threshold.
+**`get_stale_orders(ib, stale_minutes)`** — Queries IBKR via `ib.openTrades()` for all unfilled parent limit orders (where `parentId == 0` and `orderType == "LMT"` with status `Submitted` or `PreSubmitted`). Looks up order age from the `pending_orders` database table first (persisted at placement time), falling back to `trade.log[0].time` for orders placed before this tracking was added. The DB lookup is critical because `ib_insync` resets the trade log on every reconnection, which would otherwise make all orders appear brand new. Returns a list of dicts with the Trade object, ticker, exchange, and age in minutes for orders older than the threshold.
 
-**`cancel_bracket_order(ib, trade)`** — Cancels a parent entry order. IBKR automatically cancels the attached child orders (take-profit and stop-loss) when the parent is cancelled. Follows the same try/except pattern as `cancel_order()`.
+**`cancel_bracket_order(ib, trade)`** — Cancels a parent entry order. IBKR automatically cancels the attached child orders (take-profit and stop-loss) when the parent is cancelled. Also removes the `pending_orders` DB record for the cancelled order. Follows the same try/except pattern as `cancel_order()`.
 
 The scheduler's `check_stale_orders()` orchestrates the full flow: for each stale order, it fetches fresh historical data, re-runs the screener, and cancels orders where the stock no longer passes technical screening. This runs at the beginning of every scan cycle to free up capital and position slots before new candidates are evaluated.
 
@@ -879,6 +879,11 @@ daily_summary (end-of-day snapshots):
 signals (every signal ever generated — audit trail):
   - ticker, action, confidence, prices, reasoning
   - source (screener/ai), timestamp
+
+pending_orders (tracks unfilled order placement times):
+  - perm_id (IBKR permanent order ID, primary key)
+  - ticker, placed_at
+  - Cleaned up on fill or cancellation
 ```
 
 ### Key Operations
@@ -896,6 +901,12 @@ signals (every signal ever generated — audit trail):
 **`get_daily_pnl()`** — Calculate today's realized P&L by summing all trades closed today.
 
 **`record_signal(signal)`** — Save every signal for audit trail. Even rejected ones. Useful for backtesting analysis: "How often did we reject signals that would have been profitable?"
+
+**`save_pending_order(perm_id, ticker)`** — Records when a parent order was placed. Called from `place_order()` after the bracket is submitted. Uses `INSERT OR IGNORE` so duplicate calls are safe.
+
+**`get_pending_order_time(perm_id)`** — Returns the original placement datetime for a pending order, or `None` if not found. Used by `get_stale_orders()` to calculate accurate order age across reconnections.
+
+**`remove_pending_order(perm_id)`** — Deletes a pending order record. Called from `cancel_bracket_order()`, `cancel_order()`, and `setup_fill_handler()` when orders are cancelled or filled.
 
 ### Transaction Safety
 
@@ -1173,6 +1184,7 @@ Every module has its own test file. Tests use **synthetic data** — hand-built 
 | `test_models.py` | Dataclass construction, computed properties (P&L, duration) |
 | `test_universe.py` | Universe building, filtering, caching |
 | `test_scheduler.py` | Streaming signal pipeline, callback-based risk check + execution |
+| `test_stale_orders.py` | Persistent order timestamps, stale detection, DB cleanup on fill/cancel |
 | `test_telegram.py` | Status commands, portfolio display, risk notifications |
 | `test_backtest.py` | Full backtest loop, exit checking, no look-ahead |
 
