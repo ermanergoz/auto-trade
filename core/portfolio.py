@@ -3,7 +3,7 @@
 import logging
 import sqlite3
 from contextlib import contextmanager
-from datetime import datetime, date
+from datetime import datetime, date, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -91,6 +91,12 @@ def init_db(db_path: Path = DB_PATH) -> None:
                 trade_type TEXT DEFAULT 'day',
                 timestamp TEXT NOT NULL,
                 created_at TEXT DEFAULT (datetime('now'))
+            );
+
+            CREATE TABLE IF NOT EXISTS pending_orders (
+                perm_id INTEGER PRIMARY KEY,
+                ticker TEXT NOT NULL,
+                placed_at TEXT NOT NULL
             );
 
             CREATE INDEX IF NOT EXISTS idx_positions_ticker ON positions(ticker);
@@ -379,3 +385,35 @@ def get_daily_summary(
         winning_trades=row["winning_trades"],
         losing_trades=row["losing_trades"],
     )
+
+
+# ---------------------------------------------------------------------------
+# Pending Orders
+# ---------------------------------------------------------------------------
+
+def save_pending_order(perm_id: int, ticker: str, db_path: Path = DB_PATH) -> None:
+    """Record when a parent order was placed (persists across reconnections)."""
+    with _db_connection(db_path) as conn:
+        conn.execute(
+            """INSERT OR IGNORE INTO pending_orders (perm_id, ticker, placed_at)
+               VALUES (?, ?, ?)""",
+            (perm_id, ticker, datetime.now(timezone.utc).isoformat()),
+        )
+
+
+def get_pending_order_time(perm_id: int, db_path: Path = DB_PATH) -> Optional[datetime]:
+    """Return the original placement time for a pending order, or None."""
+    with _db_connection(db_path) as conn:
+        row = conn.execute(
+            "SELECT placed_at FROM pending_orders WHERE perm_id = ?",
+            (perm_id,),
+        ).fetchone()
+    if row:
+        return datetime.fromisoformat(row["placed_at"])
+    return None
+
+
+def remove_pending_order(perm_id: int, db_path: Path = DB_PATH) -> None:
+    """Remove a pending order record (after fill or cancellation)."""
+    with _db_connection(db_path) as conn:
+        conn.execute("DELETE FROM pending_orders WHERE perm_id = ?", (perm_id,))
