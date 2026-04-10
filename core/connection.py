@@ -47,6 +47,7 @@ def ensure_connected(
     host: str = IBKR_HOST,
     port: int = IBKR_PORT,
     client_id: int = IBKR_CLIENT_ID,
+    timeout: int = IBKR_TIMEOUT,
     max_retries: int = 3,
     retry_delay: float = 5.0,
 ) -> IB:
@@ -60,7 +61,7 @@ def ensure_connected(
     logger.warning("IBKR connection lost — attempting reconnect...")
     for attempt in range(1, max_retries + 1):
         try:
-            ib.connect(host, port, clientId=client_id, timeout=IBKR_TIMEOUT)
+            ib.connect(host, port, clientId=client_id, timeout=timeout)
             logger.info("Reconnected to IBKR (attempt %d)", attempt)
             return ib
         except Exception:
@@ -80,7 +81,7 @@ def create_contract(ticker: str, exchange: str = "SMART") -> Stock:
     for best execution. The exchange parameter is accepted for future
     multi-market support but is not used.
     """
-    if exchange and exchange not in ("SMART", "NYSE", "NASDAQ", ""):
+    if exchange and exchange not in ("SMART", "NYSE", "NASDAQ", "ARCA", "BATS", "IEX", "AMEX", "ISLAND", "US", ""):
         logger.warning(
             "Exchange '%s' for %s ignored — only US/SMART routing is supported",
             exchange, ticker,
@@ -91,15 +92,14 @@ def create_contract(ticker: str, exchange: str = "SMART") -> Stock:
 def qualify_contracts(ib: IB, contracts: list[Contract]) -> list[Contract]:
     """Qualify contracts to resolve ambiguous tickers.
 
-    Particularly important for BIST stocks. Returns only successfully
-    qualified contracts.
+    Returns only successfully qualified contracts.
     """
     qualified = []
     for contract in contracts:
         try:
             results = ib.qualifyContracts(contract)
             if results:
-                qualified.append(contract)
+                qualified.append(results[0])
             else:
                 logger.warning("Could not qualify contract: %s", contract)
         except Exception as e:
@@ -108,7 +108,12 @@ def qualify_contracts(ib: IB, contracts: list[Contract]) -> list[Contract]:
 
 
 def get_account_summary(ib: IB) -> dict:
-    """Fetch key account summary values from IBKR."""
+    """Fetch key account summary values from IBKR.
+
+    Raises ConnectionError if not connected, RuntimeError if no data returned.
+    """
+    if not ib.isConnected():
+        raise ConnectionError("Cannot fetch account summary: not connected to IBKR")
     summary = ib.accountSummary()
     result = {}
     for item in summary:
@@ -116,5 +121,10 @@ def get_account_summary(ib: IB) -> dict:
             "NetLiquidation", "TotalCashValue", "GrossPositionValue",
             "UnrealizedPnL", "RealizedPnL", "BuyingPower",
         ):
-            result[item.tag] = float(item.value)
+            try:
+                result[item.tag] = float(item.value)
+            except (ValueError, TypeError):
+                logger.debug("Non-numeric account value for %s: %r", item.tag, item.value)
+    if not result:
+        raise RuntimeError("Account summary returned no data — check IBKR subscription")
     return result

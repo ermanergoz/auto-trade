@@ -2,19 +2,21 @@
 
 import json
 import logging
+import threading
 import urllib.request
 from datetime import datetime
 from typing import Optional
 
 import pandas as pd
 
-from config.settings import AI_MODEL, AI_CONFIDENCE_THRESHOLD, OLLAMA_HOST
+from config.settings import AI_MODEL, AI_CONFIDENCE_THRESHOLD, OLLAMA_HOST, MIN_RISK_REWARD_RATIO
 from core.models import Signal, Action, TradeType
 
 logger = logging.getLogger(__name__)
 
-# Token usage tracking
+# Token usage tracking (guarded by _token_lock for thread safety)
 _daily_token_usage = {"input": 0, "output": 0, "date": None}
+_token_lock = threading.Lock()
 
 
 def _reset_daily_usage_if_needed() -> None:
@@ -42,6 +44,9 @@ ANALYSIS_PROMPT = """You are a disciplined stock trader making real money decisi
 ## News Headlines
 {news}
 
+## Macro/Political Headlines
+{macro_news}
+
 ## Decision Checklist — evaluate each before deciding:
 
 1. TREND: Is the stock in a clear uptrend (for buy) or downtrend (for sell)? Are moving averages aligned (MA5 > MA10 > MA20 for uptrend)?
@@ -50,6 +55,7 @@ ANALYSIS_PROMPT = """You are a disciplined stock trader making real money decisi
 4. RISK/REWARD: Is the reward at least 1.5x the risk? Calculate: (take_profit - entry) / (entry - stop_loss) >= 1.5
 5. NEWS SENTIMENT: Do recent headlines support or contradict the technical signal?
 6. ANTI-CHASE RULE: Has the stock already moved more than 5% in the signal direction recently? If yes, you missed the move — say "hold".
+7. MACRO/POLITICAL RISK: Do current political, regulatory, or macroeconomic conditions (elections, trade wars, sanctions, Fed policy, sector regulation) create risk or opportunity for this stock? Consider how macro headlines might override or reinforce the technical picture.
 
 ## Response Format
 Return a JSON object with these exact fields:
@@ -62,9 +68,9 @@ Return a JSON object with these exact fields:
 - "reasoning": 2-3 sentences covering your checklist assessment
 
 ## Discipline Rules
-- Default to "hold" unless at least 4 of 6 checklist items are clearly favorable
+- Default to "hold" unless at least 5 of 7 checklist items are clearly favorable
 - Never chase: if the stock already ran >5% toward the signal, say "hold"
-- Confidence above 65 only when trend + momentum + volume all align
+- Confidence above 65 only when trend + momentum + volume all align and macro environment is not hostile
 - Be honest about uncertainty — a confident "hold" is better than a shaky "buy"
 - Set stop-loss at a technical level (support/resistance), not an arbitrary percentage"""
 
@@ -75,6 +81,7 @@ def _build_prompt(
     df: pd.DataFrame,
     indicator_values: dict,
     news: list[str],
+    macro_news: list[str] | None = None,
 ) -> str:
     """Build the analysis prompt with all context."""
     # Recent price action
@@ -94,11 +101,20 @@ def _build_prompt(
     else:
         indicators = "  No indicator data available"
 
-    # News
+    # News — sanitize headlines to mitigate prompt injection from external sources
+    def _sanitize_headline(h: str) -> str:
+        return h[:200].replace("\n", " ").replace("##", "").replace("---", "").strip()
+
     if news:
-        news_text = "\n".join(f"  - {h}" for h in news[:5])
+        news_text = "\n".join(f"  - {_sanitize_headline(h)}" for h in news[:5])
     else:
         news_text = "  No recent news available"
+
+    # Macro/political news
+    if macro_news:
+        macro_text = "\n".join(f"  - {_sanitize_headline(h)}" for h in macro_news[:5])
+    else:
+        macro_text = "  No macro/political headlines available"
 
     return ANALYSIS_PROMPT.format(
         ticker=ticker,
@@ -106,6 +122,7 @@ def _build_prompt(
         price_action=price_action,
         indicators=indicators,
         news=news_text,
+        macro_news=macro_text,
     )
 
 
@@ -132,17 +149,28 @@ def _call_ollama(prompt: str) -> Optional[dict]:
     response = urllib.request.urlopen(req, timeout=1800)
     result = json.loads(response.read())
 
-    # Track usage
-    _reset_daily_usage_if_needed()
-    if "prompt_eval_count" in result:
-        _daily_token_usage["input"] += result["prompt_eval_count"]
-    if "eval_count" in result:
-        _daily_token_usage["output"] += result["eval_count"]
+    # Check for errors BEFORE tracking usage — error responses should
+    # not count toward daily token limits
+    if "error" in result:
+        logger.warning("Ollama error: %s", result["error"])
+        return None
+
+    # Track usage only on successful responses
+    with _token_lock:
+        _reset_daily_usage_if_needed()
+        if "prompt_eval_count" in result:
+            _daily_token_usage["input"] += result["prompt_eval_count"]
+        if "eval_count" in result:
+            _daily_token_usage["output"] += result["eval_count"]
 
     duration = result.get("total_duration", 0) / 1e9
     logger.info("Ollama response in %.1fs (%s)", duration, AI_MODEL)
 
-    return json.loads(result["response"])
+    try:
+        return json.loads(result["response"])
+    except (KeyError, json.JSONDecodeError) as e:
+        logger.warning("Ollama response malformed (missing 'response' key or invalid JSON): %s", e)
+        return None
 
 
 def _call_llm(prompt: str, max_retries: int = 3) -> Optional[dict]:
@@ -164,7 +192,7 @@ def _call_llm(prompt: str, max_retries: int = 3) -> Optional[dict]:
 
 def _validate_response(data: dict) -> bool:
     """Validate LLM response has all required fields with valid values."""
-    required = ["action", "confidence", "entry_price", "stop_loss", "take_profit", "reasoning"]
+    required = ["action", "confidence", "entry_price", "stop_loss", "take_profit", "reasoning", "trade_type"]
     missing = [f for f in required if f not in data]
     if missing:
         logger.warning("LLM response missing fields: %s. Keys present: %s", missing, list(data.keys()))
@@ -172,6 +200,9 @@ def _validate_response(data: dict) -> bool:
 
     if data["action"] not in ("buy", "sell", "hold"):
         logger.warning("LLM response invalid action: %r", data["action"])
+        return False
+    if data.get("trade_type") not in ("day", "swing"):
+        logger.warning("LLM response invalid trade_type: %r", data.get("trade_type"))
         return False
     if not isinstance(data["confidence"], (int, float)) or not (0 <= data["confidence"] <= 100):
         logger.warning("LLM response invalid confidence: %r", data["confidence"])
@@ -195,12 +226,22 @@ def _validate_response(data: dict) -> bool:
             if tp <= entry:
                 logger.warning("BUY take_profit %.2f must be above entry %.2f", tp, entry)
                 return False
+            risk = entry - sl
+            reward = tp - entry
+            if risk > 0 and reward / risk < MIN_RISK_REWARD_RATIO:
+                logger.warning("BUY R:R %.2f below minimum %.2f", reward / risk, MIN_RISK_REWARD_RATIO)
+                return False
         elif data["action"] == "sell":
             if sl <= entry:
                 logger.warning("SELL stop_loss %.2f must be above entry %.2f", sl, entry)
                 return False
             if tp >= entry:
                 logger.warning("SELL take_profit %.2f must be below entry %.2f", tp, entry)
+                return False
+            risk = sl - entry
+            reward = entry - tp
+            if risk > 0 and reward / risk < MIN_RISK_REWARD_RATIO:
+                logger.warning("SELL R:R %.2f below minimum %.2f", reward / risk, MIN_RISK_REWARD_RATIO)
                 return False
 
     return True
@@ -216,6 +257,7 @@ def analyze_candidate(
     df: pd.DataFrame,
     indicator_values: dict,
     news: list[str],
+    macro_news: list[str] | None = None,
 ) -> Optional[Signal]:
     """Analyze a single screener candidate with the LLM.
 
@@ -223,7 +265,7 @@ def analyze_candidate(
 
     Returns a Signal if confidence >= threshold, else None.
     """
-    prompt = _build_prompt(ticker, exchange, df, indicator_values, news)
+    prompt = _build_prompt(ticker, exchange, df, indicator_values, news, macro_news=macro_news)
     result = _call_llm(prompt)
 
     if not result:
@@ -265,6 +307,7 @@ def analyze_batch(
     candidates: list[dict],
     on_signal=None,
     on_progress=None,
+    macro_news: list[str] | None = None,
 ) -> list[Signal]:
     """Analyze a batch of screener candidates sequentially.
 
@@ -273,6 +316,7 @@ def analyze_batch(
             ticker, exchange, df, indicator_values, news
         on_signal: Optional callback called immediately when a signal is approved.
         on_progress: Optional callback(current, total) called after each candidate.
+        macro_news: Broad market/political headlines shared across all candidates.
 
     Returns list of approved Signal objects.
     """
@@ -280,14 +324,26 @@ def analyze_batch(
     total = len(candidates)
 
     for i, c in enumerate(candidates, 1):
-        logger.info("Analyzing candidate %d/%d: %s", i, total, c["ticker"])
-        signal = analyze_candidate(
-            ticker=c["ticker"],
-            exchange=c["exchange"],
-            df=c["df"],
-            indicator_values=c.get("indicator_values", {}),
-            news=c.get("news", []),
-        )
+        try:
+            ticker = c["ticker"]
+        except KeyError as e:
+            logger.error("Skipping malformed candidate (missing key %s)", e)
+            continue
+        logger.info("Analyzing candidate %d/%d: %s", i, total, ticker)
+        try:
+            signal = analyze_candidate(
+                ticker=ticker,
+                exchange=c["exchange"],
+                df=c["df"],
+                indicator_values=c.get("indicator_values", {}),
+                news=c.get("news", []),
+                macro_news=macro_news,
+            )
+        except (KeyError, TypeError) as e:
+            logger.error("Skipping candidate %s (missing key %s)", ticker, e)
+            if on_progress:
+                on_progress(i, total)
+            continue
         if signal:
             signals.append(signal)
             logger.info(
@@ -309,5 +365,6 @@ def analyze_batch(
 
 def get_daily_token_usage() -> dict:
     """Return today's token usage stats."""
-    _reset_daily_usage_if_needed()
-    return dict(_daily_token_usage)
+    with _token_lock:
+        _reset_daily_usage_if_needed()
+        return dict(_daily_token_usage)
