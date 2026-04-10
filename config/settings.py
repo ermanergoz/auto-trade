@@ -119,6 +119,18 @@ BOLLINGER_PERIOD = 20
 BOLLINGER_STD = 2.0
 SUPPORT_RESISTANCE_PCT = 2.0
 
+# Indicator weights for scoring — higher weight = more influence on score.
+# Default 1.0 = equal weighting. Set to 0.0 to disable an indicator's contribution.
+INDICATOR_WEIGHTS = {
+    "RSI": 1.0,
+    "MACD": 1.0,
+    "MA_CROSSOVER": 1.0,
+    "VOLUME_SPIKE": 1.0,
+    "BOLLINGER": 1.0,
+    "SUPPORT": 1.0,
+    "RESISTANCE": 1.0,
+}
+
 # ---------------------------------------------------------------------------
 # API Keys
 # ---------------------------------------------------------------------------

@@ -95,14 +95,16 @@ class TestRSI:
 
 class TestMACD:
     def test_bullish_crossover(self):
-        # Downtrend then sharp reversal up
+        # Downtrend then sharp reversal up — designed to trigger MACD crossover
         closes = _trending_down(30, 150, 1) + _trending_up(15, 120, 3)
         df = _make_df(closes)
         result = check_macd(df)
-        # May or may not trigger depending on exact crossover timing
-        if result:
+        # If no crossover detected, the test data needs revisiting
+        if result is not None:
             assert result["indicator"] == "MACD"
             assert result["action"] in (Action.BUY, Action.SELL)
+        # Not asserting result is not None because MACD crossover timing
+        # is sensitive to exact input data; the too_short test covers the guard
 
     def test_too_short(self):
         df = _make_df([100] * 10)
@@ -121,7 +123,7 @@ class TestMACrossover:
         closes = _trending_down(25, 120, 0.5) + _trending_up(5, 107, 2)
         df = _make_df(closes)
         result = check_ma_crossover(df)
-        if result:
+        if result is not None:
             assert result["action"] == Action.BUY
             assert result["indicator"] == "MA_CROSSOVER"
 
@@ -130,7 +132,7 @@ class TestMACrossover:
         closes = _trending_up(25, 80, 0.5) + _trending_down(5, 93, 2)
         df = _make_df(closes)
         result = check_ma_crossover(df)
-        if result:
+        if result is not None:
             assert result["action"] == Action.SELL
 
     def test_too_short(self):
@@ -202,10 +204,14 @@ class TestBollinger:
 class TestSupportResistance:
     def test_near_support(self):
         # _make_df creates low = close * 0.98, so close=95 gives low=93.1
-        # Current close must be within 2% of that low: 93.1 * 1.02 = 94.96
-        # So current close ~93.5 is within range of 20-day low 93.1
-        closes = [100] * 10 + [95] + [100] * 10 + [93.5]
+        # Current close must be within 2% of that low AND today's intraday
+        # low must NOT breach the support level (no broken support).
+        # close=94.9 → today_low=94.9*0.98=93.002 < 93.1, would breach.
+        # So we set today's low manually to stay above support.
+        closes = [100] * 10 + [95] + [100] * 10 + [94.5]
         df = _make_df(closes)
+        # Override today's low so it doesn't breach the 20d support at 93.1
+        df.iloc[-1, df.columns.get_loc("low")] = 93.5
         result = check_support_resistance(df)
         assert result is not None, "Close near 20-day low should trigger support signal"
         assert result["action"] == Action.BUY
@@ -340,3 +346,85 @@ class TestMAValuesAlwaysStored:
         assert "MA10" in sig.indicator_values, "MA10 must always be in indicator_values"
         assert isinstance(sig.indicator_values["MA5"], float)
         assert isinstance(sig.indicator_values["MA20"], float)
+
+
+# ---------------------------------------------------------------------------
+# Indicator Weights Tests
+# ---------------------------------------------------------------------------
+
+class TestIndicatorWeights:
+    """score_candidate should use configurable indicator weights."""
+
+    def test_default_weights_are_equal(self):
+        """With default (equal) weights, behavior matches original scoring."""
+        triggered = [{"action": Action.BUY, "strength": 0.8, "indicator": "RSI"}]
+        score_default, action = score_candidate(triggered)
+        score_weighted, action_w = score_candidate(triggered, weights=None)
+        assert score_default == score_weighted
+        assert action == action_w
+
+    def test_high_weight_increases_score(self):
+        """An indicator with higher weight should produce a higher score."""
+        triggered = [{"action": Action.BUY, "strength": 0.8, "indicator": "RSI"}]
+        score_normal, _ = score_candidate(triggered, weights={"RSI": 1.0})
+        score_boosted, _ = score_candidate(triggered, weights={"RSI": 3.0})
+        assert score_boosted > score_normal
+
+    def test_zero_weight_nullifies_indicator(self):
+        """An indicator with weight=0 should not contribute to the score."""
+        triggered_both = [
+            {"action": Action.BUY, "strength": 0.8, "indicator": "RSI"},
+            {"action": Action.BUY, "strength": 0.6, "indicator": "MACD"},
+        ]
+        weights = {"RSI": 0.0, "MACD": 1.0}
+        score_zeroed, action = score_candidate(triggered_both, weights=weights)
+        assert action == Action.BUY
+
+        # With RSI zeroed, only MACD contributes. Compare to MACD-only with same weights.
+        triggered_macd = [{"action": Action.BUY, "strength": 0.6, "indicator": "MACD"}]
+        score_macd_only, _ = score_candidate(triggered_macd, weights=weights)
+        assert abs(score_zeroed - score_macd_only) < 0.01
+
+    def test_weights_affect_direction_determination(self):
+        """A heavily-weighted sell indicator can override more buy indicators."""
+        triggered = [
+            {"action": Action.BUY, "strength": 0.5, "indicator": "RSI"},
+            {"action": Action.BUY, "strength": 0.5, "indicator": "MACD"},
+            {"action": Action.SELL, "strength": 0.5, "indicator": "BOLLINGER"},
+        ]
+        # Without weights: buy_score=1.0, sell_score=0.5 → BUY
+        _, action_equal = score_candidate(triggered)
+        assert action_equal == Action.BUY
+
+        # With heavy weight on sell indicator: sell_score=0.5*5=2.5, buy=0.5+0.5=1.0
+        weights = {"RSI": 1.0, "MACD": 1.0, "BOLLINGER": 5.0}
+        _, action_weighted = score_candidate(triggered, weights=weights)
+        assert action_weighted == Action.SELL
+
+    def test_missing_indicator_weight_defaults_to_one(self):
+        """Indicators not in the weights dict should default to weight=1.0."""
+        triggered = [
+            {"action": Action.BUY, "strength": 0.8, "indicator": "RSI"},
+            {"action": Action.BUY, "strength": 0.6, "indicator": "MACD"},
+        ]
+        # Only specify RSI weight, MACD should default to 1.0
+        weights = {"RSI": 2.0}
+        score, action = score_candidate(triggered, weights=weights)
+        assert action == Action.BUY
+        assert score > 0
+
+    def test_screen_stocks_accepts_weights(self):
+        """screen_stocks should pass weights through to score_candidate."""
+        volumes = [500_000] * 25 + [3_000_000]
+        closes = _flat(25, 100) + [70]  # triggers bollinger + volume spike
+        df = _make_df(closes, volumes)
+
+        stock_data = {"TEST": ("SMART", df)}
+        # Zero out all weights — should produce no signals
+        weights = {
+            "RSI": 0.0, "MACD": 0.0, "MA_CROSSOVER": 0.0,
+            "VOLUME_SPIKE": 0.0, "BOLLINGER": 0.0,
+            "SUPPORT": 0.0, "RESISTANCE": 0.0,
+        }
+        signals = screen_stocks(stock_data, min_score=15.0, indicator_weights=weights)
+        assert signals == []

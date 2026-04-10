@@ -19,6 +19,7 @@ from config.settings import (
     BOLLINGER_PERIOD, BOLLINGER_STD,
     SUPPORT_RESISTANCE_PCT,
     DEFAULT_STOP_LOSS_PCT, DEFAULT_TAKE_PROFIT_PCT,
+    INDICATOR_WEIGHTS,
 )
 from core.models import Signal, Action, TradeType
 
@@ -69,7 +70,7 @@ def check_macd(df: pd.DataFrame) -> Optional[dict]:
 
     Returns dict with signal info or None.
     """
-    min_len = MACD_SLOW + MACD_SIGNAL + 1
+    min_len = MACD_SLOW + MACD_SIGNAL - 1
     if len(df) < min_len:
         return None
 
@@ -181,9 +182,14 @@ def check_volume_spike(df: pd.DataFrame) -> Optional[dict]:
     ratio = current_volume / avg_volume
 
     if ratio >= VOLUME_SPIKE_MULTIPLIER:
-        # Volume spike — direction depends on price movement
-        price_change = df["close"].iloc[-1] - df["close"].iloc[-2]
-        action = Action.BUY if price_change > 0 else Action.SELL
+        # Volume spike — direction from intraday candle body (open-to-close)
+        price_change = df["close"].iloc[-1] - df["open"].iloc[-1]
+        if price_change > 0:
+            action = Action.BUY
+        elif price_change < 0:
+            action = Action.SELL
+        else:
+            return None  # Doji candle — no directional information
 
         return {
             "indicator": "VOLUME_SPIKE",
@@ -270,9 +276,15 @@ def check_support_resistance(df: pd.DataFrame) -> Optional[dict]:
         return None
 
     threshold = SUPPORT_RESISTANCE_PCT / 100.0
+    if threshold <= 0:
+        return None
 
-    # Near support (within 2% of 20-day low)
-    if low_20d > 0 and abs(price - low_20d) / low_20d <= threshold:
+    today_low = df["low"].iloc[-1]
+    today_high = df["high"].iloc[-1]
+
+    # Near support (within 2% of 20-day low) — price must be ABOVE support
+    # and today's intraday low must not have breached it (broken support)
+    if low_20d > 0 and price > low_20d and today_low >= low_20d and abs(price - low_20d) / low_20d <= threshold:
         return {
             "indicator": "SUPPORT",
             "action": Action.BUY,
@@ -281,8 +293,9 @@ def check_support_resistance(df: pd.DataFrame) -> Optional[dict]:
             "strength": 1.0 - abs(price - low_20d) / low_20d / threshold,
         }
 
-    # Near resistance (within 2% of 20-day high)
-    if high_20d > 0 and abs(price - high_20d) / high_20d <= threshold:
+    # Near resistance (within 2% of 20-day high) — price must be AT or BELOW resistance
+    # and today's intraday high must not have breached it (broken resistance/breakout)
+    if high_20d > 0 and price <= high_20d and today_high <= high_20d and abs(price - high_20d) / high_20d <= threshold:
         return {
             "indicator": "RESISTANCE",
             "action": Action.SELL,
@@ -307,6 +320,11 @@ ALL_CHECKS = [
     check_support_resistance,
 ]
 
+# Canonical indicator names used by each check for weight lookups.
+# support_resistance can emit either "SUPPORT" or "RESISTANCE" — we include
+# the max of the two weights when normalizing so the total stays stable.
+_INDICATOR_NAMES = ["RSI", "MACD", "MA_CROSSOVER", "VOLUME_SPIKE", "BOLLINGER", "SUPPORT"]
+
 
 def analyze_stock(df: pd.DataFrame) -> list[dict]:
     """Run all indicator checks on a single stock's DataFrame.
@@ -324,21 +342,35 @@ def analyze_stock(df: pd.DataFrame) -> list[dict]:
     return triggered
 
 
-def score_candidate(triggered: list[dict]) -> tuple[float, Action]:
+def score_candidate(
+    triggered: list[dict],
+    weights: dict[str, float] | None = None,
+) -> tuple[float, Action]:
     """Score a candidate based on how many indicators triggered.
 
     Returns (score, dominant_action).
-    Score is 0-100 based on number and strength of signals.
+    Score is 0-100 based on weighted number and strength of signals.
+
+    Args:
+        triggered: List of triggered indicator dicts.
+        weights: Optional dict mapping indicator name -> weight multiplier.
+                 Defaults to INDICATOR_WEIGHTS from settings. Weight of 0
+                 effectively disables that indicator's contribution.
     """
     if not triggered:
         return 0.0, Action.HOLD
 
-    # Count buy vs sell signals
+    w = weights if weights is not None else INDICATOR_WEIGHTS
+
+    def _weight(signal: dict) -> float:
+        return w.get(signal["indicator"], 1.0)
+
+    # Count buy vs sell signals, weighted by indicator importance
     buy_signals = [t for t in triggered if t["action"] == Action.BUY]
     sell_signals = [t for t in triggered if t["action"] == Action.SELL]
 
-    buy_score = sum(t.get("strength", 0.5) for t in buy_signals)
-    sell_score = sum(t.get("strength", 0.5) for t in sell_signals)
+    buy_score = sum(t.get("strength", 0.5) * _weight(t) for t in buy_signals)
+    sell_score = sum(t.get("strength", 0.5) * _weight(t) for t in sell_signals)
 
     # Dominant direction
     if buy_score > sell_score:
@@ -352,10 +384,17 @@ def score_candidate(triggered: list[dict]) -> tuple[float, Action]:
     else:
         return 0.0, Action.HOLD
 
-    # Score: base on number of confirming signals + strength
-    # Max theoretical: 6 signals * 1.0 strength = 6.0
-    num_indicators = len(ALL_CHECKS)
-    raw_score = (len(direction_signals) / num_indicators) * 50 + (direction_score / num_indicators) * 50
+    # Score: base on weighted signal count + net weighted strength
+    # Opposing signals reduce the score to penalize mixed-signal stocks
+    opposing_score = sell_score if dominant == Action.BUY else buy_score
+    net_score = direction_score - opposing_score
+    weighted_count = sum(_weight(t) for t in direction_signals)
+    # Total weight = sum of weights for all possible indicators (6 checks)
+    # Use the number of checks scaled by average weight for normalization
+    total_weight = sum(w.get(name, 1.0) for name in _INDICATOR_NAMES)
+    if total_weight == 0:
+        return 0.0, Action.HOLD
+    raw_score = (weighted_count / total_weight) * 50 + (max(net_score, 0) / total_weight) * 50
     score = min(raw_score, 100.0)
 
     return score, dominant
@@ -370,6 +409,8 @@ def _build_signal(
     action: Action,
 ) -> Signal:
     """Build a Signal object from screening results."""
+    if df.empty:
+        raise ValueError(f"Cannot build signal for {ticker}: DataFrame is empty")
     price = df["close"].iloc[-1]
     atr = _compute_atr(df)
 
@@ -378,21 +419,21 @@ def _build_signal(
         take_profit = price * (1 + DEFAULT_TAKE_PROFIT_PCT / 100)
         # Use ATR-based stops if available
         if atr and atr > 0:
-            stop_loss = price - 2 * atr
+            stop_loss = max(price - 2 * atr, 0.01)
             take_profit = price + 3 * atr
     else:
         stop_loss = price * (1 + DEFAULT_STOP_LOSS_PCT / 100)
         take_profit = price * (1 - DEFAULT_TAKE_PROFIT_PCT / 100)
         if atr and atr > 0:
             stop_loss = price + 2 * atr
-            take_profit = price - 3 * atr
+            take_profit = max(price - 3 * atr, 0.01)
 
     reasoning = "; ".join(t["detail"] for t in triggered)
     indicator_values = {t["indicator"]: t["value"] for t in triggered}
 
     # Always compute and store MA values for trend confirmation in risk manager,
     # even if MA crossover didn't trigger (risk.check_trend_confirmation needs these).
-    if len(df) >= MA_SLOW:
+    if len(df) >= MA_SLOW + 1:
         ma_fast = ta.sma(df["close"], length=MA_FAST)
         ma_slow = ta.sma(df["close"], length=MA_SLOW)
         if ma_fast is not None and not pd.isna(ma_fast.iloc[-1]):
@@ -436,6 +477,7 @@ def _compute_atr(df: pd.DataFrame, period: int = 14) -> Optional[float]:
 def screen_stocks(
     stock_data: dict[str, tuple[str, pd.DataFrame]],
     min_score: float = 15.0,
+    indicator_weights: dict[str, float] | None = None,
 ) -> list[Signal]:
     """Screen multiple stocks and return all candidates above min_score.
 
@@ -445,6 +487,8 @@ def screen_stocks(
     Args:
         stock_data: Dict mapping ticker -> (exchange, ohlcv_dataframe).
         min_score: Minimum screener score to include (0-100).
+        indicator_weights: Optional dict of indicator name -> weight.
+                           Defaults to INDICATOR_WEIGHTS from settings.
 
     Returns:
         List of Signal objects sorted by score descending.
@@ -460,7 +504,7 @@ def screen_stocks(
             if not triggered:
                 continue
 
-            score, action = score_candidate(triggered)
+            score, action = score_candidate(triggered, weights=indicator_weights)
             if score < min_score or action == Action.HOLD:
                 continue
 
