@@ -40,7 +40,7 @@ Think of it like a 3-person trading desk, automated:
 
 1. **The Screener** — A fast number-cruncher that scans hundreds of stocks every 15 minutes, looking for interesting patterns in prices, volume, and technical indicators. It's like a junior analyst who flags "hey, these 15 stocks look interesting right now."
 
-2. **The AI Analyst** — A local AI model (Qwen 2.5 7B running on Ollama) that takes those 15 candidates and does deep analysis. It looks at price trends, momentum, volume, news headlines, and a strict 6-point checklist. It's the senior analyst who says "of those 15, I'd actually buy these 3."
+2. **The AI Analyst** — A local AI model (Qwen 2.5 7B running on Ollama) that takes those 15 candidates and does deep analysis. It looks at price trends, momentum, volume, news headlines, macro/political context, and a strict 7-point checklist. It's the senior analyst who says "of those 15, I'd actually buy these 3."
 
 3. **The Risk Manager** — A paranoid rule-checker that gates every trade with 12 different safety checks. Position too big? Rejected. Already lost too much today? Rejected. Chasing a stock that already moved 5%? Rejected. Three losses in a row? Circuit breaker pauses everything. It's the compliance officer who makes sure we never blow up.
 
@@ -188,6 +188,7 @@ Position:
   - stop_loss, take_profit, trade_type, sector
   - current_price (updated live)
   - unrealized_pnl → computed: (current_price - entry_price) * quantity
+  - unrealized_pnl_pct → computed: percentage change (guards against zero entry_price)
 ```
 
 ### Trade — "We bought and sold this stock, here's how it went"
@@ -197,7 +198,7 @@ Trade:
   - Everything from Position, plus:
   - exit_price, exit_time
   - pnl → computed: (exit_price - entry_price) * quantity
-  - pnl_pct → computed: percentage gain/loss
+  - pnl_pct → computed: percentage gain/loss (guards against zero entry_price)
   - duration → computed: how long we held it
 ```
 
@@ -244,20 +245,22 @@ OLLAMA_HOST = "http://localhost:11434"  # Where Ollama runs
 
 ### Risk Limits — The Safety Net
 ```python
-MAX_POSITION_SIZE_PCT = 5.0         # Never put >5% of portfolio in one stock
-DAILY_LOSS_LIMIT_PCT = 2.0          # Stop trading if down 2% today
-MAX_OPEN_POSITIONS = 10             # Max 10 stocks at once
+MAX_POSITION_SIZE_PCT = 50.0        # Max 50% of portfolio in one stock (tuned for $500 account)
+DAILY_LOSS_LIMIT_PCT = 10.0         # Stop trading if down 10% today
+MAX_OPEN_POSITIONS = 3              # Max 3 stocks at once
 DEFAULT_STOP_LOSS_PCT = 3.0         # Default: bail if stock drops 3%
 DEFAULT_TAKE_PROFIT_PCT = 6.0       # Default: cash out at 6% profit
-MAX_SECTOR_CONCENTRATION_PCT = 25.0 # Max 25% in one sector (like tech)
-ANTI_MOMENTUM_PCT = 5.0             # Don't buy if already moved 5%
+MAX_SECTOR_CONCENTRATION_PCT = 50.0 # Max 50% in one sector
+ANTI_MOMENTUM_PCT = 8.0             # Don't buy if already moved 8%
 MIN_RISK_REWARD_RATIO = 1.5         # Potential profit must be 1.5x potential loss
 ALLOW_SHORT_SELLING = False         # Block sells for stocks not held (no shorting)
 CIRCUIT_BREAKER_LOSSES = 3          # Pause after 3 consecutive losses
 CIRCUIT_BREAKER_WINDOW_MIN = 60     # Within this many minutes
 ```
 
-The risk manager also includes a **cumulative risk check** that ensures total open risk (all positions' max loss via stop-loss) stays within the daily loss limit. This prevents a scenario where 5 positions each sized at 1% risk = 5% total risk, exceeding the 2% daily limit.
+These values are tuned for a small account ($500). For larger accounts, tighten them back — see [RISK-TUNING.md](RISK-TUNING.md) for a full comparison table and scaling guide.
+
+The risk manager also includes a **cumulative risk check** that ensures total open risk (all positions' max loss via stop-loss) stays within the daily loss limit. This prevents a scenario where 3 positions each sized at 5% risk = 15% total risk, exceeding the 10% daily limit.
 
 A **`validate_settings()`** function validates all configuration at startup and rejects invalid values (e.g., port not 7496/7497, negative ratios, zero positions).
 
@@ -309,16 +312,32 @@ This module fetches prices and news. It has two data sources and caching to avoi
 
 ### News
 
-**`get_news(ticker, market, max_results)`** — Fetches recent news headlines for AI context. Tries Tavily API first; if Tavily fails or is rate-limited, falls back to yfinance (`yf.Ticker().news`). This ensures the AI always has news context even when external APIs hit limits.
+**`get_news(ticker, market, max_results)`** — Fetches recent news headlines for AI context. Tries yfinance first (free, no rate limits); if yfinance returns nothing, falls back to Tavily API. This conserves Tavily quota for macro/political headlines.
+
+**`get_macro_news(max_results)`** — Fetches broad market political/macro headlines via Tavily (no yfinance equivalent). Called once per scan cycle and shared across all candidates.
+
+### Realtime Subscriptions
+
+**`subscribe_realtime(ib, contract, callback)`** — Subscribes to live price updates for a contract. The callback is stored per IB instance and properly removed on unsubscribe to prevent callback leaks across reconnections.
+
+**`unsubscribe_realtime(ib, contract)`** — Cancels a realtime subscription and removes the stored callback.
+
+**`clear_realtime_subscriptions()`** — Resets all tracked subscriptions. Called by the disconnect handler after IBKR drops connections, so stale callbacks from the old connection don't accumulate.
+
+**Snapshot quote cleanup** — After reading a snapshot quote via `get_realtime_quote()`, `cancelMktData` is called to free the IBKR market data slot. Without this, each snapshot permanently consumed one of the limited IBKR data lines.
 
 ### Caching
 
 Every data fetch is cached with a time-to-live (TTL):
 - Historical bars: cached for 5 minutes (they don't change that fast)
 - Quotes: cached for 30 seconds
-- News: cached for 15 minutes
+- News (stock-specific + macro): cached for 1 hour on success, 60 seconds on failure (so retries happen sooner when APIs are down)
 
 This prevents us from hammering the APIs with identical requests within the same scan cycle.
+
+### Error Handling
+
+Tavily API failures are logged at WARNING level (not debug) so they surface in the logs when news fetching degrades.
 
 ### Column Normalization
 
@@ -334,7 +353,8 @@ Before we can screen stocks, we need a list of stocks TO screen. That's what the
 
 ```
 Step 1: Check cache — did we already build today's universe?
-   YES → use cached list (it doesn't change intraday)
+   YES → re-apply filters to cached list (in case filter rules changed)
+         and use it (the raw stock list doesn't change intraday)
    NO  → continue to Step 2
 
 Step 2: Ask IBKR to scan the market using 10 different scanner types:
@@ -356,6 +376,8 @@ Step 3: Combine all results and remove duplicates.
 Step 3.5: Enrich with contract details.
           The IBKR scanner doesn't return sector or company name data.
           So we call reqContractDetails for each stock to fill in those fields.
+          A 0.05-second delay is inserted between each request to avoid
+          IBKR pacing violations.
           This is what makes the financial sector filter actually work.
 
 Step 3.6: 3-tier sector fallback for stocks still missing sector data:
@@ -372,6 +394,7 @@ Step 3.6: 3-tier sector fallback for stocks still missing sector data:
 
 Step 4: Filter out:
    - Financial sector stocks (banks, insurance, etc.)
+   - Defense/military stocks (weapons, ammunition, combat systems, etc.)
    - Non-equity ETFs (bond, leveraged, inverse, commodity, volatility)
    - Stocks with volume below 100K shares/day
    - Stocks with market cap below $50M
@@ -394,9 +417,12 @@ Step 5: Cache the result as a JSON file for the rest of the day
 3. **Ollama LLM** — asks the local AI model to classify by sector and country
 4. **Exclude** — unclassifiable stocks are dropped (can't safely filter financials)
 
-**News fallback** — what if Tavily is rate-limited or unavailable?
-1. **Tavily API** — primary source, best quality
-2. **yfinance** — `yf.Ticker().news` returns recent headlines for free
+**Stock news priority** — yfinance-first to conserve Tavily quota:
+1. **yfinance** — `yf.Ticker().news` returns recent headlines for free (no rate limits)
+2. **Tavily API** — fallback when yfinance returns nothing
+
+**Macro/political news** — Tavily only (no free alternative for broad market headlines):
+1. **Tavily API** — fetched once per scan cycle, shared across all candidates
 
 This means the system ALWAYS has stocks to trade and context for AI analysis, even if external APIs are flaky.
 
@@ -459,6 +485,8 @@ Why does this matter? Big volume means big interest. If a stock suddenly trades 
 
 This check doesn't generate BUY or SELL by itself — it confirms other signals.
 
+MACD requires a minimum data length of `MACD_SLOW + MACD_SIGNAL - 1` bars to produce valid output. Shorter DataFrames are skipped.
+
 #### 5. Bollinger Bands — `check_bollinger(df)`
 
 Bollinger Bands create an envelope around the price:
@@ -475,16 +503,18 @@ Statistically, price stays within the bands ~95% of the time.
 
 Looks at the stock's 20-day high and low.
 
-- **Price within 2% of the 20-day low** → Near support → BUY (might bounce)
+- **Price within 2% of the 20-day low** → Near support → BUY (might bounce), but only if today's intraday low hasn't breached the support level (a broken support is bearish, not a buying opportunity)
 - **Price within 2% of the 20-day high** → Near resistance → SELL (might reverse)
 
 ### Scoring
 
 Each stock gets a score from 0 to 100 based on:
 
-1. **How many indicators triggered** — More signals = higher score. If RSI, MACD, and volume ALL say "buy", that's more convincing than just RSI alone.
-2. **Signal strength** — Each indicator returns a strength between 0 and 1. A deeply oversold RSI of 15 scores higher than a barely-oversold RSI of 29.
-3. **Consensus** — Are all signals pointing the same direction? 4 buy signals = strong. 2 buy + 2 sell = confused (lower score).
+1. **Weighted indicator count** — More signals = higher score, but each indicator's contribution is multiplied by its weight from `INDICATOR_WEIGHTS`. If RSI (weight 2.0), MACD (weight 1.0), and volume (weight 1.0) ALL say "buy", RSI contributes twice as much to the score.
+2. **Weighted signal strength** — Each indicator returns a strength between 0 and 1, multiplied by its weight. A deeply oversold RSI of 15 with weight 2.0 scores much higher than a barely-oversold RSI of 29 with weight 0.5.
+3. **Consensus** — Are all signals pointing the same direction? Opposing signals actively reduce the score: `net_score = direction_signals - opposing_signals`. This prevents conflicting indicators from producing a falsely confident signal.
+
+Indicator weights are configurable in `config/settings.py` via `INDICATOR_WEIGHTS` (dict mapping indicator name → float weight). Default is 1.0 for all indicators (equal weighting). Set a weight to 0.0 to disable an indicator. The backtester also accepts custom weights via `BacktestConfig.indicator_weights` for A/B testing different weight profiles.
 
 Stocks scoring above the minimum threshold (default: 15.0) become candidates and get passed to the AI analyst.
 
@@ -538,6 +568,10 @@ News Headlines:
   - "Apple announces record services revenue"
   - "iPhone 17 leaks suggest major camera upgrade"
 
+Macro/Political Headlines:
+  - "Fed holds rates steady amid inflation concerns"
+  - "US-China trade talks resume after tariff escalation"
+
 Decision Checklist — evaluate each:
   1. TREND: Is the stock in a clear trend?
   2. MOMENTUM: Is momentum confirming?
@@ -545,6 +579,7 @@ Decision Checklist — evaluate each:
   4. RISK/REWARD: Is reward >= 1.5x risk?
   5. NEWS: Any catalysts or red flags?
   6. ANTI-CHASE: Has it already moved >5%?
+  7. MACRO/POLITICAL: Do macro conditions create risk or opportunity?
 ```
 
 #### Step 2: Call the AI
@@ -571,6 +606,9 @@ The system checks:
 - Are prices provided (for buy/sell)?
 - Is `stop_loss` below `entry_price` (for buys)?
 - Is `take_profit` above `entry_price` (for buys)?
+- Is `trade_type` one of "day" or "swing"?
+
+The Ollama JSON response is parsed inside a try/except that catches both `KeyError` (missing fields) and `JSONDecodeError` (malformed output), logging specific error messages for each case.
 
 Invalid responses are rejected and retried (up to 3 times with exponential backoff).
 
@@ -582,7 +620,7 @@ Only signals with confidence >= 65 pass through. The AI is encouraged to be hone
 
 These are embedded in the prompt to prevent common trading mistakes:
 
-1. **Require 4/6 checklist items favorable** — Don't buy just because RSI is oversold. Need multiple confirmations.
+1. **Require 5/7 checklist items favorable** — Don't buy just because RSI is oversold. Need multiple confirmations.
 2. **Anti-chase** — If a stock already moved 5%+ in the direction of the signal, reject it. You missed the move.
 3. **Conservative confidence** — Only give 65+ when trend + momentum + volume align. Be honest about uncertainty.
 4. **No FOMO** — It's okay to say HOLD. Missing a trade is better than taking a bad one.
@@ -627,9 +665,9 @@ Why: Bad days happen. This prevents emotional revenge-trading. If you're down 2%
 #### 4. Max Open Positions — `check_max_positions()`
 "Do we have too many open positions?"
 
-Rule: Maximum 10 open positions at once.
+Rule: Maximum 10 open positions at once. Exit signals (SELL on existing long, BUY on existing short) are always allowed through — they reduce positions, not add new ones.
 
-Why: More positions = more to monitor = more risk of something slipping through. Also keeps the portfolio manageable.
+Why: More positions = more to monitor = more risk of something slipping through. Also keeps the portfolio manageable. The exit exemption prevents a situation where a stop-loss or take-profit signal is blocked when the portfolio is at max capacity.
 
 #### 5. Stop-Loss Validation — `check_stop_loss()`
 "Does this signal have a valid stop-loss?"
@@ -641,28 +679,28 @@ Why: A trade without a stop-loss has unlimited downside. Never acceptable.
 #### 6. Sector Concentration — `check_sector_concentration()`
 "Are we too heavy in one sector?"
 
-Rule: No more than 25% of portfolio in a single sector (like Technology or Healthcare).
+Rule: No more than 25% of portfolio in a single sector (like Technology or Healthcare). The check includes the proposed new position's estimated value (worst-case max position size) to prevent the first position in a sector from bypassing the limit.
 
 Why: If all your money is in tech stocks and tech crashes, everything drops together. Diversification protects you.
 
 #### 7. No Duplicates — `check_no_duplicate()`
-"Do we already have a position in this stock?"
+"Do we already have a position in the same direction?"
 
-Rule: Can't buy AAPL if we already own AAPL.
+Rule: Can't open a new long in AAPL if we already hold AAPL long. But a SELL signal on an existing long position is allowed (it's closing the position, not opening a new one).
 
-Why: Prevents doubling down on a losing position (a common emotional mistake).
+Why: Prevents doubling down on a losing position (a common emotional mistake) while still allowing position exits through the normal signal pipeline.
 
 #### 8. Excluded Sector — `check_excluded_sector()`
 "Is this stock in a sector we don't trade?"
 
-Rule: No financial sector stocks (banks, insurance, lending).
+Rule: No financial sector stocks (banks, insurance, lending) and no defense/military stocks (weapons, ammunition, combat systems). Also checks the `EXCLUDED_TICKERS` list — tickers that are explicitly blocked are rejected here too, not just in the universe builder.
 
-Why: Safety net. Even if IBKR's sector data is wrong and a bank slips through the universe filter, this catches it at the risk level.
+Why: Safety net. Even if IBKR's sector data is wrong and a bank or defense contractor slips through the universe filter, this catches it at the risk level. The explicit ticker check provides a third layer of defense for known problematic symbols.
 
 #### 9. Anti-Momentum — `check_anti_momentum()`
 "Has this stock already moved too much?"
 
-Rule: Reject if the current price has already moved more than 5% from the signal's entry price.
+Rule: Reject if the current price has already moved more than 5% from the signal's entry price. Also rejects signals with zero or invalid prices — these indicate data problems and must not bypass risk checks.
 
 Why: Chasing. If the screener flagged TSLA at $200 but by the time we get to risk check it's at $212, we missed the move. Buying now means we're chasing and likely buying at a local top.
 
@@ -676,14 +714,14 @@ Why: Trading against the trend is fighting the market. This check ensures we're 
 #### 11. Risk/Reward Ratio — `check_risk_reward()`
 "Is the potential profit worth the potential loss?"
 
-Rule: (take_profit - entry) / (entry - stop_loss) must be >= 1.5
+Rule: (take_profit - entry) / (entry - stop_loss) must be >= 1.5. Signals with zero or invalid prices are rejected rather than skipping the check.
 
 Why: If you risk $1 to make $1, you need to be right >50% of the time to profit. At 1.5:1, you only need to be right ~40% of the time. The math works in your favor.
 
 #### 12. Circuit Breaker — `check_circuit_breaker()`
 "Have we been losing too many trades in a row?"
 
-Rule: If the last 3 consecutive closed trades (within a 60-minute window) are all losses, pause all new trading and send a Telegram alert. A win or breakeven trade resets the streak. Both the loss count and time window are configurable via `CIRCUIT_BREAKER_LOSSES` and `CIRCUIT_BREAKER_WINDOW_MIN`.
+Rule: If the last 3 consecutive closed trades (within a 60-minute window) are all losses, pause all new trading and send a Telegram alert. A win or breakeven trade resets the streak. Both the loss count and time window are configurable via `CIRCUIT_BREAKER_LOSSES` and `CIRCUIT_BREAKER_WINDOW_MIN`. Trades missing an `exit_time` attribute are safely skipped to prevent crashes when the trade list contains incomplete records.
 
 Why: The daily loss limit is reactive — it triggers after you've already bled money. The circuit breaker is proactive: 3 rapid losses in a row usually signals something systemic (market regime change, stale data feed, broken model). Better to pause and review than keep firing. Think of it as a smoke detector vs. a fire extinguisher.
 
@@ -699,6 +737,22 @@ Use the SMALLER of the two.
 ```
 
 Method 2 is the clever one. It says: "If I'm wrong and my stop-loss gets hit, I want to lose at most 1% of my portfolio." So if the stop-loss is very tight (close to entry), you can buy more shares. If it's wide, you buy fewer. This is professional-grade position sizing.
+
+#### Volatility Regime Scaling
+
+When market volatility is provided (via `volatility` parameter to `evaluate()` or `calculate_position_size()`), position sizes are scaled inversely to realized volatility:
+
+```
+vol_scale = min(VOLATILITY_BASELINE / current_volatility, 1.0)
+adjusted_quantity = base_quantity * vol_scale
+```
+
+Key properties:
+- **High volatility** (e.g., 40% annualized) → positions shrink (scale = 0.5 with 20% baseline)
+- **Low volatility** (e.g., 10% annualized) → positions stay at base size (capped at 1.0, no leverage)
+- **No volatility data** (`None`) → original sizing (backward compatible)
+
+The baseline annualized volatility is configurable via `VOLATILITY_BASELINE` (default: 20%). `calculate_realized_volatility(closes, window=20)` computes this from a close-price series using 20-day rolling log returns, annualized by √252.
 
 ### The RiskResult
 
@@ -737,17 +791,17 @@ This is **atomic** — all three orders are placed as a unit. You never end up w
 
 **`place_order(ib, signal, quantity, dry_run)`** — The main function. Creates a bracket order from the signal's entry, stop-loss, and take-profit prices. All legs use `tif='GTC'` (Good Till Cancelled) so orders placed outside market hours persist and execute at market open. The parent and take-profit orders are placed with `transmit=False`, and only the stop-loss (last order) has `transmit=True` — this ensures all three legs transmit atomically to IBKR, preventing the parent from filling before child orders are registered. In dry-run mode, it just logs what WOULD happen.
 
-**`close_position_market(ib, position, dry_run)`** — Immediately close a position with a market order. Used when day-trade positions need to be closed before market close.
+**`close_position_market(ib, position, dry_run)`** — Immediately close a position with a market order. Derives the closing action from the position's quantity sign (SELL for long, BUY for short). Used when day-trade positions need to be closed before market close.
 
-**`close_all_day_trades(ib, positions, dry_run)`** — Called 15 minutes before market close. Finds all positions marked as DAY trades and closes them with market orders. After placing all close orders, waits briefly and logs a warning for any that haven't filled yet — critical because unfilled orders mean positions stay open overnight.
+**`close_all_day_trades(ib, positions, dry_run)`** — Called 15 minutes before market close. Finds all positions marked as DAY trades and closes them with market orders. After placing all close orders, uses `monitor_orders()` with a 30-second timeout to wait for fills, and logs at ERROR level for any that haven't filled yet — critical because unfilled orders mean positions stay open overnight.
 
-**`handle_fill(signal, quantity, fill_price)`** — Records a filled order in the SQLite database.
+**`handle_fill(signal, quantity, fill_price)`** — Records a filled order in the SQLite database. Returns `None` if the fill quantity is zero or negative, preventing phantom positions from being recorded.
 
-**`setup_fill_handler(ib, signal, quantity, on_fill)`** — Attaches an async callback to handle entry order fills. When the parent order status changes to "Filled", it records the position in the database and calls the optional `on_fill` callback. Also logs warnings for partial fills (when filled_qty < requested quantity). The scheduler attaches this handler BEFORE placing the order to avoid a race condition where fast fills fire before the handler is registered.
+**`setup_fill_handler(ib, signal, quantity, on_fill)`** — Attaches an async callback to handle entry order fills. Only processes parent entry orders (`parentId == 0`) matching the signal's ticker — child orders (take-profit, stop-loss) are handled by `setup_exit_handler` instead. Uses a `fired` flag to ensure each handler instance fires at most once, preventing duplicate position recording when multiple signals for the same ticker are active. When the parent order status changes to "Filled", it records the position in the database, calls the optional `on_fill` callback, and deregisters itself from `ib.orderStatusEvent` to prevent handler accumulation across scan cycles. The post-fill logic (handle_fill, remove_pending_order, callback, unsubscribe) is wrapped in try/finally to ensure the event handler is always cleaned up even if a callback raises an exception. Also logs warnings for partial fills (when filled_qty < requested quantity). The scheduler attaches this handler BEFORE placing the order to avoid a race condition where fast fills fire before the handler is registered.
 
-**`setup_exit_handler(ib, signal, on_exit)`** — Attaches a callback to handle exit order fills (take-profit and stop-loss). When a child order fills, it closes the position in the database via `portfolio.close_position()`, which also writes to the CSV trade journal. Calls the optional `on_exit` callback for Telegram notifications.
+**`setup_exit_handler(ib, signal, on_exit)`** — Attaches a callback to handle exit order fills (take-profit and stop-loss). When a child order fills, it closes the position in the database via `portfolio.close_position()`, which also writes to the CSV trade journal. Logs a warning if the exit fill cannot be matched to a database position (e.g., position already closed or missing). Warns when `parent_order_id` is missing on the exit trade, as this risks cross-bracket interference (matching the wrong bracket's exit to a position). Calls the optional `on_exit` callback for Telegram notifications. Uses try/finally to ensure the event handler is always deregistered even if callback errors occur.
 
-**`setup_disconnect_handler(ib)`** — Attaches a callback for connection drops. Important because IBKR connections are notoriously unstable. Uses a re-entrancy guard (`_reconnecting` flag) to prevent cascading reconnect loops where a reconnect triggers another disconnect event. Reads the shared `shutting_down` flag from `core.state` to skip reconnection during intentional shutdown (avoiding the circular import that would result from importing directly from `scheduler.py`).
+**`setup_disconnect_handler(ib)`** — Attaches a callback for connection drops. Important because IBKR connections are notoriously unstable. Uses a re-entrancy guard (`_reconnecting` flag) to prevent cascading reconnect loops where a reconnect triggers another disconnect event. Calls `clear_realtime_subscriptions()` to reset subscription tracking after IBKR drops connections, preventing stale callbacks from the old connection from accumulating. Reads the shared `shutting_down` flag from `core.state` to skip reconnection during intentional shutdown (avoiding the circular import that would result from importing directly from `scheduler.py`).
 
 ### Stale Order Re-evaluation
 
@@ -755,7 +809,7 @@ This is **atomic** — all three orders are placed as a unit. You never end up w
 
 **`cancel_bracket_order(ib, trade)`** — Cancels a parent entry order. IBKR automatically cancels the attached child orders (take-profit and stop-loss) when the parent is cancelled. Also removes the `pending_orders` DB record for the cancelled order. Follows the same try/except pattern as `cancel_order()`.
 
-The scheduler's `check_stale_orders()` orchestrates the full flow: for each stale order, it fetches fresh historical data, re-runs the screener, and cancels orders where the stock no longer passes technical screening. This runs at the beginning of every scan cycle to free up capital and position slots before new candidates are evaluated.
+The scheduler's `check_stale_orders()` orchestrates the full flow: for each stale order, it fetches fresh historical data, re-runs the screener, and cancels orders where the stock no longer passes technical screening. This runs at the beginning of every scan cycle to free up capital and position slots before new candidates are evaluated. In dry-run mode, the cancelled-order counter only increments when orders are actually cancelled, not when they merely fail screening.
 
 ### Dry-Run Mode
 
@@ -812,11 +866,16 @@ def run_scan_cycle(ib, markets, mode="paper", force=False):
         for stock in universe[market]:
             df = get_historical_data(ib, contract, "60 D", "1 day")
             stock_data[stock.ticker] = (stock.exchange, df)
+        sector_lookup = {s.ticker: s.sector for s in universe[market]}
 
-        # 6. Run the screener
+        # 6. Run the screener (then inject sector from universe into candidates)
         candidates = screen_stocks(stock_data)
+        for sig in candidates:
+            sig.indicator_values["sector"] = sector_lookup.get(sig.ticker, "")
 
         # 7. AI analysis on candidates (progress tracked via on_progress callback)
+        #    The _on_ai_progress callback binds `market` via default argument
+        #    to avoid loop variable capture bugs
         ai_signals = analyze_batch(candidates, on_progress=update_ai_progress)
 
         # 8. Risk check and execute
@@ -888,7 +947,7 @@ pending_orders (tracks unfilled order placement times):
 
 ### Key Operations
 
-**`add_position(position)`** — When a trade fills, save it to the positions table.
+**`add_position(position)`** — When a trade fills, save it to the positions table. Checks for an existing position with the same ticker before inserting to prevent duplicate positions (e.g., from a race condition where two fills arrive back-to-back for the same stock).
 
 **`close_position(ticker, exit_price)`** — When closing a trade:
 1. Read the position from the positions table
@@ -898,7 +957,9 @@ pending_orders (tracks unfilled order placement times):
 5. Log the trade to the daily CSV journal (`core/logger.log_trade_to_csv`)
 6. All in one transaction (either everything succeeds or nothing does)
 
-**`get_daily_pnl()`** — Calculate today's realized P&L by summing all trades closed today.
+**`get_daily_pnl(day, db_path, unrealized_pnl)`** — Calculate today's total P&L (realized + unrealized). Realized P&L sums all trades closed on the given day. The optional `unrealized_pnl` parameter (from IBKR account summary) adds mark-to-market losses on open positions, ensuring the daily loss limit catches unrealized drawdowns too.
+
+**`get_trades(start_date, end_date, ticker, db_path)`** — Return completed trades, optionally filtered by date range and/or ticker. Used by the exit handler to notify the correct trade (filtered by ticker) and by the circuit breaker (filtered by date).
 
 **`record_signal(signal)`** — Save every signal for audit trail. Even rejected ones. Useful for backtesting analysis: "How often did we reject signals that would have been profitable?"
 
@@ -1014,6 +1075,10 @@ The only things that differ:
 - **Slippage**: Adds 0.1% slippage to simulate real-world execution
 - **Commission**: Adds $1 per trade
 
+Additional backtest-only features:
+- **Indicator weights**: Override per-indicator scoring weights (e.g., weight RSI higher than Bollinger) via `BacktestConfig.indicator_weights`
+- **Volatility scaling**: Enable `use_volatility_scaling=True` to scale position sizes inversely to realized market volatility — the same `calculate_realized_volatility()` function used in live trading
+
 ### How It Works
 
 ```
@@ -1091,6 +1156,20 @@ You can run multiple backtests with different settings and compare them side by 
 ```bash
 python main.py --mode backtest --tickers AAPL MSFT GOOGL --capital 100000
 ```
+
+### AI Value-Add Comparison
+
+The `compare_ai_value_add(screener_metrics, ai_metrics)` function answers the key question: "Is the AI analyst actually helping?" It takes metrics from two backtest runs (screener-only vs screener+AI) and computes:
+
+| Alpha Metric | What It Measures |
+|-------------|-----------------|
+| **Return Alpha** | Return difference: AI minus screener-only |
+| **Sharpe Alpha** | Risk-adjusted return difference |
+| **P&L Alpha** | Absolute dollar profit difference |
+| **AI Filter Rate** | % of screener trades the AI filtered out (rejected as hold/low-confidence) |
+| **AI Adds Value** | Boolean flag: True if AI improved returns |
+
+Run two backtests — one with `use_ai=False` (default) and one with `use_ai=True` — then compare. Negative return alpha means the AI is destroying value by filtering out good trades or adding noise.
 
 ---
 
@@ -1177,7 +1256,7 @@ Every module has its own test file. Tests use **synthetic data** — hand-built 
 | `conftest.py` | Shared fixtures: `make_signal()`, `make_position()` factories |
 | `test_screener.py` | Each indicator triggers correctly on crafted price data |
 | `test_risk.py` | Each safety check accepts/rejects correctly, circuit breaker streak logic |
-| `test_analyst.py` | Prompt building, response parsing, validation |
+| `test_analyst.py` | Prompt building, response parsing, validation (including `trade_type` field) |
 | `test_data.py` | Data fetching, caching, column normalization |
 | `test_connection.py` | Contract creation, connection handling |
 | `test_portfolio.py` | DB operations, position lifecycle |
@@ -1267,7 +1346,7 @@ pytest tests/test_risk.py::test_daily_loss_limit -v
 
 **The problem**: IBKR's sector data isn't always reliable. Sometimes a bank stock would have sector = "N/A" or a wrong sector, passing through the universe filter.
 
-**The solution**: **Double filtering**. The universe builder filters by sector at build time. Then the risk manager has its OWN `check_excluded_sector()` that catches any stragglers. Belt AND suspenders. Both use the same `FINANCIAL_KEYWORDS` list from `config/settings.py` to stay in sync. Also added an explicit exclusion list of ~40 specific tickers known to be problematic.
+**The solution**: **Double filtering**. The universe builder filters by sector at build time. Then the risk manager has its OWN `check_excluded_sector()` that catches any stragglers. Belt AND suspenders. Both use the same `FINANCIAL_KEYWORDS` and `DEFENSE_KEYWORDS` lists from `config/settings.py` to stay in sync. Also added an explicit exclusion list of ~40 specific tickers known to be problematic.
 
 ---
 
