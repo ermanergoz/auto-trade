@@ -239,8 +239,6 @@ def run_scan_cycle(
 
             dry_run = mode in ("dry-run", "backtest")
 
-            # Attach fill handlers BEFORE placing order to avoid race
-            # where a fast fill fires before handler is attached.
             def _on_fill(sig, filled_qty, fill_price):
                 notify_trade(sig, filled_qty)
                 logger.info(
@@ -255,15 +253,37 @@ def run_scan_cycle(
                 if trades_list:
                     notify_trade_closed(trades_list[0])
 
-            setup_fill_handler(ib, signal, result.position_size, on_fill=_on_fill)
-            setup_exit_handler(ib, signal, on_exit=_on_exit)
-
             trades = place_order(ib, signal, result.position_size, dry_run=dry_run)
 
             if trades:
-                summary["orders_placed"] += 1
-                notify_trade(signal, result.position_size, action_type="SUBMITTED")
-                open_positions = get_open_positions()
+                # Give IBKR time to accept or reject the order before
+                # checking status — rejections (e.g. insufficient funds)
+                # arrive asynchronously within ~500ms.
+                ib.sleep(0.5)
+                parent_status = trades[0].orderStatus.status
+                if parent_status in ("Inactive", "Cancelled"):
+                    # Extract rejection reason from trade log if available
+                    reason = ""
+                    for log_entry in reversed(trades[0].log):
+                        if log_entry.message and "Order rejected" in log_entry.message:
+                            reason = log_entry.message
+                            break
+                    logger.warning(
+                        "Order for %s was rejected by IBKR (status=%s): %s",
+                        signal.ticker, parent_status, reason or "unknown reason",
+                    )
+                    notify_error(
+                        f"Order rejected by IBKR: {signal.ticker} "
+                        f"{result.position_size} shares @ ${signal.entry_price:.2f}\n"
+                        f"Reason: {reason or 'unknown'}"
+                    )
+                else:
+                    setup_fill_handler(ib, signal, result.position_size, on_fill=_on_fill)
+                    setup_exit_handler(ib, signal, on_exit=_on_exit)
+                    summary["orders_placed"] += 1
+                    notify_trade(signal, result.position_size, action_type="SUBMITTED")
+
+            open_positions = get_open_positions()
 
         analyze_batch(ai_input, on_signal=_on_signal, on_progress=_on_ai_progress)
 

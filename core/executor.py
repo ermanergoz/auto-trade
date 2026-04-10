@@ -1,6 +1,7 @@
 """IBKR order execution — bracket orders, monitoring, fill handling."""
 
 import logging
+import threading
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -59,16 +60,19 @@ def place_order(
 
     parent_order, tp_order, sl_order = bracket
 
-    # GTC ensures orders survive overnight and fill at market open.
-    # transmit=False on parent and TP so all three transmit atomically
-    # when the last order (SL) is placed with transmit=True.
+    # Day trades use DAY TIF so IBKR auto-expires them at session close,
+    # preventing unattended overnight exposure. Swing trades use GTC to
+    # survive overnight and fill at next market open.
+    tif = "DAY" if signal.trade_type == TradeType.DAY else "GTC"
     for o in bracket:
-        o.tif = "GTC"
+        o.tif = tif
     parent_order.transmit = False
     tp_order.transmit = False
     sl_order.transmit = True
 
-    # Place all three orders (only the last one triggers transmission)
+    # Place all three orders atomically (only the last triggers transmission).
+    # If any order fails after the parent is placed, cancel already-placed
+    # orders to avoid orphaned entries on IBKR.
     trades = []
     try:
         parent_trade = ib.placeOrder(contract, parent_order)
@@ -80,6 +84,22 @@ def place_order(
         sl_trade = ib.placeOrder(contract, sl_order)
         trades.append(sl_trade)
 
+        # Poll for permId AFTER all three orders are placed so the bracket
+        # is fully submitted before we block. This avoids a window where
+        # the parent exists on IBKR without its TP/SL children.
+        for _ in range(6):
+            ib.sleep(0.5)
+            if parent_order.permId:
+                break
+        if parent_order.permId:
+            save_pending_order(parent_order.permId, signal.ticker)
+        else:
+            logger.warning(
+                "permId not assigned for %s order after 3s — "
+                "stale detection will fall back to trade.log",
+                signal.ticker,
+            )
+
         logger.info(
             "Placed %s bracket order for %s: %d shares @ $%.2f "
             "(SL: $%.2f, TP: $%.2f) [OrderIDs: %s, %s, %s]",
@@ -88,21 +108,19 @@ def place_order(
             parent_order.orderId, tp_order.orderId, sl_order.orderId,
         )
 
-        # Persist placement time for stale order detection
-        ib.sleep(0.5)  # Allow permId assignment
-        if parent_order.permId:
-            save_pending_order(parent_order.permId, signal.ticker)
-        else:
-            logger.warning(
-                "permId not assigned for %s order after 0.5s — "
-                "stale detection will fall back to trade.log",
-                signal.ticker,
-            )
-
         return trades
 
     except Exception as e:
         logger.error("Failed to place bracket order for %s: %s", signal.ticker, e)
+        # Cancel any already-placed orders to avoid orphans
+        for t in trades:
+            try:
+                ib.cancelOrder(t.order)
+                logger.info("Cancelled orphaned order %s for %s", t.order.orderId, signal.ticker)
+            except Exception as cancel_err:
+                logger.error("Failed to cancel orphaned order: %s", cancel_err)
+        if parent_order.permId:
+            remove_pending_order(parent_order.permId)
         return None
 
 
@@ -139,10 +157,20 @@ def place_market_order(
 
 
 def monitor_orders(ib: IB, trades: list[IBTrade], timeout: float = 30.0) -> list[dict]:
-    """Check status of placed orders. Returns list of status dicts."""
+    """Poll placed orders until all are filled or timeout expires.
+
+    Returns list of status dicts with final observed state.
+    """
+    import time
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        ib.sleep(0.5)
+        if all(t.orderStatus.status == "Filled" for t in trades):
+            break
+
     statuses = []
     for trade in trades:
-        ib.sleep(0.1)  # Allow event processing
         statuses.append({
             "orderId": trade.order.orderId,
             "status": trade.orderStatus.status,
@@ -187,7 +215,7 @@ def get_stale_orders(ib: IB, stale_minutes: int = 1440) -> list[dict]:
         if order.permId:
             db_time = get_pending_order_time(order.permId)
             if db_time:
-                submitted_at = db_time.replace(tzinfo=timezone.utc)
+                submitted_at = db_time if db_time.tzinfo else db_time.replace(tzinfo=timezone.utc)
                 logger.debug("Order %s (%s): using DB timestamp %s", order.permId, ticker, submitted_at)
         # Fallback to trade log (only accurate within same session)
         if submitted_at is None:
@@ -233,10 +261,10 @@ def close_position_market(
     dry_run: bool = False,
 ) -> Optional[IBTrade]:
     """Close an open position with a market order."""
-    action = "SELL"  # Assuming we're closing a long position
+    action = "BUY" if position.quantity < 0 else "SELL"
     return place_market_order(
         ib, position.ticker, position.exchange,
-        action, position.quantity, dry_run,
+        action, abs(position.quantity), dry_run,
     )
 
 
@@ -260,17 +288,18 @@ def close_all_day_trades(
         if trade:
             trades.append(trade)
 
-    # Verify fills with timeout
+    # Verify fills with extended timeout — market orders near close
+    # may take longer than expected under adverse conditions
     if trades and not dry_run:
-        ib.sleep(3)  # Give time for fills to arrive
+        statuses = monitor_orders(ib, trades, timeout=30.0)
         unfilled = [
-            t.contract.symbol for t in trades
-            if t.orderStatus.status != "Filled"
+            s["orderId"] for s in statuses
+            if s["status"] != "Filled"
         ]
         if unfilled:
-            logger.warning(
-                "Day trade close orders NOT confirmed filled: %s — "
-                "positions may remain open overnight",
+            logger.error(
+                "CRITICAL: Day trade close orders NOT filled after 30s: %s — "
+                "positions may remain open overnight! Manual intervention needed.",
                 unfilled,
             )
 
@@ -282,17 +311,21 @@ def handle_fill(
     quantity: int,
     fill_price: float,
     db_path=None,
-) -> Position:
+) -> Optional[Position]:
     """Record a filled order in the portfolio database.
 
-    Called when a parent order fills.
+    Called when a parent order fills. Returns None if quantity is invalid.
     """
+    if quantity <= 0:
+        logger.warning("Ignoring fill with invalid quantity %d for %s", quantity, signal.ticker)
+        return None
+
     position = Position(
         ticker=signal.ticker,
         exchange=signal.exchange,
         quantity=quantity,
         entry_price=fill_price,
-        entry_time=datetime.now(),
+        entry_time=datetime.now(timezone.utc),
         stop_loss=signal.stop_loss,
         take_profit=signal.take_profit,
         trade_type=signal.trade_type,
@@ -305,33 +338,56 @@ def handle_fill(
     return position
 
 
-def setup_fill_handler(ib: IB, signal: Signal, quantity: int, on_fill=None) -> None:
+def setup_fill_handler(ib: IB, signal: Signal, quantity: int, on_fill=None, parent_order=None) -> None:
     """Attach a callback to handle entry order fills asynchronously.
 
     Args:
         on_fill: Optional callback(signal, filled_qty, fill_price) called on fill.
+        parent_order: Optional parent order object; when set, matches by permId
+                      instead of ticker to prevent double-recording.
     """
 
+    # Use threading.Event for atomic check-and-set to prevent double-fill
+    # recording when rapid consecutive fills fire from ib_insync's event thread
+    _fired = threading.Event()
+    # Capture permId at registration time for precise matching
+    _parent_perm_id = getattr(parent_order, "permId", 0) if parent_order else 0
+
     def on_order_status(trade: IBTrade):
+        if _fired.is_set():
+            return
         if trade.orderStatus.status == "Filled":
+            # Match by permId when available (precise), fall back to ticker
+            if _parent_perm_id:
+                if trade.order.permId != _parent_perm_id:
+                    return
+            else:
+                if trade.contract.symbol != signal.ticker:
+                    return
             fill_price = trade.orderStatus.avgFillPrice
             filled_qty = int(trade.orderStatus.filled)
-            if trade.order.action in ("BUY", "SELL") and trade.order.orderType != "STP":
-                if filled_qty < quantity:
-                    logger.warning(
-                        "Partial fill for %s: %d/%d shares @ $%.2f",
-                        signal.ticker, filled_qty, quantity, fill_price,
-                    )
-                handle_fill(signal, filled_qty, fill_price)
-                if trade.order.permId:
-                    remove_pending_order(trade.order.permId)
-                if on_fill:
-                    on_fill(signal, filled_qty, fill_price)
+            if trade.order.action in ("BUY", "SELL") and getattr(trade.order, "parentId", 0) == 0:
+                if _fired.is_set():
+                    return
+                _fired.set()
+                try:
+                    if filled_qty < quantity:
+                        logger.warning(
+                            "Partial fill for %s: %d/%d shares @ $%.2f",
+                            signal.ticker, filled_qty, quantity, fill_price,
+                        )
+                    handle_fill(signal, filled_qty, fill_price)
+                    if trade.order.permId:
+                        remove_pending_order(trade.order.permId)
+                    if on_fill:
+                        on_fill(signal, filled_qty, fill_price)
+                finally:
+                    ib.orderStatusEvent -= on_order_status
 
     ib.orderStatusEvent += on_order_status
 
 
-def setup_exit_handler(ib: IB, signal: Signal, on_exit=None) -> None:
+def setup_exit_handler(ib: IB, signal: Signal, on_exit=None, parent_order=None) -> None:
     """Attach a callback to handle exit order fills (TP/SL) asynchronously.
 
     When a take-profit or stop-loss child order fills, close the position
@@ -339,9 +395,16 @@ def setup_exit_handler(ib: IB, signal: Signal, on_exit=None) -> None:
 
     Args:
         on_exit: Optional callback(ticker, exit_price, exit_type) called on exit fill.
+        parent_order: Optional parent order object; when set, only matches child
+                      orders whose parentId equals this order's orderId.
     """
 
+    _fired = threading.Event()
+    _parent_order_id = getattr(parent_order, "orderId", 0) if parent_order else 0
+
     def on_order_status(trade: IBTrade):
+        if _fired.is_set():
+            return
         if trade.orderStatus.status != "Filled":
             return
         if trade.contract.symbol != signal.ticker:
@@ -357,7 +420,21 @@ def setup_exit_handler(ib: IB, signal: Signal, on_exit=None) -> None:
         if not is_child:
             return  # This is the parent entry order, handled by setup_fill_handler
 
+        # Always match children by parent order ID to prevent cross-bracket
+        # interference when a ticker is re-entered in the same session
+        if _parent_order_id and trade.order.parentId != _parent_order_id:
+            return
+        if not _parent_order_id:
+            logger.warning(
+                "Exit handler for %s has no parent_order_id — "
+                "matching by ticker only (risk of cross-bracket fire)",
+                signal.ticker,
+            )
+
         exit_type = "stop-loss" if is_stop else "take-profit"
+        if _fired.is_set():
+            return
+        _fired.set()
 
         logger.info(
             "Exit fill: %s %s @ $%.2f (%s)",
@@ -365,15 +442,24 @@ def setup_exit_handler(ib: IB, signal: Signal, on_exit=None) -> None:
         )
 
         # Close position in database
-        trade_record = db_close_position(signal.ticker, fill_price)
-        if trade_record:
-            logger.info(
-                "Position closed: %s P&L: $%.2f (%.1f%%)",
-                signal.ticker, trade_record.pnl, trade_record.pnl_pct,
-            )
-
-        if on_exit:
-            on_exit(signal.ticker, fill_price, exit_type)
+        try:
+            trade_record = db_close_position(signal.ticker, fill_price)
+            if trade_record:
+                logger.info(
+                    "Position closed: %s P&L: $%.2f (%.1f%%)",
+                    signal.ticker, trade_record.pnl, trade_record.pnl_pct,
+                )
+                if on_exit:
+                    on_exit(signal.ticker, fill_price, exit_type)
+            else:
+                # No matching DB position — do NOT call on_exit, as it would
+                # fetch a stale trade and send an incorrect notification
+                logger.warning(
+                    "Exit fill for %s @ $%.2f (%s) could not be matched to a DB position",
+                    signal.ticker, fill_price, exit_type,
+                )
+        finally:
+            ib.orderStatusEvent -= on_order_status
 
     ib.orderStatusEvent += on_order_status
 
@@ -382,16 +468,20 @@ def setup_disconnect_handler(ib: IB) -> None:
     """Set up handler for connection drops.
 
     Skips reconnect during shutdown and uses a guard to prevent
-    re-entrant reconnect loops.
+    re-entrant reconnect loops. Clears realtime subscription tracking
+    since IBKR drops all subscriptions on disconnect.
     """
-    _reconnecting = False
+    _reconnecting = threading.Event()
 
     def on_disconnect():
-        nonlocal _reconnecting
         from core import state as _state
-        if _state.shutting_down or _reconnecting:
+        from core.data import clear_realtime_subscriptions
+        if _state.shutting_down or _reconnecting.is_set():
             return
-        _reconnecting = True
+        _reconnecting.set()
+        # IBKR drops all subscriptions on disconnect — clear tracking
+        # so they can be re-established after reconnect
+        clear_realtime_subscriptions(ib)
         logger.warning("IBKR connection lost! Attempting reconnect...")
         try:
             ensure_connected(ib)
@@ -399,6 +489,6 @@ def setup_disconnect_handler(ib: IB) -> None:
         except ConnectionError:
             logger.error("Failed to reconnect to IBKR")
         finally:
-            _reconnecting = False
+            _reconnecting.clear()
 
     ib.disconnectedEvent += on_disconnect

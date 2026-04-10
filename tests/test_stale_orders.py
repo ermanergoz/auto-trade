@@ -84,10 +84,9 @@ class TestGetStaleOrders:
         now = datetime.now(timezone.utc)
 
         # DB says order was placed 25 hours ago
-        with patch("core.portfolio.DB_PATH", db_path):
-            save_pending_order(perm_id, "ILAG", db_path)
+        save_pending_order(perm_id, "ILAG", db_path)
 
-        # Backdate the DB record
+        # Backdate the DB record to simulate an order placed 25h ago
         import sqlite3
         conn = sqlite3.connect(str(db_path))
         old_time = (now - timedelta(hours=25)).isoformat()
@@ -96,14 +95,20 @@ class TestGetStaleOrders:
         conn.commit()
         conn.close()
 
+        # Verify DB lookup actually returns the backdated time
+        db_time = get_pending_order_time(perm_id, db_path)
+        assert db_time is not None
+        assert (now - db_time).total_seconds() >= 25 * 3600
+
         # trade.log says order appeared 1 minute ago (reconnection)
         log_time = now - timedelta(minutes=1)
         mock_trade = _make_mock_trade(perm_id, "ILAG", log_time=log_time)
         ib = MagicMock()
         ib.openTrades.return_value = [mock_trade]
 
-        with patch("core.executor.get_pending_order_time") as mock_get_time:
-            mock_get_time.return_value = datetime.fromisoformat(old_time)
+        # Patch to use our test DB path for the actual lookup
+        with patch("core.executor.get_pending_order_time",
+                    side_effect=lambda pid: get_pending_order_time(pid, db_path)):
             stale = get_stale_orders(ib, stale_minutes=1440)
 
         assert len(stale) == 1
@@ -189,7 +194,21 @@ class TestCancelCleansDB:
             cancel_bracket_order(ib, mock_trade)
 
         mock_remove.assert_called_once_with(333)
-        ib.cancelOrder.assert_called_once()
+        ib.cancelOrder.assert_called_once_with(mock_trade.order)
+
+    def test_cancel_failure_does_not_remove_db_record(self):
+        """If ib.cancelOrder raises, remove_pending_order must NOT be called."""
+        from core.executor import cancel_bracket_order
+
+        mock_trade = _make_mock_trade(444, "FAIL")
+        ib = MagicMock()
+        ib.cancelOrder.side_effect = Exception("IBKR error")
+
+        with patch("core.executor.remove_pending_order") as mock_remove:
+            result = cancel_bracket_order(ib, mock_trade)
+
+        assert result is False
+        mock_remove.assert_not_called()
 
     def test_generic_cancel_removes_pending_order(self):
         """cancel_order (generic) must also clean up pending_orders."""
@@ -218,23 +237,33 @@ class TestFillCleansDB:
         sig.take_profit = 110.0
         sig.trade_type = MagicMock(value="day")
 
-        # Use a list to capture the registered callback
-        callbacks = []
+        # Use a real list-backed event to capture the callback
+        registered_callbacks = []
+
+        class FakeEvent:
+            def __iadd__(self, cb):
+                registered_callbacks.append(cb)
+                return self
+            def __isub__(self, cb):
+                return self
+
         ib = MagicMock()
-        ib.orderStatusEvent.__iadd__ = lambda self, cb: callbacks.append(cb) or self
+        ib.orderStatusEvent = FakeEvent()
 
         setup_fill_handler(ib, sig, quantity=100)
-        assert len(callbacks) == 1
-        on_order_status = callbacks[0]
+        assert len(registered_callbacks) == 1
+        on_order_status = registered_callbacks[0]
 
-        # Simulate a fill event
+        # Simulate a fill event for a parent entry order
         filled_trade = MagicMock()
         filled_trade.orderStatus.status = "Filled"
         filled_trade.orderStatus.avgFillPrice = 100.0
         filled_trade.orderStatus.filled = 100
         filled_trade.order.action = "BUY"
         filled_trade.order.orderType = "LMT"
+        filled_trade.order.parentId = 0  # parent entry order
         filled_trade.order.permId = 555
+        filled_trade.contract.symbol = "FILLED"  # must match signal ticker
 
         with patch("core.executor.handle_fill"), \
              patch("core.executor.remove_pending_order") as mock_remove:
