@@ -1,8 +1,9 @@
 """Market data service — IBKR primary, YFinance fallback, Tavily news."""
 
 import logging
+import threading
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Callable, Optional
 
 import pandas as pd
@@ -14,29 +15,37 @@ from config.settings import TAVILY_API_KEY
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Simple TTL cache
+# Simple TTL cache (thread-safe)
 # ---------------------------------------------------------------------------
 
 _cache: dict[str, tuple[float, object]] = {}
+_cache_lock = threading.Lock()
 _DEFAULT_TTL = 300  # 5 minutes
 
 
 def _cache_get(key: str) -> Optional[object]:
-    if key in _cache:
-        expiry, value = _cache[key]
-        if time.time() < expiry:
-            return value
-        del _cache[key]
-    return None
+    with _cache_lock:
+        if key in _cache:
+            expiry, value = _cache[key]
+            if time.time() < expiry:
+                # Return a copy for DataFrames to prevent caller mutation
+                # from corrupting cached data
+                if isinstance(value, pd.DataFrame):
+                    return value.copy()
+                return value
+            del _cache[key]
+        return None
 
 
 def _cache_set(key: str, value: object, ttl: int = _DEFAULT_TTL) -> None:
-    _cache[key] = (time.time() + ttl, value)
+    with _cache_lock:
+        _cache[key] = (time.time() + ttl, value)
 
 
 def clear_cache() -> None:
     """Clear all cached data."""
-    _cache.clear()
+    with _cache_lock:
+        _cache.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -64,7 +73,7 @@ def get_historical_data(
     Returns:
         DataFrame with columns: date, open, high, low, close, volume.
     """
-    cache_key = f"hist:{contract.symbol}:{contract.exchange}:{duration}:{bar_size}"
+    cache_key = f"hist:{contract.symbol}:{contract.exchange}:{duration}:{bar_size}:{what_to_show}"
     cached = _cache_get(cache_key)
     if cached is not None:
         return cached
@@ -161,6 +170,9 @@ def get_realtime_quote(ib: IB, contract: Contract) -> Optional[dict]:
     ib.sleep(2)  # allow time for snapshot data
 
     ticker = ib.ticker(contract)
+    # Cancel snapshot to free IBKR slot — required before requesting again
+    ib.cancelMktData(contract)
+
     if ticker is None:
         logger.warning("No quote data for %s", contract.symbol)
         return None
@@ -170,11 +182,22 @@ def get_realtime_quote(ib: IB, contract: Contract) -> Optional[dict]:
         "bid": ticker.bid if ticker.bid == ticker.bid else None,
         "ask": ticker.ask if ticker.ask == ticker.ask else None,
         "volume": ticker.volume if ticker.volume == ticker.volume else None,
-        "timestamp": datetime.now(),
+        "timestamp": datetime.now(timezone.utc),
     }
+
+    # Don't cache or return quotes where all price fields are None
+    # (halted/illiquid stocks) — callers checking `if quote:` would get True
+    if result["last"] is None and result["bid"] is None and result["ask"] is None:
+        logger.warning("All price fields are None for %s — returning None", contract.symbol)
+        return None
 
     _cache_set(cache_key, result, ttl=30)  # short TTL for quotes
     return result
+
+
+_realtime_subscriptions: dict[int, set[str]] = {}
+_realtime_callbacks: dict[int, Callable] = {}
+_realtime_lock = threading.Lock()
 
 
 def subscribe_realtime(
@@ -184,21 +207,65 @@ def subscribe_realtime(
 ) -> None:
     """Subscribe to streaming real-time data via IBKR.
 
-    The callback receives ticker updates.
+    The callback receives ticker updates. Guards against duplicate
+    subscriptions per IB instance; resubscribes after reconnect.
     """
-    ib.reqMktData(contract)
-    ib.pendingTickersEvent += callback
+    with _realtime_lock:
+        ib_id = id(ib)
+        if ib_id not in _realtime_subscriptions:
+            _realtime_subscriptions[ib_id] = set()
+        key = f"{contract.symbol}:{contract.exchange}"
+        if key in _realtime_subscriptions[ib_id]:
+            logger.debug("Already subscribed to %s, skipping duplicate", key)
+            return
+        _realtime_subscriptions[ib_id].add(key)
+        ib.reqMktData(contract)
+        # Register callback once per IB instance. On reconnect,
+        # clear_realtime_subscriptions removes the old callback before
+        # new subscriptions re-add it, preventing duplicate registrations.
+        if len(_realtime_subscriptions[ib_id]) == 1:
+            ib.pendingTickersEvent += callback
+            _realtime_callbacks[ib_id] = callback
     logger.info("Subscribed to real-time data for %s", contract.symbol)
 
 
 def unsubscribe_realtime(ib: IB, contract: Contract) -> None:
     """Cancel streaming data for a contract."""
+    with _realtime_lock:
+        key = f"{contract.symbol}:{contract.exchange}"
+        ib_id = id(ib)
+        if ib_id in _realtime_subscriptions:
+            _realtime_subscriptions[ib_id].discard(key)
+            # Remove event callback when last subscription is removed
+            if not _realtime_subscriptions[ib_id] and ib_id in _realtime_callbacks:
+                ib.pendingTickersEvent -= _realtime_callbacks.pop(ib_id)
     ib.cancelMktData(contract)
 
 
+def clear_realtime_subscriptions(ib: IB) -> None:
+    """Clear all subscription tracking for an IB instance.
+
+    Must be called after reconnection — IBKR drops all subscriptions
+    on disconnect, so the tracking set must be reset to allow
+    re-subscribing. Also removes the event callback to prevent
+    duplicate registrations on re-subscribe.
+    """
+    with _realtime_lock:
+        ib_id = id(ib)
+        if ib_id in _realtime_subscriptions:
+            _realtime_subscriptions[ib_id].clear()
+        if ib_id in _realtime_callbacks:
+            cb = _realtime_callbacks.pop(ib_id)
+            ib.pendingTickersEvent -= cb
+
+
 # ---------------------------------------------------------------------------
-# News (Tavily API + yfinance fallback)
+# News (yfinance primary, Tavily fallback)
 # ---------------------------------------------------------------------------
+
+_NEWS_TTL = 3600  # 1 hour — reduces Tavily API usage
+_NEWS_FAILURE_TTL = 60  # Retry sooner when news fetch fails
+
 
 def _get_news_yfinance(ticker: str, max_results: int = 5) -> list[str]:
     """Fetch recent news headlines via yfinance (free, no API key)."""
@@ -207,7 +274,13 @@ def _get_news_yfinance(ticker: str, max_results: int = 5) -> list[str]:
         news = yf.Ticker(ticker).news
         if not news:
             return []
-        headlines = [item.get("title", "") for item in news[:max_results] if item.get("title")]
+        headlines = []
+        for item in news[:max_results]:
+            # yfinance >=1.2: title nested under item["content"]["title"]
+            content = item.get("content", {})
+            title = content.get("title") or item.get("title", "")
+            if title:
+                headlines.append(title)
         return headlines
     except Exception as e:
         logger.debug("yfinance news fetch failed for %s: %s", ticker, e)
@@ -217,7 +290,8 @@ def _get_news_yfinance(ticker: str, max_results: int = 5) -> list[str]:
 def get_news(ticker: str, market: str = "US", max_results: int = 5) -> list[str]:
     """Fetch recent news headlines for a ticker.
 
-    Tries Tavily API first, falls back to yfinance if Tavily fails or is not configured.
+    Tries yfinance first (free, no rate limits), falls back to Tavily
+    if yfinance returns nothing. This conserves Tavily API quota.
     Returns a list of headline strings.
     """
     cache_key = f"news:{ticker}:{market}"
@@ -225,7 +299,13 @@ def get_news(ticker: str, market: str = "US", max_results: int = 5) -> list[str]
     if cached is not None:
         return cached
 
-    # Try Tavily first
+    # Try yfinance first (free, no rate limits)
+    headlines = _get_news_yfinance(ticker, max_results)
+    if headlines:
+        _cache_set(cache_key, headlines, ttl=_NEWS_TTL)
+        return headlines
+
+    # Fallback to Tavily when yfinance returns nothing
     if TAVILY_API_KEY:
         try:
             from tavily import TavilyClient
@@ -233,15 +313,42 @@ def get_news(ticker: str, market: str = "US", max_results: int = 5) -> list[str]
 
             query = f"{ticker} stock"
             response = client.search(query, max_results=max_results, search_depth="basic")
-            headlines = [r.get("title", "") for r in response.get("results", [])]
+            headlines = [r.get("title", "") for r in response.get("results", []) if r.get("title")]
 
-            _cache_set(cache_key, headlines, ttl=900)
+            _cache_set(cache_key, headlines, ttl=_NEWS_TTL)
             return headlines
 
         except Exception as e:
-            logger.debug("Tavily failed for %s, falling back to yfinance: %s", ticker, e)
+            logger.warning("Tavily configured but failed for %s: %s", ticker, e)
 
-    # Fallback to yfinance
-    headlines = _get_news_yfinance(ticker, max_results)
-    _cache_set(cache_key, headlines, ttl=900)
+    _cache_set(cache_key, headlines, ttl=_NEWS_FAILURE_TTL)
+    return headlines
+
+
+def get_macro_news(max_results: int = 5) -> list[str]:
+    """Fetch broad market/political/macro headlines (not stock-specific).
+
+    Called once per scan cycle and shared across all candidates.
+    Uses Tavily with a macro-focused query that includes social media coverage.
+    """
+    cache_key = "macro_news"
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
+
+    if TAVILY_API_KEY:
+        try:
+            from tavily import TavilyClient
+            client = TavilyClient(api_key=TAVILY_API_KEY)
+            query = "stock market political regulatory macroeconomic trade policy news twitter"
+            response = client.search(query, max_results=max_results, search_depth="basic")
+            headlines = [r.get("title", "") for r in response.get("results", []) if r.get("title")]
+            _cache_set(cache_key, headlines, ttl=_NEWS_TTL)
+            logger.info("Tavily macro/X news: fetched %d headlines", len(headlines))
+            return headlines
+        except Exception as e:
+            logger.warning("Tavily macro/X news fetch failed: %s", e)
+
+    headlines: list[str] = []
+    _cache_set(cache_key, headlines, ttl=_NEWS_FAILURE_TTL)
     return headlines
