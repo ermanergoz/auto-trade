@@ -20,6 +20,8 @@ from config.settings import (
     MIN_RISK_REWARD_RATIO,
     ALLOW_SHORT_SELLING,
     FINANCIAL_KEYWORDS,
+    DEFENSE_KEYWORDS,
+    EXCLUDED_TICKERS,
     CIRCUIT_BREAKER_LOSSES,
     CIRCUIT_BREAKER_WINDOW_MIN,
 )
@@ -178,21 +180,50 @@ def check_short_selling(
 
 
 def check_excluded_sector(signal: Signal) -> tuple[bool, str]:
-    """Block financial sector stocks as a safety net.
+    """Block financial/defense sector stocks and explicitly excluded tickers.
 
     The universe builder already filters these, but this catches any
-    that slip through (e.g., missing sector data from IBKR).
+    that slip through (e.g., missing sector data from IBKR, backtest
+    injection, or stale cache).
     """
-    sector = getattr(signal, "indicator_values", {}).get("sector", "")
-    if not sector:
-        return True, ""
+    # Check explicitly excluded tickers first
+    if signal.ticker in EXCLUDED_TICKERS:
+        return False, (
+            f"Excluded ticker: '{signal.ticker}' is in the exclusion list"
+        )
 
-    sector_lower = sector.lower()
-    for kw in FINANCIAL_KEYWORDS:
-        if kw in sector_lower:
-            return False, (
-                f"Excluded sector: '{sector}' (financial/lending companies are blocked)"
-            )
+    indicator_values = getattr(signal, "indicator_values", None) or {}
+    sector = indicator_values.get("sector", "")
+
+    if sector:
+        sector_lower = sector.lower()
+        for kw in FINANCIAL_KEYWORDS:
+            if kw in sector_lower:
+                return False, (
+                    f"Excluded sector: '{sector}' (financial/lending companies are blocked)"
+                )
+        for kw in DEFENSE_KEYWORDS:
+            if kw in sector_lower:
+                return False, (
+                    f"Excluded sector: '{sector}' (defense/military stocks are blocked)"
+                )
+
+    # Also check company name for defense/financial keywords — catches
+    # companies with generic sector labels like "Industrials"
+    company_name = indicator_values.get("company_name", "")
+    if company_name:
+        name_lower = company_name.lower()
+        for kw in DEFENSE_KEYWORDS:
+            if kw in name_lower:
+                return False, (
+                    f"Excluded by name: '{company_name}' (defense/military keywords detected)"
+                )
+        for kw in FINANCIAL_KEYWORDS:
+            if kw in name_lower:
+                return False, (
+                    f"Excluded by name: '{company_name}' (financial keywords detected)"
+                )
+
     return True, ""
 
 

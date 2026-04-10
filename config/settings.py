@@ -40,6 +40,11 @@ FINANCIAL_KEYWORDS = [
     "savings & loans", "closed-end funds", "sovereign",
     "microfinance", "payday", "debt", "usury",
 ]
+DEFENSE_KEYWORDS = [
+    "defense", "defence", "military", "weapon", "arms", "ammunition",
+    "aerospace & defense", "munition", "missile", "combat",
+    "ordnance", "warship", "armament",
+]
 EXCLUDED_COUNTRIES = {"Israel"}
 
 # Specific tickers to always exclude from universe
