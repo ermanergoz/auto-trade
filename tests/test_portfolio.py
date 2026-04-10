@@ -64,9 +64,10 @@ class TestPositions:
 
     def test_close_position(self, db_path):
         add_position(_make_position(ticker="AAPL"), db_path)
+        exit_dt = datetime(2024, 1, 15, 15, 0)
         trade = close_position(
             "AAPL", exit_price=160.0,
-            exit_time=datetime(2024, 1, 15, 15, 0),
+            exit_time=exit_dt,
             db_path=db_path,
         )
 
@@ -74,15 +75,21 @@ class TestPositions:
         assert trade.ticker == "AAPL"
         assert trade.exit_price == 160.0
         assert trade.pnl == 100.0  # (160 - 150) * 10
+        assert trade.exit_time == exit_dt
 
         # Position should be removed
         positions = get_open_positions(db_path)
         assert len(positions) == 0
 
-        # Trade should be recorded
+        # Trade should be recorded and datetime round-trips correctly
         trades = get_trades(db_path=db_path)
         assert len(trades) == 1
         assert trades[0].pnl == 100.0
+        assert isinstance(trades[0].exit_time, datetime)
+        assert isinstance(trades[0].entry_time, datetime)
+        # DB round-trip should preserve timezone (UTC)
+        assert trades[0].exit_time.tzinfo is not None
+        assert trades[0].entry_time.tzinfo is not None
 
     def test_close_nonexistent(self, db_path):
         result = close_position("NOPE", 100.0, db_path=db_path)
@@ -164,12 +171,27 @@ class TestReconcilePositions:
         pos = _make_position(ticker="AAPL")
         add_position(pos, db_path)
 
-        ibkr_positions = [{"ticker": "AAPL", "quantity": 100}]
+        ibkr_positions = [{"ticker": "AAPL", "quantity": pos.quantity}]
         report = reconcile_positions(ibkr_positions, db_path)
 
         assert report["in_sync"] is True
         assert report["orphaned_db"] == []
         assert report["orphaned_ibkr"] == []
+        assert report["qty_mismatches"] == {}
+
+    def test_quantity_mismatch(self, db_path):
+        from core.portfolio import reconcile_positions
+
+        pos = _make_position(ticker="AAPL")  # quantity=10
+        add_position(pos, db_path)
+
+        ibkr_positions = [{"ticker": "AAPL", "quantity": 100}]
+        report = reconcile_positions(ibkr_positions, db_path)
+
+        assert report["in_sync"] is False
+        assert "AAPL" in report["qty_mismatches"]
+        assert report["qty_mismatches"]["AAPL"]["db"] == 10
+        assert report["qty_mismatches"]["AAPL"]["ibkr"] == 100
 
     def test_orphaned_in_db(self, db_path):
         from core.portfolio import reconcile_positions

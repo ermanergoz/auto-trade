@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Optional
 
@@ -35,7 +35,7 @@ class Signal:
     take_profit: float
     reasoning: str
     source: str  # "screener" or "ai"
-    timestamp: datetime = field(default_factory=datetime.now)
+    timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     exchange: str = ""
     trade_type: TradeType = TradeType.DAY
     indicator_values: dict = field(default_factory=dict)
@@ -67,6 +67,8 @@ class Position:
     def unrealized_pnl_pct(self) -> Optional[float]:
         if self.current_price is None:
             return None
+        if self.entry_price == 0:
+            return 0.0
         return ((self.current_price - self.entry_price) / self.entry_price) * 100
 
 
@@ -92,7 +94,13 @@ class Trade:
 
     @property
     def pnl_pct(self) -> float:
-        return ((self.exit_price - self.entry_price) / self.entry_price) * 100
+        if self.entry_price == 0:
+            return 0.0
+        pct = ((self.exit_price - self.entry_price) / self.entry_price) * 100
+        # For shorts (negative quantity), the return is inverted
+        if self.quantity < 0:
+            pct = -pct
+        return pct
 
     @property
     def duration(self) -> float:

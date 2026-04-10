@@ -75,18 +75,20 @@ OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
 # ---------------------------------------------------------------------------
 # Risk Management
 # ---------------------------------------------------------------------------
-MAX_POSITION_SIZE_PCT = 5.0
-DAILY_LOSS_LIMIT_PCT = 2.0
-MAX_OPEN_POSITIONS = 10
+MAX_POSITION_SIZE_PCT = 50.0
+DAILY_LOSS_LIMIT_PCT = 10.0
+MAX_OPEN_POSITIONS = 3
 DEFAULT_STOP_LOSS_PCT = 3.0
 DEFAULT_TAKE_PROFIT_PCT = 6.0
-MAX_SECTOR_CONCENTRATION_PCT = 25.0
+MAX_SECTOR_CONCENTRATION_PCT = 50.0
 
 # Discipline rules
-ANTI_MOMENTUM_PCT = 5.0         # Reject if price moved >5% from signal entry
+ANTI_MOMENTUM_PCT = 8.0         # Reject if price moved >8% from signal entry
 TREND_CONFIRMATION = True       # Require MA5 > MA10 > MA20 alignment for buys
 MIN_RISK_REWARD_RATIO = 1.5     # Minimum reward/risk ratio
+RISK_PER_TRADE_PCT = 5.0        # Risk per trade as % of portfolio (used in sizing + cumulative risk)
 ALLOW_SHORT_SELLING = False     # Block sell signals for stocks not currently held
+VOLATILITY_BASELINE = 0.20      # Baseline annualized volatility (20%) for position scaling
 
 # Circuit breaker — pause trading after consecutive losses
 CIRCUIT_BREAKER_LOSSES = 3      # Number of consecutive losses to trip
@@ -150,16 +152,16 @@ TIMEZONE = "Europe/Istanbul"
 
 
 def is_paper_mode() -> bool:
-    """Check if connected to paper trading (port 7497) vs live (port 7496)."""
-    return IBKR_PORT == 7497
+    """Check if connected to paper trading (port 7497/4002) vs live (port 7496/4001)."""
+    return IBKR_PORT in (7497, 4002)
 
 
 def validate_settings() -> list[str]:
     """Validate configuration values at startup. Returns list of errors (empty = OK)."""
     errors = []
 
-    if IBKR_PORT not in (7496, 7497):
-        errors.append(f"IBKR_PORT must be 7496 (live) or 7497 (paper), got {IBKR_PORT}")
+    if IBKR_PORT not in (7496, 7497, 4001, 4002):
+        errors.append(f"IBKR_PORT must be 7496/4001 (live) or 7497/4002 (paper), got {IBKR_PORT}")
 
     if MAX_POSITION_SIZE_PCT <= 0 or MAX_POSITION_SIZE_PCT > 100:
         errors.append(f"MAX_POSITION_SIZE_PCT must be 0-100, got {MAX_POSITION_SIZE_PCT}")
@@ -175,5 +177,38 @@ def validate_settings() -> list[str]:
 
     if SCAN_INTERVAL_MINUTES < 1:
         errors.append(f"SCAN_INTERVAL_MINUTES must be >= 1, got {SCAN_INTERVAL_MINUTES}")
+
+    if DEFAULT_STOP_LOSS_PCT <= 0:
+        errors.append(f"DEFAULT_STOP_LOSS_PCT must be positive, got {DEFAULT_STOP_LOSS_PCT}")
+
+    if not (0 < AI_CONFIDENCE_THRESHOLD <= 100):
+        errors.append(f"AI_CONFIDENCE_THRESHOLD must be 1-100, got {AI_CONFIDENCE_THRESHOLD}")
+
+    if BOLLINGER_STD <= 0:
+        errors.append(f"BOLLINGER_STD must be positive, got {BOLLINGER_STD}")
+
+    if SUPPORT_RESISTANCE_PCT <= 0:
+        errors.append(f"SUPPORT_RESISTANCE_PCT must be positive, got {SUPPORT_RESISTANCE_PCT}")
+
+    if RISK_PER_TRADE_PCT <= 0 or RISK_PER_TRADE_PCT > 10:
+        errors.append(f"RISK_PER_TRADE_PCT must be 0-10, got {RISK_PER_TRADE_PCT}")
+
+    if STALE_ORDER_MINUTES > 0 and STALE_ORDER_MINUTES < SCAN_INTERVAL_MINUTES:
+        errors.append(
+            f"STALE_ORDER_MINUTES ({STALE_ORDER_MINUTES}) should be >= "
+            f"SCAN_INTERVAL_MINUTES ({SCAN_INTERVAL_MINUTES})"
+        )
+
+    if MAX_SECTOR_CONCENTRATION_PCT <= 0 or MAX_SECTOR_CONCENTRATION_PCT > 100:
+        errors.append(f"MAX_SECTOR_CONCENTRATION_PCT must be 0-100, got {MAX_SECTOR_CONCENTRATION_PCT}")
+
+    if DEFAULT_TAKE_PROFIT_PCT <= 0:
+        errors.append(f"DEFAULT_TAKE_PROFIT_PCT must be positive, got {DEFAULT_TAKE_PROFIT_PCT}")
+
+    if CIRCUIT_BREAKER_LOSSES < 0:
+        errors.append(f"CIRCUIT_BREAKER_LOSSES must be non-negative, got {CIRCUIT_BREAKER_LOSSES}")
+
+    if CIRCUIT_BREAKER_WINDOW_MIN <= 0:
+        errors.append(f"CIRCUIT_BREAKER_WINDOW_MIN must be positive, got {CIRCUIT_BREAKER_WINDOW_MIN}")
 
     return errors

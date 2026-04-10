@@ -36,6 +36,8 @@ def _db_connection(db_path: Path = DB_PATH):
 def init_db(db_path: Path = DB_PATH) -> None:
     """Create all tables if they don't exist."""
     with _db_connection(db_path) as conn:
+        # executescript() issues an implicit COMMIT which resets
+        # connection-level PRAGMAs like foreign_keys=ON. Re-enable after.
         conn.executescript("""
             CREATE TABLE IF NOT EXISTS positions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -104,6 +106,8 @@ def init_db(db_path: Path = DB_PATH) -> None:
             CREATE INDEX IF NOT EXISTS idx_trades_exit_time ON trades(exit_time);
             CREATE INDEX IF NOT EXISTS idx_signals_timestamp ON signals(timestamp);
         """)
+        # Re-enable FK enforcement after executescript's implicit COMMIT
+        conn.execute("PRAGMA foreign_keys=ON")
     logger.info("Database initialized at %s", db_path)
 
 
@@ -112,8 +116,22 @@ def init_db(db_path: Path = DB_PATH) -> None:
 # ---------------------------------------------------------------------------
 
 def add_position(position: Position, db_path: Path = DB_PATH) -> int:
-    """Insert a new open position. Returns the row ID."""
+    """Insert a new open position. Returns the row ID.
+
+    Rejects duplicates for the same ticker to prevent phantom positions
+    from partial fills or double-attached handlers.
+    """
     with _db_connection(db_path) as conn:
+        existing = conn.execute(
+            "SELECT id FROM positions WHERE ticker = ?", (position.ticker,)
+        ).fetchone()
+        if existing:
+            logger.warning(
+                "Duplicate position for %s (existing id=%d) — skipping insert",
+                position.ticker, existing["id"],
+            )
+            return existing["id"]
+
         cursor = conn.execute(
             """INSERT INTO positions
                (ticker, exchange, quantity, entry_price, entry_time,
@@ -139,11 +157,11 @@ def close_position(
     db_path: Path = DB_PATH,
 ) -> Optional[Trade]:
     """Close an open position and record it as a trade. Returns the Trade."""
-    exit_time = exit_time or datetime.now()
+    exit_time = exit_time or datetime.now(timezone.utc)
 
     with _db_connection(db_path) as conn:
         row = conn.execute(
-            "SELECT * FROM positions WHERE ticker = ? LIMIT 1",
+            "SELECT * FROM positions WHERE ticker = ? ORDER BY id ASC LIMIT 1",
             (ticker,),
         ).fetchone()
 
@@ -221,26 +239,34 @@ def get_open_positions(db_path: Path = DB_PATH) -> list[Position]:
 def get_trades(
     start_date: Optional[date] = None,
     end_date: Optional[date] = None,
+    ticker: Optional[str] = None,
     db_path: Path = DB_PATH,
 ) -> list[Trade]:
-    """Return completed trades, optionally filtered by date range."""
+    """Return completed trades, optionally filtered by date range and/or ticker."""
     query = "SELECT * FROM trades"
     params: list = []
+    clauses: list = []
 
-    if start_date or end_date:
-        clauses = []
-        if start_date:
-            clauses.append("exit_time >= ?")
-            params.append(start_date.isoformat())
-        if end_date:
-            clauses.append("exit_time <= ?")
-            params.append(end_date.isoformat() + "T23:59:59")
+    if start_date:
+        clauses.append("date(exit_time) >= ?")
+        params.append(start_date.isoformat())
+    if end_date:
+        clauses.append("date(exit_time) <= ?")
+        params.append(end_date.isoformat())
+    if ticker:
+        clauses.append("ticker = ?")
+        params.append(ticker)
+    if clauses:
         query += " WHERE " + " AND ".join(clauses)
 
     query += " ORDER BY exit_time DESC"
 
     with _db_connection(db_path) as conn:
         rows = conn.execute(query, params).fetchall()
+
+    def _ensure_utc(dt_str: str) -> datetime:
+        dt = datetime.fromisoformat(dt_str)
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
 
     return [
         Trade(
@@ -250,8 +276,8 @@ def get_trades(
             quantity=r["quantity"],
             entry_price=r["entry_price"],
             exit_price=r["exit_price"],
-            entry_time=datetime.fromisoformat(r["entry_time"]),
-            exit_time=datetime.fromisoformat(r["exit_time"]),
+            entry_time=_ensure_utc(r["entry_time"]),
+            exit_time=_ensure_utc(r["exit_time"]),
             trade_type=TradeType(r["trade_type"]),
             sector=r["sector"],
             reasoning=r["reasoning"],
@@ -279,29 +305,66 @@ def reconcile_positions(
     orphaned_db = sorted(db_tickers - ibkr_tickers)
     orphaned_ibkr = sorted(ibkr_tickers - db_tickers)
 
+    # Check quantity mismatches for tickers present in both DB and IBKR
+    # Sum quantities per ticker to handle multiple positions for the same stock
+    common_tickers = db_tickers & ibkr_tickers
+    db_qty: dict[str, int] = {}
+    for p in db_positions:
+        db_qty[p.ticker] = db_qty.get(p.ticker, 0) + p.quantity
+    ibkr_qty: dict[str, int] = {}
+    for p in ibkr_positions:
+        ibkr_qty[p["ticker"]] = ibkr_qty.get(p["ticker"], 0) + p["quantity"]
+    qty_mismatches = {}
+    for t in common_tickers:
+        if db_qty[t] != ibkr_qty[t]:
+            is_sign = (db_qty[t] > 0) != (ibkr_qty[t] > 0)
+            qty_mismatches[t] = {
+                "db": db_qty[t],
+                "ibkr": ibkr_qty[t],
+                "type": "sign_mismatch" if is_sign else "quantity_mismatch",
+            }
+
     report = {
         "db_count": len(db_positions),
-        "ibkr_count": len(ibkr_positions),
+        "ibkr_count": len(ibkr_tickers),
         "orphaned_db": orphaned_db,
         "orphaned_ibkr": orphaned_ibkr,
-        "in_sync": len(orphaned_db) == 0 and len(orphaned_ibkr) == 0,
+        "qty_mismatches": qty_mismatches,
+        "in_sync": len(orphaned_db) == 0 and len(orphaned_ibkr) == 0 and len(qty_mismatches) == 0,
     }
 
     if not report["in_sync"]:
         logger.warning(
             "Position mismatch! DB: %d, IBKR: %d. "
-            "In DB only: %s. In IBKR only: %s",
+            "In DB only: %s. In IBKR only: %s. Qty mismatches: %s",
             report["db_count"], report["ibkr_count"],
-            orphaned_db, orphaned_ibkr,
+            orphaned_db, orphaned_ibkr, qty_mismatches,
         )
+        sign_mismatches = [t for t, v in qty_mismatches.items() if v.get("type") == "sign_mismatch"]
+        if sign_mismatches:
+            logger.critical(
+                "DIRECTION MISMATCH for %s — DB and IBKR disagree on long/short! "
+                "Manual intervention required.",
+                sign_mismatches,
+            )
 
     return report
 
 
-def get_daily_pnl(day: Optional[date] = None, db_path: Path = DB_PATH) -> float:
-    """Calculate realized P&L for a given day (default: today)."""
-    day = day or date.today()
+def get_daily_pnl(
+    day: Optional[date] = None,
+    db_path: Path = DB_PATH,
+    unrealized_pnl: float = 0.0,
+) -> float:
+    """Calculate total daily P&L (realized + unrealized).
+
+    Args:
+        day: Date to compute realized P&L for (default: today).
+        unrealized_pnl: Mark-to-market P&L on open positions (from IBKR).
+    """
+    day = day or datetime.now(timezone.utc).date()
     day_str = day.isoformat()
+    # exit_time is stored as UTC ISO string; extract date portion for comparison
     with _db_connection(db_path) as conn:
         row = conn.execute(
             """SELECT COALESCE(SUM((exit_price - entry_price) * quantity), 0) as pnl
@@ -309,7 +372,7 @@ def get_daily_pnl(day: Optional[date] = None, db_path: Path = DB_PATH) -> float:
                WHERE date(exit_time) = ?""",
             (day_str,),
         ).fetchone()
-    return row["pnl"]
+    return row["pnl"] + unrealized_pnl
 
 
 def get_portfolio_value(ib_account_value: float, db_path: Path = DB_PATH) -> float:
@@ -365,7 +428,7 @@ def get_daily_summary(
     day: Optional[date] = None, db_path: Path = DB_PATH
 ) -> Optional[DailySummary]:
     """Get the summary for a specific day."""
-    day = day or date.today()
+    day = day or datetime.now(timezone.utc).date()
     with _db_connection(db_path) as conn:
         row = conn.execute(
             "SELECT * FROM daily_summary WHERE date = ?",
@@ -409,7 +472,8 @@ def get_pending_order_time(perm_id: int, db_path: Path = DB_PATH) -> Optional[da
             (perm_id,),
         ).fetchone()
     if row:
-        return datetime.fromisoformat(row["placed_at"])
+        dt = datetime.fromisoformat(row["placed_at"])
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
     return None
 
 

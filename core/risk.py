@@ -6,9 +6,15 @@ never fetch data themselves. This allows the backtester to reuse them.
 
 import logging
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from core.models import Signal, Position, Trade, Action
+import math
+from typing import Optional
+
+import numpy as np
+import pandas as pd
+
 from config.settings import (
     MAX_POSITION_SIZE_PCT,
     DAILY_LOSS_LIMIT_PCT,
@@ -18,12 +24,14 @@ from config.settings import (
     ANTI_MOMENTUM_PCT,
     TREND_CONFIRMATION,
     MIN_RISK_REWARD_RATIO,
+    RISK_PER_TRADE_PCT,
     ALLOW_SHORT_SELLING,
     FINANCIAL_KEYWORDS,
     DEFENSE_KEYWORDS,
     EXCLUDED_TICKERS,
     CIRCUIT_BREAKER_LOSSES,
     CIRCUIT_BREAKER_WINDOW_MIN,
+    VOLATILITY_BASELINE,
 )
 
 logger = logging.getLogger(__name__)
@@ -85,10 +93,22 @@ def check_daily_loss_limit(
 
 
 def check_max_positions(
+    signal: Signal,
     open_positions: list[Position],
     max_positions: int = MAX_OPEN_POSITIONS,
 ) -> tuple[bool, str]:
-    """Must have fewer than MAX_OPEN_POSITIONS open."""
+    """Must have fewer than MAX_OPEN_POSITIONS open.
+
+    Exit signals (SELL on existing long, BUY on existing short) are
+    always allowed — they reduce positions, not add new ones.
+    """
+    # Allow exits through regardless of position count
+    for pos in open_positions:
+        if pos.ticker == signal.ticker:
+            if (signal.action == Action.SELL and pos.quantity > 0) or \
+               (signal.action == Action.BUY and pos.quantity < 0):
+                return True, ""
+
     if len(open_positions) >= max_positions:
         return False, (
             f"Max open positions reached: {len(open_positions)}/{max_positions}"
@@ -120,25 +140,29 @@ def check_sector_concentration(
     open_positions: list[Position],
     portfolio_value: float,
     max_pct: float = MAX_SECTOR_CONCENTRATION_PCT,
+    proposed_value: float = 0.0,
 ) -> tuple[bool, str]:
     """Sector exposure must not exceed MAX_SECTOR_CONCENTRATION_PCT."""
-    if not signal.exchange or portfolio_value <= 0:
-        return True, ""  # Can't check without sector info
+    if portfolio_value <= 0:
+        return True, ""
 
     # Sum value of existing positions in same sector
     # (using entry_price * quantity as estimate)
-    sector = getattr(signal, "indicator_values", {}).get("sector", "")
+    sector = (getattr(signal, "indicator_values", None) or {}).get("sector", "")
     if not sector:
         return True, ""  # Unknown sector, let it through
 
     sector_value = sum(
-        (p.current_price or p.entry_price) * p.quantity
+        (p.current_price or p.entry_price) * abs(p.quantity)
         for p in open_positions
         if p.sector.lower() == sector.lower()
     )
 
+    # Include the proposed new position's value
+    sector_value += proposed_value
+
     max_sector_value = portfolio_value * (max_pct / 100)
-    if sector_value >= max_sector_value:
+    if sector_value > max_sector_value:
         return False, (
             f"Sector '{sector}' exposure ${sector_value:.2f} would exceed "
             f"limit ${max_sector_value:.2f} ({max_pct}%)"
@@ -150,9 +174,23 @@ def check_no_duplicate(
     signal: Signal,
     open_positions: list[Position],
 ) -> tuple[bool, str]:
-    """No existing position in this ticker."""
+    """No existing position in the same direction for this ticker.
+
+    A BUY is blocked if we already hold a long position (duplicate entry).
+    A SELL is allowed if we hold a long position (closing the position).
+    Zero-quantity positions (closed but not cleaned up) are ignored.
+    """
     for pos in open_positions:
         if pos.ticker == signal.ticker:
+            # Skip zero-quantity positions (closed but not yet removed from DB)
+            if pos.quantity == 0:
+                continue
+            # SELL signal on an existing long = closing the position, allow it
+            if signal.action == Action.SELL and pos.quantity > 0:
+                return True, ""
+            # BUY signal on an existing short = closing the position, allow it
+            if signal.action == Action.BUY and pos.quantity < 0:
+                return True, ""
             return False, (
                 f"Already holding position in {signal.ticker} "
                 f"({pos.quantity} shares @ ${pos.entry_price:.2f})"
@@ -171,9 +209,9 @@ def check_short_selling(
     if signal.action != Action.SELL:
         return True, ""
 
-    # Check if we hold this stock
+    # Check if we hold this stock (skip zero-quantity stale positions)
     for pos in open_positions:
-        if pos.ticker == signal.ticker:
+        if pos.ticker == signal.ticker and pos.quantity != 0:
             return True, ""
 
     return False, f"Short selling blocked for {signal.ticker} (not currently held)"
@@ -242,14 +280,15 @@ def check_cumulative_risk(
         return False, "Portfolio value is zero or negative"
 
     existing_risk = sum(
-        abs(p.entry_price - p.stop_loss) * p.quantity
+        abs(p.entry_price - p.stop_loss) * abs(p.quantity)
         for p in open_positions
+        if p.stop_loss > 0
     )
 
-    # Estimate new position risk using risk-based sizing (1% of portfolio)
+    # Estimate new position risk using the shared RISK_PER_TRADE_PCT constant
     stop_distance = abs(signal.entry_price - signal.stop_loss)
     if stop_distance > 0:
-        risk_per_trade = portfolio_value * 0.01
+        risk_per_trade = portfolio_value * (RISK_PER_TRADE_PCT / 100)
         estimated_qty = int(risk_per_trade / stop_distance)
         new_risk = stop_distance * estimated_qty
     else:
@@ -278,7 +317,10 @@ def check_anti_momentum(
     move was missed.
     """
     if current_price <= 0 or signal.entry_price <= 0:
-        return True, ""
+        return False, (
+            f"Invalid prices for anti-momentum check "
+            f"(current_price={current_price}, entry_price={signal.entry_price})"
+        )
 
     pct_move = ((current_price - signal.entry_price) / signal.entry_price) * 100
 
@@ -354,7 +396,10 @@ def check_risk_reward(
 ) -> tuple[bool, str]:
     """Take-profit must give at least X:1 reward/risk ratio."""
     if signal.entry_price <= 0 or signal.stop_loss <= 0 or signal.take_profit <= 0:
-        return True, ""  # Can't check without prices
+        return False, (
+            f"Invalid prices for risk/reward check "
+            f"(entry={signal.entry_price}, SL={signal.stop_loss}, TP={signal.take_profit})"
+        )
 
     if signal.action == Action.BUY:
         risk = signal.entry_price - signal.stop_loss
@@ -390,12 +435,17 @@ def check_circuit_breaker(
     if not recent_trades or max_losses <= 0:
         return True, ""
 
-    cutoff = datetime.now() - timedelta(minutes=window_minutes)
+    cutoff = datetime.now(timezone.utc) - timedelta(minutes=window_minutes)
+
+    def _make_aware(dt: datetime) -> datetime:
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
 
     # Filter to trades within the window, sorted newest-first
+    # Guard against trades missing exit_time (e.g. backtest deserialization)
     windowed = sorted(
-        (t for t in recent_trades if t.exit_time >= cutoff),
-        key=lambda t: t.exit_time,
+        (t for t in recent_trades
+         if hasattr(t, "exit_time") and t.exit_time and _make_aware(t.exit_time) >= cutoff),
+        key=lambda t: _make_aware(t.exit_time),
         reverse=True,
     )
 
@@ -416,6 +466,34 @@ def check_circuit_breaker(
 
 
 # ---------------------------------------------------------------------------
+# Volatility
+# ---------------------------------------------------------------------------
+
+def calculate_realized_volatility(
+    closes: pd.Series,
+    window: int = 20,
+) -> Optional[float]:
+    """Calculate annualized realized volatility from a close-price series.
+
+    Uses log returns over the given window, annualized by sqrt(252).
+    Returns None if the series is too short.
+    """
+    if len(closes) < window + 1:
+        return None
+
+    ratios = closes / closes.shift(1)
+    log_returns = np.log(ratios.replace(0, np.nan)).dropna()
+    if len(log_returns) < window:
+        return None
+
+    daily_vol = log_returns.iloc[-window:].std()
+    if pd.isna(daily_vol):
+        return None
+
+    return float(daily_vol * math.sqrt(252))
+
+
+# ---------------------------------------------------------------------------
 # Position sizing
 # ---------------------------------------------------------------------------
 
@@ -423,12 +501,17 @@ def calculate_position_size(
     signal: Signal,
     portfolio_value: float,
     max_pct: float = MAX_POSITION_SIZE_PCT,
+    volatility: float | None = None,
 ) -> int:
     """Calculate number of shares based on max position size and stop-loss distance.
 
     Uses the smaller of:
     1. Max position size (% of portfolio)
-    2. Risk-based sizing (2% risk per trade using stop-loss distance)
+    2. Risk-based sizing (1% risk per trade using stop-loss distance)
+
+    When volatility is provided, scales the position inversely to the
+    volatility regime: high vol → smaller position, low vol → base size
+    (never increases beyond base to avoid leverage).
     """
     if signal.entry_price <= 0 or portfolio_value <= 0:
         return 0
@@ -437,8 +520,8 @@ def calculate_position_size(
     max_position_value = portfolio_value * (max_pct / 100)
     qty_by_size = int(max_position_value / signal.entry_price)
 
-    # Method 2: Risk-based (risk 1% of portfolio per trade)
-    risk_per_trade = portfolio_value * 0.01
+    # Method 2: Risk-based (risk RISK_PER_TRADE_PCT% of portfolio per trade)
+    risk_per_trade = portfolio_value * (RISK_PER_TRADE_PCT / 100)
     stop_distance = abs(signal.entry_price - signal.stop_loss)
     if stop_distance > 0:
         qty_by_risk = int(risk_per_trade / stop_distance)
@@ -447,6 +530,12 @@ def calculate_position_size(
 
     # Take the smaller
     quantity = min(qty_by_size, qty_by_risk)
+
+    # Volatility regime adjustment: scale down when vol > baseline
+    if volatility is not None and volatility > 0 and VOLATILITY_BASELINE > 0:
+        vol_scale = min(VOLATILITY_BASELINE / volatility, 1.0)  # cap at 1.0 (no leverage)
+        quantity = max(int(quantity * vol_scale), min(1, quantity))
+
     return max(quantity, 0)
 
 
@@ -461,10 +550,15 @@ def evaluate(
     daily_pnl: float,
     current_price: float = 0.0,
     recent_trades: list[Trade] | None = None,
+    volatility: float | None = None,
 ) -> RiskResult:
     """Run all risk checks on a signal. Returns RiskResult.
 
     Pure function — all state passed in as arguments.
+
+    Args:
+        volatility: Current annualized market volatility. When provided,
+                    position sizes are scaled inversely (high vol → smaller).
     """
     reasons = []
 
@@ -474,14 +568,20 @@ def evaluate(
     # Get indicator values for trend check
     indicator_values = getattr(signal, "indicator_values", {}) or {}
 
+    # Pre-compute position size for sector concentration check
+    # so we use the actual risk-sized value, not a fixed max estimate
+    estimated_size = calculate_position_size(signal, portfolio_value, volatility=volatility)
+    proposed_value = signal.entry_price * estimated_size if estimated_size > 0 else 0.0
+
     checks = [
         check_short_selling(signal, open_positions),
         check_position_size(signal, portfolio_value),
         check_daily_loss_limit(daily_pnl, portfolio_value),
         check_cumulative_risk(signal, open_positions, portfolio_value),
-        check_max_positions(open_positions),
+        check_max_positions(signal, open_positions),
         check_stop_loss(signal),
-        check_sector_concentration(signal, open_positions, portfolio_value),
+        check_sector_concentration(signal, open_positions, portfolio_value,
+                                    proposed_value=proposed_value),
         check_no_duplicate(signal, open_positions),
         # Discipline rules
         check_excluded_sector(signal),
@@ -499,7 +599,7 @@ def evaluate(
 
     position_size = 0
     if approved:
-        position_size = calculate_position_size(signal, portfolio_value)
+        position_size = estimated_size
         if position_size <= 0:
             approved = False
             reasons.append("Calculated position size is 0 (portfolio too small or price too high)")
