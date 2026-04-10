@@ -12,7 +12,7 @@ from core.universe import (
     _classify_sector_ollama,
     _fill_missing_sectors,
     _filter_universe,
-    _is_financial_sector,
+    _is_excluded_sector,
     _static_fallback,
     cache_universe,
     load_cached_universe,
@@ -22,40 +22,60 @@ from core.universe import (
 
 class TestFinancialFilter:
     def test_detects_financials(self):
-        assert _is_financial_sector("Financials") is True
-        assert _is_financial_sector("Financial Services") is True
-        assert _is_financial_sector("Banks") is True
-        assert _is_financial_sector("Insurance") is True
-        assert _is_financial_sector("Consumer Finance") is True
-        assert _is_financial_sector("Capital Markets") is True
+        assert _is_excluded_sector("Financials") is True
+        assert _is_excluded_sector("Financial Services") is True
+        assert _is_excluded_sector("Banks") is True
+        assert _is_excluded_sector("Insurance") is True
+        assert _is_excluded_sector("Consumer Finance") is True
+        assert _is_excluded_sector("Capital Markets") is True
 
     def test_detects_lending_and_interest_businesses(self):
-        assert _is_financial_sector("Lending Services") is True
-        assert _is_financial_sector("Mortgage Finance") is True
-        assert _is_financial_sector("Consumer Lending") is True
-        assert _is_financial_sector("Microfinance") is True
-        assert _is_financial_sector("Payday Loans") is True
-        assert _is_financial_sector("Credit Services") is True
-        assert _is_financial_sector("Debt Collection") is True
+        assert _is_excluded_sector("Lending Services") is True
+        assert _is_excluded_sector("Mortgage Finance") is True
+        assert _is_excluded_sector("Consumer Lending") is True
+        assert _is_excluded_sector("Microfinance") is True
+        assert _is_excluded_sector("Payday Loans") is True
+        assert _is_excluded_sector("Credit Services") is True
+        assert _is_excluded_sector("Debt Collection") is True
 
     def test_allows_non_financials(self):
-        assert _is_financial_sector("Technology") is False
-        assert _is_financial_sector("Healthcare") is False
-        assert _is_financial_sector("Energy") is False
-        assert _is_financial_sector("Industrials") is False
-        assert _is_financial_sector("") is False
+        assert _is_excluded_sector("Technology") is False
+        assert _is_excluded_sector("Healthcare") is False
+        assert _is_excluded_sector("Energy") is False
+        assert _is_excluded_sector("Industrials") is False
+        assert _is_excluded_sector("") is False
 
     def test_case_insensitive(self):
-        assert _is_financial_sector("FINANCIALS") is True
-        assert _is_financial_sector("banking") is True
+        assert _is_excluded_sector("FINANCIALS") is True
+        assert _is_excluded_sector("banking") is True
 
     def test_excludes_non_equity_etfs(self):
-        assert _is_financial_sector("Bond ETF") is True
-        assert _is_financial_sector("Leveraged ETF") is True
-        assert _is_financial_sector("Non-Stock ETF") is True
+        assert _is_excluded_sector("Bond ETF") is True
+        assert _is_excluded_sector("Leveraged ETF") is True
+        assert _is_excluded_sector("Non-Stock ETF") is True
 
     def test_keeps_equity_etfs(self):
-        assert _is_financial_sector("Equity ETF") is False
+        assert _is_excluded_sector("Equity ETF") is False
+
+    def test_detects_defense_and_military(self):
+        assert _is_excluded_sector("Aerospace & Defense") is True
+        assert _is_excluded_sector("Defense") is True
+        assert _is_excluded_sector("Defence") is True
+        assert _is_excluded_sector("Military Equipment") is True
+        assert _is_excluded_sector("Weapons & Ammunition") is True
+        assert _is_excluded_sector("Arms Manufacturer") is True
+        assert _is_excluded_sector("Missile Systems") is True
+        assert _is_excluded_sector("Combat Systems") is True
+        assert _is_excluded_sector("Ordnance & Accessories") is True
+
+    def test_defense_case_insensitive(self):
+        assert _is_excluded_sector("AEROSPACE & DEFENSE") is True
+        assert _is_excluded_sector("military") is True
+
+    def test_allows_non_defense_industrials(self):
+        assert _is_excluded_sector("Industrials") is False
+        assert _is_excluded_sector("Industrial Machinery") is False
+        assert _is_excluded_sector("Aerospace Parts") is False
 
 
 class TestFilterUniverse:
@@ -72,6 +92,20 @@ class TestFilterUniverse:
         assert "BAC" not in tickers
         assert "AAPL" in tickers
         assert "MSFT" in tickers
+
+    def test_removes_defense(self):
+        stocks = [
+            StockInfo("AAPL", "SMART", "Technology", 0, 0),
+            StockInfo("LMT", "SMART", "Aerospace & Defense", 0, 0),
+            StockInfo("RTX", "SMART", "Defense", 0, 0),
+            StockInfo("CAT", "SMART", "Industrials", 0, 0),
+        ]
+        filtered = _filter_universe(stocks)
+        tickers = {s.ticker for s in filtered}
+        assert "LMT" not in tickers
+        assert "RTX" not in tickers
+        assert "AAPL" in tickers
+        assert "CAT" in tickers
 
     def test_removes_excluded_countries(self):
         stocks = [
@@ -135,7 +169,7 @@ class TestStaticFallback:
     def test_us_fallback_no_financials(self):
         stocks = _static_fallback("US")
         for s in stocks:
-            assert not _is_financial_sector(s.sector), f"{s.ticker} is financial"
+            assert not _is_excluded_sector(s.sector), f"{s.ticker} is financial"
 
     def test_unknown_market(self):
         stocks = _static_fallback("MOON")

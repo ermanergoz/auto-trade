@@ -12,7 +12,8 @@ from ib_insync import IB, Stock, ScannerSubscription
 
 from config.settings import (
     AI_MODEL, DATA_DIR, EXCLUDED_COUNTRIES, EXCLUDED_SECTORS, EXCLUDED_TICKERS,
-    FINANCIAL_KEYWORDS, MIN_DAILY_VOLUME, MIN_MARKET_CAP, OLLAMA_HOST,
+    FINANCIAL_KEYWORDS, DEFENSE_KEYWORDS, MIN_DAILY_VOLUME, MIN_MARKET_CAP,
+    OLLAMA_HOST,
 )
 from core.models import StockInfo
 
@@ -47,6 +48,8 @@ def build_universe(
         # Try cache first (universe doesn't change intraday)
         cached = load_cached_universe(market)
         if cached:
+            # Re-apply filter to catch exclusion rule changes since cache was written
+            cached = _filter_universe(cached)
             logger.info("Loaded %d cached %s stocks", len(cached), market)
             all_stocks.extend(cached)
             continue
@@ -121,7 +124,7 @@ def _scan_ibkr(ib: IB, market: str) -> list[StockInfo]:
 
                 details = item.contractDetails
 
-                sector = getattr(details, "category", "") or ""
+                sector = getattr(details, "industry", "") or getattr(details, "category", "") or ""
                 market_cap = 0.0  # IBKR scanner doesn't directly give market cap
                 avg_volume = 0.0
 
@@ -173,11 +176,12 @@ def _enrich_with_contract_details(
             details_list = ib.reqContractDetails(contract)
             if details_list:
                 d = details_list[0]
-                stock.sector = getattr(d, "category", "") or ""
+                stock.sector = getattr(d, "industry", "") or getattr(d, "category", "") or ""
                 stock.name = getattr(d, "longName", "") or ""
                 enriched_count += 1
 
-            # IBKR pacing: brief pause every 50 requests
+            # IBKR pacing: small delay per request to avoid pacing violations
+            ib.sleep(0.05)
             if i % 50 == 0:
                 logger.info("Enriched %d/%d stocks...", i, len(need_enrichment))
                 ib.sleep(1)
@@ -343,8 +347,14 @@ def _filter_universe(stocks: list[StockInfo]) -> list[StockInfo]:
         if s.country and s.country in EXCLUDED_COUNTRIES:
             continue
 
-        # Exclude financial sector
-        if _is_financial_sector(s.sector):
+        # Exclude financial and defense sectors
+        if _is_excluded_sector(s.sector):
+            continue
+
+        # Also check company name for defense/financial keywords — catches
+        # companies with generic sector labels like "Industrials" that are
+        # actually defense contractors (e.g., Raytheon, Lockheed Martin)
+        if s.name and _is_excluded_by_name(s.name):
             continue
 
         # Apply liquidity filters only if data is available
@@ -359,8 +369,8 @@ def _filter_universe(stocks: list[StockInfo]) -> list[StockInfo]:
     return filtered
 
 
-def _is_financial_sector(sector: str) -> bool:
-    """Check if the sector should be excluded (financials + non-equity ETFs)."""
+def _is_excluded_sector(sector: str) -> bool:
+    """Check if the sector should be excluded (financials, defense, non-equity ETFs)."""
     if not sector:
         return False
     sector_lower = sector.lower()
@@ -374,7 +384,25 @@ def _is_financial_sector(sector: str) -> bool:
     for excluded in EXCLUDED_SECTORS:
         if excluded.lower() in sector_lower:
             return True
-    return any(kw in sector_lower for kw in FINANCIAL_KEYWORDS)
+    if any(kw in sector_lower for kw in FINANCIAL_KEYWORDS):
+        return True
+    return any(kw in sector_lower for kw in DEFENSE_KEYWORDS)
+
+
+def _is_excluded_by_name(name: str) -> bool:
+    """Check if company name contains defense or financial keywords.
+
+    Catches companies with generic sector labels (e.g. "Industrials")
+    that are actually defense contractors or financial firms.
+    """
+    name_lower = name.lower()
+    for kw in DEFENSE_KEYWORDS:
+        if kw in name_lower:
+            return True
+    for kw in FINANCIAL_KEYWORDS:
+        if kw in name_lower:
+            return True
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -407,9 +435,9 @@ def _static_fallback(market: str) -> list[StockInfo]:
             ("PEP", "Consumer Defensive"), ("COST", "Consumer Defensive"),
             ("WMT", "Consumer Defensive"), ("CL", "Consumer Defensive"),
             # Industrials
-            ("CAT", "Industrials"), ("BA", "Industrials"), ("HON", "Industrials"),
-            ("UPS", "Industrials"), ("RTX", "Industrials"), ("DE", "Industrials"),
-            ("GE", "Industrials"), ("LMT", "Industrials"), ("MMM", "Industrials"),
+            ("CAT", "Industrials"), ("HON", "Industrials"),
+            ("UPS", "Industrials"), ("DE", "Industrials"),
+            ("GE", "Industrials"), ("MMM", "Industrials"),
             ("UNP", "Industrials"),
             # Energy
             ("XOM", "Energy"), ("CVX", "Energy"), ("COP", "Energy"),
@@ -495,5 +523,7 @@ def get_tickers_for_market(
     """Filter universe to a specific market."""
     market = market.upper()
     if market == "US":
-        return [s for s in universe if s.exchange in ("SMART", "NYSE", "NASDAQ")]
-    return universe
+        us_exchanges = {"SMART", "NYSE", "NASDAQ", "ARCA", "BATS", "IEX", "AMEX", "ISLAND"}
+        return [s for s in universe if s.exchange in us_exchanges]
+    logger.warning("Unknown market '%s' in get_tickers_for_market — returning empty list", market)
+    return []

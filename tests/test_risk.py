@@ -11,6 +11,7 @@ from core.risk import (
     check_stop_loss,
     check_no_duplicate,
     check_circuit_breaker,
+    check_excluded_sector,
     calculate_position_size,
     evaluate,
 )
@@ -388,3 +389,23 @@ class TestCircuitBreakerInEvaluate:
         sig = _make_signal()
         result = evaluate(sig, [], 100_000, 0)
         assert result.approved is True
+
+
+class TestDefenseSectorExclusion:
+    """check_excluded_sector must block defense/military stocks."""
+
+    def test_blocks_defense_sector(self):
+        sig = _make_signal(indicator_values={"sector": "Aerospace & Defense"})
+        ok, reason = check_excluded_sector(sig)
+        assert ok is False
+        assert "defense" in reason.lower()
+
+    def test_blocks_military_keyword(self):
+        sig = _make_signal(indicator_values={"sector": "Military Equipment"})
+        ok, reason = check_excluded_sector(sig)
+        assert ok is False
+
+    def test_allows_technology_sector(self):
+        sig = _make_signal(indicator_values={"sector": "Technology"})
+        ok, _ = check_excluded_sector(sig)
+        assert ok is True

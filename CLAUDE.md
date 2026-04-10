@@ -7,11 +7,11 @@ This project is an automated stock trading system. Read these docs before starti
 
 ## Key Context
 
-- **What**: Automated day/swing trading bot for US and Turkish (BIST) stocks
+- **What**: Automated day/swing trading bot for US stocks
 - **Broker**: Interactive Brokers (IBKR) via `ib_insync` Python library
 - **Data**: IBKR is the primary data source (historical + real-time). YFinance is fallback for backtesting only.
 - **Strategy**: Technical screener filters thousands of stocks -> AI (Claude/GPT) analyzes top ~20 candidates -> Risk manager gates trades -> IBKR executes
-- **Excludes**: Financial sector stocks (banks, insurance, lending companies)
+- **Excludes**: Financial sector stocks (banks, insurance, lending companies) and defense/military stocks (weapons, ammunition, combat systems)
 - **Modes**: paper (default), live, backtest, dry-run
 - **Notifications**: Telegram bot
 - **Database**: SQLite
