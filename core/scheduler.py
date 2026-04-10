@@ -14,7 +14,7 @@ from config.settings import (
     AI_MAX_CANDIDATES, STALE_ORDER_MINUTES,
 )
 from core.connection import ensure_connected, create_contract, disconnect
-from core.data import get_historical_data, get_news, get_historical_data_yfinance
+from core.data import get_historical_data, get_news, get_historical_data_yfinance, get_macro_news
 from core.universe import build_universe, get_tickers_for_market
 from core.screener import screen_stocks
 from core.analyst import analyze_batch
@@ -50,6 +50,11 @@ _tz = ZoneInfo(TIMEZONE)
 def is_market_open(market: str) -> bool:
     """Check if a market is currently open based on Istanbul time."""
     now = datetime.now(_tz)
+
+    # Weekends — check before parsing to avoid errors on misconfigured hours
+    if now.weekday() >= 5:
+        return False
+
     hours = MARKET_HOURS.get(market.upper())
     if not hours:
         return False
@@ -60,11 +65,7 @@ def is_market_open(market: str) -> bool:
     market_open = now.replace(hour=open_h, minute=open_m, second=0, microsecond=0)
     market_close = now.replace(hour=close_h, minute=close_m, second=0, microsecond=0)
 
-    # Weekends
-    if now.weekday() >= 5:
-        return False
-
-    return market_open <= now <= market_close
+    return market_open <= now < market_close
 
 
 def get_active_markets(markets: list[str]) -> list[str]:
@@ -141,9 +142,14 @@ def run_scan_cycle(
     from core.connection import get_account_summary
     account = get_account_summary(ib)
     portfolio_value = account.get("NetLiquidation", 0)
-    daily_pnl = get_daily_pnl()
+    daily_pnl = get_daily_pnl(unrealized_pnl=account.get("UnrealizedPnL", 0.0))
     open_positions = get_open_positions()
     update_portfolio_data(account, open_positions, daily_pnl)
+
+    # Fetch macro/political headlines once for all candidates
+    macro_news = get_macro_news()
+    if macro_news:
+        logger.info("Macro headlines: %d items fetched", len(macro_news))
 
     # Build universe (cached daily)
     update_status("building_universe", f"Markets: {', '.join(active_markets)}")
@@ -157,7 +163,7 @@ def run_scan_cycle(
 
         # Check for end-of-day close (skip when force mode)
         mins_left = minutes_to_close(market)
-        if not force and CLOSE_DAY_TRADES_BEFORE_MARKET_CLOSE and mins_left <= CLOSE_MINUTES_BEFORE:
+        if not force and CLOSE_DAY_TRADES_BEFORE_MARKET_CLOSE and 0 < mins_left <= CLOSE_MINUTES_BEFORE:
             logger.info(
                 "%s market closing in %d min — closing day trades", market, mins_left,
             )
@@ -168,10 +174,13 @@ def run_scan_cycle(
         # Step 1: Fetch data for all stocks
         update_status("fetching_data", f"{len(market_stocks)} stocks for {market}")
         stock_data = _fetch_market_data(ib, market_stocks)
+        sector_lookup = {s.ticker: s.sector for s in market_stocks}
 
         # Step 2: Run screener
         update_status("screening", f"{len(stock_data)} stocks")
         candidates = screen_stocks(stock_data)
+        for cand in candidates:
+            cand.indicator_values["sector"] = sector_lookup.get(cand.ticker, "")
         summary["candidates_found"] += len(candidates)
         logger.info("Screener found %d candidates for %s", len(candidates), market)
 
@@ -206,8 +215,8 @@ def run_scan_cycle(
 
         update_status("ai_analysis", f"0/{len(ai_input)} candidates for {market}")
 
-        def _on_ai_progress(current, total):
-            update_status("ai_analysis", f"{current}/{total} candidates for {market}")
+        def _on_ai_progress(current, total, _market=market):
+            update_status("ai_analysis", f"{current}/{total} candidates for {_market}")
 
         # Step 3+4: AI analysis with streaming risk check + execution.
         # Each AI-approved signal is immediately sent to risk check and
@@ -216,15 +225,29 @@ def run_scan_cycle(
         risk_approved_signals = []
 
         def _on_signal(signal):
-            nonlocal open_positions
+            nonlocal open_positions, portfolio_value
             summary["ai_approved"] += 1
             record_signal(signal)
+
+            # Refresh account state to capture any fills since scan start
+            fresh_account = get_account_summary(ib)
+            portfolio_value = fresh_account.get("NetLiquidation", portfolio_value)
+            fresh_daily_pnl = get_daily_pnl(unrealized_pnl=fresh_account.get("UnrealizedPnL", 0.0))
 
             # Fetch current price for anti-momentum check
             sig_df = stock_data.get(signal.ticker, (None, None))[1]
             current_price = sig_df["close"].iloc[-1] if sig_df is not None and not sig_df.empty else 0.0
-            recent_trades = get_trades(start_date=datetime.now().date())
-            result = evaluate(signal, open_positions, portfolio_value, daily_pnl, current_price=current_price, recent_trades=recent_trades)
+            if current_price == 0.0:
+                logger.warning(
+                    "Current price unavailable for %s — anti-momentum check will use entry_price",
+                    signal.ticker,
+                )
+            # Use UTC date for trade lookup — exit_time is stored as UTC ISO string,
+            # so SQLite's date() extracts UTC calendar date. Using Istanbul date
+            # would miss trades closed before 03:00 Istanbul time.
+            from datetime import timezone as _utc_tz
+            recent_trades = get_trades(start_date=datetime.now(_utc_tz.utc).date())
+            result = evaluate(signal, open_positions, portfolio_value, fresh_daily_pnl, current_price=current_price, recent_trades=recent_trades)
             if not result.approved:
                 logger.info("Risk rejected %s: %s", signal.ticker, "; ".join(result.reasons))
                 if any("circuit breaker" in r.lower() for r in result.reasons):
@@ -249,7 +272,7 @@ def run_scan_cycle(
             def _on_exit(ticker, exit_price, exit_type):
                 from notifications.telegram import notify_trade_closed
                 from core.portfolio import get_trades
-                trades_list = get_trades()
+                trades_list = get_trades(ticker=ticker)
                 if trades_list:
                     notify_trade_closed(trades_list[0])
 
@@ -278,14 +301,26 @@ def run_scan_cycle(
                         f"Reason: {reason or 'unknown'}"
                     )
                 else:
-                    setup_fill_handler(ib, signal, result.position_size, on_fill=_on_fill)
-                    setup_exit_handler(ib, signal, on_exit=_on_exit)
+                    # Attach fill/exit handlers AFTER placing order so we can
+                    # pass the parent order for precise permId matching.
+                    # The bracket uses transmit=False until the last child,
+                    # so fills cannot arrive before place_order returns.
+                    setup_fill_handler(
+                        ib, signal, result.position_size,
+                        on_fill=_on_fill, parent_order=trades[0].order,
+                    )
+                    setup_exit_handler(
+                        ib, signal, on_exit=_on_exit, parent_order=trades[0].order,
+                    )
                     summary["orders_placed"] += 1
                     notify_trade(signal, result.position_size, action_type="SUBMITTED")
 
+            # Always refresh positions for next risk check, regardless of
+            # whether the order succeeded — async fills may have updated DB
+            ib.sleep(0.5)
             open_positions = get_open_positions()
 
-        analyze_batch(ai_input, on_signal=_on_signal, on_progress=_on_ai_progress)
+        analyze_batch(ai_input, on_signal=_on_signal, on_progress=_on_ai_progress, macro_news=macro_news)
 
         if risk_approved_signals:
             notify_risk_results(risk_approved_signals)
@@ -361,6 +396,8 @@ def check_stale_orders(ib: IB, mode: str = "paper") -> dict:
             dry_run = mode in ("dry-run", "backtest")
             if dry_run:
                 logger.info("[DRY-RUN] Would cancel stale order for %s (%.1fh old)", ticker, age_hours)
+                result["cancelled"] += 1
+                result["tickers_cancelled"].append(ticker)
             else:
                 cancel_bracket_order(ib, trade)
                 notify_stale_order_cancelled(ticker, age_hours)

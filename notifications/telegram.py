@@ -163,6 +163,7 @@ def _build_status_response() -> str:
 
 
 _MAX_LISTENER_ERRORS = 10
+_stop_event = threading.Event()
 
 
 def _poll_loop() -> None:
@@ -172,7 +173,7 @@ def _poll_loop() -> None:
     offset = None
     consecutive_errors = 0
 
-    while True:
+    while not _stop_event.is_set():
         try:
             updates = _get_updates_sync(offset=offset)
             consecutive_errors = 0  # Reset on success
@@ -202,11 +203,17 @@ def _poll_loop() -> None:
                 logger.error("Telegram listener exceeded max errors — stopping")
                 return
 
-        time.sleep(1)
+        _stop_event.wait(1)
+
+
+def stop_listener() -> None:
+    """Signal the Telegram listener thread to stop."""
+    _stop_event.set()
 
 
 def start_listener() -> None:
     """Start the background Telegram message listener thread."""
+    _stop_event.clear()  # allow restart after a previous stop
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         logger.debug("Telegram not configured — listener not started")
         return

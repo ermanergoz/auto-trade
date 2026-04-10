@@ -232,6 +232,40 @@ def compare_configs(results_list: list[tuple[str, dict]]) -> None:
     console.print(table)
 
 
+def compare_ai_value_add(
+    screener_metrics: dict,
+    ai_metrics: dict,
+) -> dict:
+    """Compare screener-only vs screener+AI backtest results.
+
+    Returns a dict with both sets of metrics and alpha measurements
+    to determine whether the AI analyst adds or destroys value.
+    """
+    s_trades = screener_metrics.get("num_trades", 0)
+    a_trades = ai_metrics.get("num_trades", 0)
+
+    return_alpha = ai_metrics.get("total_return_pct", 0) - screener_metrics.get("total_return_pct", 0)
+    sharpe_alpha = ai_metrics.get("sharpe_ratio", 0) - screener_metrics.get("sharpe_ratio", 0)
+    pnl_alpha = ai_metrics.get("total_pnl", 0) - screener_metrics.get("total_pnl", 0)
+
+    if s_trades > 0:
+        filter_rate = (1 - a_trades / s_trades) * 100
+    else:
+        filter_rate = 0.0
+
+    return {
+        "screener_only": screener_metrics,
+        "screener_plus_ai": ai_metrics,
+        "alpha": {
+            "return_alpha_pct": return_alpha,
+            "sharpe_alpha": sharpe_alpha,
+            "pnl_alpha": pnl_alpha,
+            "ai_filter_rate_pct": filter_rate,
+            "ai_adds_value": return_alpha > 0,
+        },
+    }
+
+
 def export_metrics_json(metrics: dict, filepath: str) -> None:
     """Export metrics to JSON file."""
     import json

@@ -32,6 +32,7 @@ _PATCHES = [
     "core.scheduler.update_status",
     "core.scheduler.ensure_connected",
     "core.scheduler.get_news",
+    "core.scheduler.get_macro_news",
     "core.scheduler.get_active_markets",
 ]
 
@@ -49,6 +50,7 @@ def _setup_mocks(
     signals,
     risk_approved=None,
     positions_sequence=None,
+    sectors=None,
 ):
     """Configure mocks for a standard pipeline run.
 
@@ -61,6 +63,8 @@ def _setup_mocks(
         risk_approved = [True] * len(signals)
     if positions_sequence is None:
         positions_sequence = [[]] * (len(signals) + 1)
+    if sectors is None:
+        sectors = [""] * len(signals)
 
     mocks["get_active_markets"].return_value = ["US"]
     mocks["get_daily_pnl"].return_value = 0.0
@@ -68,16 +72,20 @@ def _setup_mocks(
 
     from core.models import StockInfo
 
-    stock_infos = [StockInfo(s.ticker, s.exchange, "", 0.0, 0.0) for s in signals]
+    stock_infos = [
+        StockInfo(s.ticker, s.exchange, sector, 0.0, 0.0)
+        for s, sector in zip(signals, sectors)
+    ]
     mocks["get_tickers_for_market"].return_value = stock_infos
     mocks["build_universe"].return_value = {}
     mocks["screen_stocks"].return_value = signals
     mocks["get_news"].return_value = []
+    mocks["get_macro_news"].return_value = []
 
     # analyze_batch fires signals via on_signal callback and returns
     # an empty list. The streaming pipeline must rely on the callback
     # for risk check + execution, not the return value.
-    def fake_analyze_batch(ai_input, on_signal=None, on_progress=None):
+    def fake_analyze_batch(ai_input, on_signal=None, on_progress=None, macro_news=None):
         for sig in signals:
             if on_signal:
                 on_signal(sig)
@@ -103,9 +111,9 @@ def _run_cycle(mocks):
     ib = MagicMock()
 
     with patch("core.scheduler._fetch_market_data") as mock_fetch, \
-         patch("core.connection.get_account_summary") as mock_account, \
-         patch("core.scheduler.minutes_to_close", return_value=999):
-        mock_account.return_value = {"NetLiquidation": 100_000}
+         patch("core.connection.get_account_summary", return_value={"NetLiquidation": 100_000}), \
+         patch("core.scheduler.minutes_to_close", return_value=999), \
+         patch("core.scheduler.get_trades", return_value=[]):
         mock_fetch.return_value = _make_stock_data(
             [s.ticker for s in mocks["screen_stocks"].return_value],
         )
@@ -204,8 +212,13 @@ class TestStreamingPipeline:
         assert summary["risk_approved"] == 2
         assert summary["orders_placed"] == 2
 
-    def test_fill_handler_attached_before_order(self):
-        """setup_fill_handler must be called BEFORE place_order to avoid race."""
+    def test_fill_handler_attached_after_order_with_parent(self):
+        """setup_fill_handler must be called AFTER place_order with parent_order.
+
+        The bracket uses transmit=False until the last child order, so fills
+        cannot arrive before place_order returns. Attaching handlers after
+        allows passing the parent order for precise permId matching.
+        """
         sig = _make_signal(ticker="RACE")
         _setup_mocks(self.m, [sig], risk_approved=[True])
 
@@ -215,9 +228,12 @@ class TestStreamingPipeline:
 
         _run_cycle(self.m)
 
-        assert call_order == ["handler", "order"], (
-            f"Fill handler must be attached before order placement, got: {call_order}"
+        assert call_order == ["order", "handler"], (
+            f"Fill handler must be attached after order placement, got: {call_order}"
         )
+        # Verify parent_order is passed for precise matching
+        _, kwargs = self.m["setup_fill_handler"].call_args
+        assert "parent_order" in kwargs and kwargs["parent_order"] is not None
 
     def test_exit_handler_attached_for_approved_signals(self):
         """setup_exit_handler must be called for risk-approved signals."""
@@ -239,3 +255,14 @@ class TestStreamingPipeline:
         kwargs = self.m["evaluate"].call_args[1]
         assert "current_price" in kwargs
         assert kwargs["current_price"] > 0, "current_price must not be 0"
+
+    def test_sector_injected_into_candidates(self):
+        """Sector from universe must be injected into screener candidates."""
+        sig = _make_signal(ticker="TECH")
+        _setup_mocks(self.m, [sig], risk_approved=[True], sectors=["Technology"])
+
+        _run_cycle(self.m)
+
+        # The signal passed to evaluate should have sector in indicator_values
+        evaluated_signal = self.m["evaluate"].call_args[0][0]
+        assert evaluated_signal.indicator_values.get("sector") == "Technology"

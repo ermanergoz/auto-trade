@@ -17,7 +17,7 @@ from config.settings import (
 )
 from core.models import Signal, Position, Trade, Action, TradeType
 from core.screener import screen_stocks
-from core.risk import evaluate, RiskResult
+from core.risk import evaluate, RiskResult, calculate_realized_volatility
 from core.data import get_historical_data_yfinance
 
 logger = logging.getLogger(__name__)
@@ -42,12 +42,18 @@ class SimulatedPortfolio:
         if self.cash == 0:
             self.cash = self.initial_capital
 
-    @property
-    def portfolio_value(self) -> float:
+    def portfolio_value_mtm(self, current_prices: dict[str, float] | None = None) -> float:
+        """Mark-to-market portfolio value using current prices when available."""
         position_value = sum(
-            p.entry_price * p.quantity for p in self.positions
+            current_prices.get(p.ticker, p.entry_price) * p.quantity
+            if current_prices else p.entry_price * p.quantity
+            for p in self.positions
         )
         return self.cash + position_value
+
+    @property
+    def portfolio_value(self) -> float:
+        return self.portfolio_value_mtm()
 
     @property
     def daily_pnl(self) -> float:
@@ -93,8 +99,11 @@ class SimulatedPortfolio:
         if not pos:
             return None
 
-        # Apply slippage on exit
-        adjusted_exit = exit_price * (1 - self.slippage_pct / 100)
+        # Apply slippage on exit (direction depends on position side)
+        if pos.quantity > 0:  # long: selling, slippage lowers exit price
+            adjusted_exit = exit_price * (1 - self.slippage_pct / 100)
+        else:  # short: buying back, slippage raises exit price
+            adjusted_exit = exit_price * (1 + self.slippage_pct / 100)
         self.cash += adjusted_exit * pos.quantity - self.commission
 
         trade = Trade(
@@ -132,13 +141,22 @@ def _check_exits(portfolio: SimulatedPortfolio, day_data: dict[str, pd.Series], 
         low = bar["low"]
         high = bar["high"]
 
-        # Stop-loss hit — fill at the worse of stop price or bar low (gap-down)
-        if low <= pos.stop_loss:
-            actual_exit = min(low, pos.stop_loss)
-            to_close.append((pos.ticker, actual_exit, "stop-loss"))
-        # Take-profit hit — limit order fills at target price
-        elif high >= pos.take_profit:
-            to_close.append((pos.ticker, pos.take_profit, "take-profit"))
+        if pos.quantity > 0:  # Long position
+            # Stop-loss hit — fill at the worse of stop price or bar low (gap-down)
+            if low <= pos.stop_loss:
+                actual_exit = min(low, pos.stop_loss)
+                to_close.append((pos.ticker, actual_exit, "stop-loss"))
+            # Take-profit hit — limit order fills at target price
+            elif high >= pos.take_profit:
+                to_close.append((pos.ticker, pos.take_profit, "take-profit"))
+        else:  # Short position
+            # Stop-loss hit — fill at worse of stop price or bar high (gap-up)
+            if high >= pos.stop_loss:
+                actual_exit = max(high, pos.stop_loss)
+                to_close.append((pos.ticker, actual_exit, "stop-loss"))
+            # Take-profit hit — limit order fills at target price
+            elif low <= pos.take_profit:
+                to_close.append((pos.ticker, pos.take_profit, "take-profit"))
 
     for ticker, exit_price, reason in to_close:
         trade = portfolio.close_position(ticker, exit_price, bar_date)
@@ -165,6 +183,8 @@ class BacktestConfig:
     commission: float = BACKTEST_COMMISSION
     use_ai: bool = False  # AI analysis is expensive; default to screener-only
     min_screener_score: float = 15.0
+    indicator_weights: dict[str, float] | None = None
+    use_volatility_scaling: bool = False
 
 
 def run_backtest(config: BacktestConfig) -> SimulatedPortfolio:
@@ -259,20 +279,40 @@ def run_backtest(config: BacktestConfig) -> SimulatedPortfolio:
                 exchange = "SMART"
                 stock_data[ticker] = (exchange, hist)
 
-        # Step 3: Run screener
-        candidates = screen_stocks(stock_data, min_score=config.min_screener_score)
+        # Step 3: Run screener (with optional indicator weights)
+        candidates = screen_stocks(
+            stock_data, min_score=config.min_screener_score,
+            indicator_weights=config.indicator_weights,
+        )
 
         if not candidates:
             portfolio.record_equity(current_date)
             continue
 
+        # Step 3b: Calculate realized volatility for position scaling
+        market_volatility = None
+        if config.use_volatility_scaling:
+            # Use the first available stock's close series as a market proxy
+            for ticker, df in all_data.items():
+                if isinstance(df.index, pd.DatetimeIndex):
+                    hist = df[df.index.date < current_date]
+                else:
+                    hist = df[df.index < current_date]
+                if len(hist) >= 21:
+                    market_volatility = calculate_realized_volatility(hist["close"])
+                    break
+
         # Step 4: Risk check and execute
+        # Use mark-to-market prices for accurate portfolio value
+        current_prices = {t: bar["close"] for t, bar in day_data.items()}
+        mtm_value = portfolio.portfolio_value_mtm(current_prices)
         for signal in candidates:
             result = evaluate(
                 signal,
                 portfolio.positions,
-                portfolio.portfolio_value,
+                mtm_value,
                 portfolio.daily_pnl,
+                volatility=market_volatility,
             )
             if not result.approved:
                 continue
