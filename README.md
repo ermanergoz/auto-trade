@@ -2,7 +2,7 @@
 
 An automated stock trading system that day-trades and swing-trades US (NYSE/NASDAQ) equities through Interactive Brokers. The system uses a two-stage pipeline: a fast technical screener filters hundreds of stocks, then a local AI model (via Ollama) performs deep analysis on all qualifying candidates. A risk manager gates every trade before execution through IBKR.
 
-Financial sector stocks (banks, insurance, lending companies) are automatically excluded from all trading.
+Financial sector stocks (banks, insurance, lending companies) and defense/military stocks (weapons, ammunition, combat systems) are automatically excluded from all trading.
 
 ---
 
@@ -36,7 +36,7 @@ Financial sector stocks (banks, insurance, lending companies) are automatically 
 - **US market focus**: Trades US (NYSE/NASDAQ) equities through IBKR with 10 different scanner types for broad market coverage
 - **Two-stage screening pipeline**: Technical screener (fast, free) filters hundreds of stocks, then AI analyst performs deep analysis on all qualifying candidates
 - **AI-powered analysis**: Local LLM via Ollama (Qwen 2.5 7B by default) -- no API keys, no cost, fully offline
-- **Comprehensive risk management**: Position sizing, daily loss limits, sector concentration limits, mandatory stop-losses, and duplicate position prevention
+- **Comprehensive risk management**: Position sizing, daily loss limits, sector concentration limits, mandatory stop-losses, duplicate position prevention, defense/financial sector exclusion, and circuit breaker
 - **Bracket order execution**: Automatic stop-loss and take-profit orders attached to every trade via IBKR bracket orders
 - **Day and swing trading**: Automatic end-of-day position closing for day trades, trailing stops for swing trades
 - **Backtesting engine**: Replay historical data through the exact same strategy code with configurable slippage and commission modeling
@@ -45,7 +45,7 @@ Financial sector stocks (banks, insurance, lending companies) are automatically 
 - **SQLite persistence**: Full audit trail of positions, trades, signals, and daily summaries
 - **Paper trading by default**: Live mode requires explicit opt-in with confirmation prompt
 - **Market hours awareness**: Respects US (16:30-23:00 TRT) trading hours
-- **Connection resilience**: Automatic reconnection to IBKR on connection drops with retry logic
+- **Connection resilience**: Automatic reconnection to IBKR on connection drops with retry logic; realtime subscriptions are properly cleaned up on disconnect to prevent callback leaks
 - **IBC Watchdog mode**: Optional auto-start of IB Gateway with automatic reconnection after daily restarts via IBC
 - **GTC bracket orders**: Orders placed outside market hours persist and execute at market open
 - **Zero AI cost**: Runs AI analysis locally via Ollama -- no cloud API fees
@@ -117,7 +117,7 @@ Each scan cycle (every 15 minutes by default) executes the following pipeline:
 2. **Market hours check** -- Determine if the US market is currently open
 3. **Universe building** -- Build/load the tradeable stock list (cached daily) using 10 IBKR scanner types, enrich each stock with sector data via a 3-tier fallback chain (IBKR contract details -> yfinance -> Ollama LLM), classify ETFs by category (equity ETFs kept, bond/leveraged/commodity ETFs excluded), then filter out financial sector stocks and apply liquidity thresholds. Typical result: ~200-350 unique stocks
 4. **Data fetching** -- Fetch historical OHLCV data for all stocks in the universe from IBKR (or YFinance fallback)
-5. **Technical screening** -- Run 6 technical indicators on every stock, score candidates, and pass all qualifying stocks (above min_score) to AI analysis
+5. **Technical screening** -- Run 6 technical indicators on every stock, score candidates, inject sector data from the universe into each candidate's indicator values (so risk checks can enforce sector limits), and pass all qualifying stocks (above min_score) to AI analysis
 6. **AI analysis** -- Send each candidate to the local LLM (via Ollama) with price action, indicators, and news context; receive structured trade recommendations with confidence scores
 7. **Risk evaluation** -- Pass every AI-approved signal through 12 risk checks (short selling block, position size, daily loss, max positions, stop-loss, sector concentration, no duplicates, excluded sector, risk/reward, anti-momentum, trend confirmation, circuit breaker)
 8. **Order execution** -- Place bracket orders (entry + stop-loss + take-profit) through IBKR for approved signals
@@ -510,11 +510,13 @@ The screener runs 6 technical indicators on every stock in the universe and scor
 | **MA Crossover (5,20)** | MA5 crosses above MA20 (golden cross) | MA5 crosses below MA20 (death cross) |
 | **Volume Spike** | Volume > 2x 20-day average (confirms moves) | Volume > 2x 20-day average (confirms moves) |
 | **Bollinger Bands (20,2)** | Price below lower band (oversold) | Price above upper band (overbought) |
-| **Support/Resistance** | Price within 2% of support level | Price within 2% of resistance level |
+| **Support/Resistance** | Price within 2% of support level (only if intraday low hasn't breached support) | Price within 2% of resistance level |
 
 ### Scoring
 
-Each triggered indicator contributes to the candidate's score. The screener counts buy signals vs sell signals, determines the dominant direction, and calculates a confidence score (0-100). All stocks scoring above the minimum threshold (default: 15) are passed to the AI analyst — there is no hard cap on the number of candidates.
+Each triggered indicator contributes to the candidate's score using configurable weights (`INDICATOR_WEIGHTS` in settings). The screener counts buy signals vs sell signals weighted by indicator importance, determines the dominant direction, and calculates a confidence score (0-100). Opposing signals actively reduce the score (net_score = direction - opposing), preventing conflicting indicators from producing falsely confident signals. All stocks scoring above the minimum threshold (default: 15) are passed to the AI analyst — there is no hard cap on the number of candidates.
+
+Indicator weights can be tuned per-indicator (e.g., `{"RSI": 2.0, "MACD": 0.5}`) to emphasize indicators with higher predictive power. Weights default to 1.0 (equal weighting). Setting a weight to 0.0 effectively disables that indicator's contribution to the score.
 
 Stop-loss and take-profit levels are calculated using ATR (Average True Range) for volatility-adjusted sizing.
 
@@ -529,7 +531,8 @@ The AI analyst performs deep analysis on each screener candidate using a local L
 For each candidate, the analyst gathers:
 - **5-day price action**: Recent OHLCV data showing price movement
 - **Technical indicator values**: All computed indicator values from the screener
-- **News headlines**: Top 5 recent news articles via Tavily API (falls back to yfinance if Tavily is unavailable or rate-limited)
+- **News headlines**: Top 5 recent news articles via yfinance (free, no rate limits), falling back to Tavily API when yfinance returns nothing
+- **Macro/political headlines**: Top 5 broad market political, regulatory, and macroeconomic headlines via Tavily (shared across all candidates, fetched once per scan cycle)
 - **Sector context**: Current sector performance
 
 ### Structured Output
@@ -543,9 +546,12 @@ The LLM returns a structured JSON response:
   "entry_price": 150.25,
   "stop_loss": 145.75,
   "take_profit": 160.00,
-  "reasoning": "Strong bullish MACD crossover with volume confirmation..."
+  "reasoning": "Strong bullish MACD crossover with volume confirmation...",
+  "trade_type": "swing"
 }
 ```
+
+Response validation checks all required fields including `trade_type` (must be "day" or "swing"). JSON parse errors (`KeyError`, `JSONDecodeError`) from Ollama are caught with specific log messages and trigger retries.
 
 ### Filtering
 
@@ -566,17 +572,23 @@ Every trade must pass through **all 12 risk checks** before execution. If any ch
 | Check | Rule | Default |
 |-------|------|---------|
 | **Short Selling Block** | Sell signals for stocks not currently held are blocked | Blocked (configurable) |
-| **Position Size** | Single position cannot exceed X% of portfolio value | 5% |
-| **Daily Loss Limit** | Halt all trading if daily P&L drops below -X% | 2% |
-| **Max Open Positions** | Cannot exceed N concurrent open positions | 10 |
+| **Position Size** | Single position cannot exceed X% of portfolio value | 50% |
+| **Daily Loss Limit** | Halt all trading if daily P&L drops below -X% | 10% |
+| **Max Open Positions** | Cannot exceed N concurrent open positions | 3 |
 | **Stop-Loss Required** | Every trade must have a valid stop-loss order | Required |
-| **Sector Concentration** | No sector can exceed X% of total portfolio | 25% |
+| **Sector Concentration** | No sector can exceed X% of total portfolio | 50% |
 | **No Duplicates** | Cannot open a second position in an already-held stock | Enforced |
+| **Excluded Sector** | Block financial sector, defense/military stocks, and explicitly excluded tickers | Enforced |
+| **Anti-Momentum** | Reject if price already moved >X% from signal entry (rejects invalid prices) | 8% |
+| **Trend Confirmation** | Moving averages must align with trade direction | MA5 > MA10 > MA20 |
+| **Risk/Reward Ratio** | Take-profit/stop-loss ratio must exceed minimum (rejects invalid prices) | 1.5:1 |
 | **Circuit Breaker** | Pause trading after N consecutive losses within a time window | 3 losses / 60 min |
+
+> **Note**: These defaults are tuned for a small account ($500). For larger accounts, see [docs/RISK-TUNING.md](docs/RISK-TUNING.md) for recommended values at different account sizes.
 
 ### Stale Order Re-evaluation
 
-Unfilled limit orders are re-evaluated at the start of every scan cycle. If an order has been pending longer than `STALE_ORDER_MINUTES` (default: 24 hours), the system fetches fresh data and re-runs the technical screener on that stock. Orders that no longer pass screening are automatically cancelled (cancelling the parent entry order also cancels its attached stop-loss and take-profit children). Orders that still pass are kept alive. Telegram notifications are sent for each cancellation.
+Unfilled limit orders are re-evaluated at the start of every scan cycle. If an order has been pending longer than `STALE_ORDER_MINUTES` (default: 24 hours), the system fetches fresh data and re-runs the technical screener on that stock. Orders that no longer pass screening are automatically cancelled (cancelling the parent entry order also cancels its attached stop-loss and take-profit children). Orders that still pass are kept alive. Telegram notifications are sent for each cancellation. In dry-run mode, the cancelled-order counter only increments for actual cancellations.
 
 Order placement timestamps are persisted in the `pending_orders` database table to survive IBKR reconnections (the `ib_insync` trade log resets on every reconnect, which would otherwise make all orders appear brand new). Records are cleaned up automatically when orders fill or are cancelled.
 
@@ -584,7 +596,9 @@ Order placement timestamps are persisted in the `pending_orders` database table 
 
 Position size is calculated using the more conservative of two methods:
 1. **Max position method**: `portfolio_value * MAX_POSITION_SIZE_PCT / entry_price`
-2. **Risk-based method**: `(portfolio_value * 1%) / (entry_price - stop_loss)` -- limits risk to 1% of portfolio per trade using stop-loss distance
+2. **Risk-based method**: `(portfolio_value * RISK_PER_TRADE_PCT%) / (entry_price - stop_loss)` -- limits risk to 5% of portfolio per trade using stop-loss distance (default; was 1% for larger accounts)
+
+When volatility scaling is enabled (`use_volatility_scaling` in backtest config, or passing `volatility` to `evaluate()`), position sizes are scaled inversely to realized market volatility. High volatility → smaller positions, low volatility → base size (never increases beyond base to avoid leverage). The baseline annualized volatility is configurable via `VOLATILITY_BASELINE` (default: 20%).
 
 ---
 
@@ -613,6 +627,8 @@ The backtesting engine replays historical data through the **exact same** screen
 | Commission | $1/trade | Per-trade commission cost |
 | Initial capital | $100,000 | Starting portfolio value |
 | Warmup period | 60 days | Days skipped for indicator stabilization |
+| Indicator weights | Equal (1.0) | Per-indicator weight multipliers for scoring |
+| Volatility scaling | Off | Scale position sizes inversely to realized volatility |
 
 ### Performance Metrics
 
@@ -629,6 +645,18 @@ The backtest report includes:
 | **Average Trade Duration** | Mean holding period |
 | **Best/Worst Trade** | Largest single gain and loss |
 | **Total Trades** | Number of round-trip trades executed |
+
+### AI Value-Add Comparison
+
+The `compare_ai_value_add()` function compares screener-only vs screener+AI backtest results to measure whether the AI analyst adds or destroys value. It reports:
+
+| Metric | Description |
+|--------|-------------|
+| **Return Alpha** | Return difference (AI - screener-only) |
+| **Sharpe Alpha** | Risk-adjusted return difference |
+| **P&L Alpha** | Absolute profit difference |
+| **AI Filter Rate** | % of screener trades the AI filtered out |
+| **AI Adds Value** | Boolean: whether the AI improved returns |
 
 ### Example
 
@@ -761,7 +789,7 @@ pytest tests/ --cov=core --cov=backtest --cov=notifications
 | `test_portfolio.py` | Database CRUD operations, position lifecycle |
 | `test_universe.py` | Universe building, financial sector filtering, caching |
 | `test_screener.py` | Technical indicator calculations, scoring, signal generation |
-| `test_analyst.py` | LLM integration, response validation, cost tracking |
+| `test_analyst.py` | LLM integration, response validation (including `trade_type`), cost tracking |
 | `test_risk.py` | All 12 risk checks, cumulative risk, sector concentration, circuit breaker |
 | `test_scheduler.py` | Streaming pipeline, fill handler ordering, exit tracking |
 | `test_telegram.py` | Status commands, portfolio display, risk notifications |
@@ -846,13 +874,13 @@ This system is designed with multiple layers of safety:
 
 3. **Mandatory stop-losses** -- Every trade placed through the system has a stop-loss order attached via IBKR bracket orders. Trades without valid stop-losses are rejected by the risk manager.
 
-4. **Daily loss limit** -- If the portfolio's daily P&L drops below -2% (configurable), all trading is automatically halted for the remainder of the day.
+4. **Daily loss limit** -- If the portfolio's daily P&L (realized + unrealized) drops below -2% (configurable), all trading is automatically halted for the remainder of the day.
 
 5. **Position size limits** -- No single position can exceed 5% of portfolio value (configurable). Position sizing also accounts for stop-loss distance to limit risk to 1% of portfolio per trade.
 
 6. **Sector concentration limits** -- No single sector can exceed 25% of the portfolio, preventing over-concentration.
 
-7. **Duplicate position prevention** -- The system will not open a second position in a stock that is already held.
+7. **Duplicate position prevention** -- The system will not open a second position in a stock that is already held. This is enforced at both the risk manager level (check before approval) and the database level (guard in `add_position` prevents duplicate inserts from race conditions).
 
 8. **Day trade auto-close** -- Day trade positions are automatically closed 15 minutes before market close to prevent unintended overnight exposure.
 
@@ -862,13 +890,17 @@ This system is designed with multiple layers of safety:
 
 11. **Financial sector exclusion** -- Banks, insurance companies, and lending institutions are permanently excluded from the trading universe.
 
+11b. **Defense/military exclusion** -- Defense contractors, weapons manufacturers, and military equipment companies are permanently excluded from the trading universe.
+
 12. **Non-equity ETF exclusion** -- Bond ETFs, leveraged/inverse ETFs, commodity ETFs, and volatility products are automatically filtered out. Equity index ETFs (SPY, QQQ, etc.) are kept.
 
 13. **Circuit breaker** -- If the system takes 3 consecutive losing trades within 60 minutes (both configurable), all new trading is paused and a Telegram alert is sent. This catches regime changes, stale data, or systematic issues before the daily loss limit is hit.
 
-13. **3-tier sector fallback** -- Stock sector data is resolved through IBKR contract details, then yfinance, then Ollama LLM classification. Only stocks that fail all three are excluded.
+14. **3-tier sector fallback** -- Stock sector data is resolved through IBKR contract details, then yfinance, then Ollama LLM classification. Only stocks that fail all three are excluded.
 
-14. **News fallback** -- News headlines for AI context are fetched from Tavily API first, falling back to yfinance news when Tavily is unavailable or rate-limited.
+14. **News efficiency** -- Stock-specific news is fetched from yfinance first (free, no rate limits), falling back to Tavily only when yfinance returns nothing. Successful news is cached for 1 hour; failed fetches use a 60-second cache so retries happen sooner. This conserves Tavily API quota for macro/political headlines where it has no free alternative.
+
+15. **Macro/political awareness** -- The AI analyst evaluates broad market political, regulatory, and macroeconomic conditions (elections, trade wars, sanctions, Fed policy) as part of its 7-point checklist. Macro headlines are fetched once per scan cycle via Tavily and shared across all candidates.
 
 ---
 
@@ -892,8 +924,8 @@ This system is designed with multiple layers of safety:
 
 **"Pacing violation" errors**
 - IBKR limits historical data requests to 60 per 10 minutes
-- The system batches and caches requests, but very large universes may hit this limit
-- Reduce universe size or increase `SCAN_INTERVAL_MINUTES`
+- The system batches and caches requests, and the universe builder inserts a 0.05-second delay between `reqContractDetails` calls to stay within IBKR rate limits
+- Very large universes may still hit this limit -- reduce universe size or increase `SCAN_INTERVAL_MINUTES`
 
 ### AI Analyst Issues
 

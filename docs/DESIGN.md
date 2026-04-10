@@ -2,14 +2,14 @@
 
 ## Overview
 
-An automated stock trading system that day-trades and swing-trades US and Turkish (BIST) equities through Interactive Brokers. Uses technical indicators for broad market screening and LLM-powered analysis for final trade decisions. Excludes financial sector stocks.
+An automated stock trading system that day-trades and swing-trades US equities through Interactive Brokers. Uses technical indicators for broad market screening and LLM-powered analysis for final trade decisions. Excludes financial sector stocks.
 
 ## Broker & Account
 
 - **Broker**: Interactive Brokers (IBKR)
 - **API**: `ib_insync` Python library connecting to TWS or IB Gateway
 - **Paper trading first**, then small real money
-- **Single account** covering both US and BIST markets
+- **Single account** for US markets
 - Paper vs live toggle: same code, different IBKR connection port (7497 paper, 7496 live)
 
 ## Architecture
@@ -17,7 +17,7 @@ An automated stock trading system that day-trades and swing-trades US and Turkis
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │                        Scheduler                            │
-│  (Runs during BIST: 10:00-18:00 TRT, US: 16:30-23:00 TRT) │
+│  (Runs during US: 16:30-23:00 TRT)                         │
 └─────────┬───────────────────────────────────┬───────────────┘
           │                                   │
   ┌───────▼────────┐                 ┌────────▼───────┐
@@ -70,13 +70,13 @@ Orchestrates the trading loop. Runs on the local machine.
 - Detects which markets are open based on current time
 - Runs the full pipeline (screen -> analyze -> trade) on a configurable interval (e.g., every 15 minutes)
 - Handles graceful shutdown, market close procedures
-- Schedule: BIST 10:00-18:00 TRT, US 16:30-23:00 TRT (overlap ~16:30-18:00)
+- Schedule: US 16:30-23:00 TRT
 
 ### 2. Stock Universe Builder
 
 Builds the tradeable stock list, updated daily.
 
-- Pulls all available tickers from IBKR for US (NYSE, NASDAQ) and BIST exchanges
+- Pulls all available tickers from IBKR for US (NYSE, NASDAQ) exchanges
 - Filters OUT financial sector stocks (GICS sector "Financials" — banks, insurance, capital markets, consumer finance, mortgage/lending)
 - Applies liquidity filters: minimum average daily volume, minimum market cap
 - Caches the universe daily (doesn't change intraday)
@@ -85,10 +85,10 @@ Builds the tradeable stock list, updated daily.
 
 Provides price data and news.
 
-- **Price data (primary)**: IBKR historical data via `ib_insync` `reqHistoricalData()` — covers both US and BIST, no extra API needed
+- **Price data (primary)**: IBKR historical data via `ib_insync` `reqHistoricalData()` — no extra API needed
 - **Price data (backtest fallback)**: YFinance for bulk historical downloads when IBKR connection isn't available (backtest mode)
 - **Real-time quotes**: IBKR streaming market data via `reqMktData()` for active positions and screener hits
-- **News**: Tavily API for English news (US stocks), configurable for Turkish news sources
+- **News**: Tavily API for stock news, yfinance as free fallback
 - Caches aggressively to avoid redundant requests within a scan interval
 
 ### 4. Technical Screener
@@ -225,7 +225,7 @@ IBKR_PORT = 7497  # 7497=paper, 7496=live
 IBKR_CLIENT_ID = 1
 
 # Markets
-MARKETS = ["US", "BIST"]
+MARKETS = ["US"]
 EXCLUDED_SECTORS = ["Financials"]
 MIN_DAILY_VOLUME = 100_000
 MIN_MARKET_CAP = 50_000_000  # $50M
@@ -265,8 +265,8 @@ TELEGRAM_CHAT_ID = ""
 ## Key Decisions
 
 - **Build from scratch** rather than forking `daily_stock_analysis` — that repo's architecture is built for notifications, not execution, and has lots of Chinese-market-specific code
-- **IBKR as single broker** for both US and BIST markets
-- **IBKR as primary data source** — already connected for trading, provides both historical and real-time data for US and BIST. YFinance only as backtest fallback for bulk downloads. This eliminates an external dependency and avoids YFinance reliability issues.
+- **IBKR as single broker** for US markets
+- **IBKR as primary data source** — already connected for trading, provides both historical and real-time data for US stocks. YFinance only as backtest fallback for bulk downloads. This eliminates an external dependency and avoids YFinance reliability issues.
 - **Screener-then-AI pipeline** to keep LLM costs under ~$1/day
 - **SQLite** instead of PostgreSQL — simpler for a local single-user system
 - **Skip options for now** — add as a future milestone once stock trading is stable

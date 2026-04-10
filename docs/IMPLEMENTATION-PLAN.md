@@ -2,7 +2,7 @@
 
 ## Context
 
-This plan covers building an automated stock trading system from scratch in Python. The system targets both US (NYSE/NASDAQ) and Turkish (BIST) equities through a single Interactive Brokers account. The motivation is to automate a two-stage screening pipeline: a fast technical screener filters thousands of stocks down to ~20 candidates, then an LLM (Claude or GPT) performs deep analysis on only those candidates, keeping AI costs under ~$1/day. A risk manager gates every trade before execution.
+This plan covers building an automated stock trading system from scratch in Python. The system targets US (NYSE/NASDAQ) equities through Interactive Brokers. The motivation is to automate a two-stage screening pipeline: a fast technical screener filters thousands of stocks down to ~20 candidates, then an LLM (Claude or GPT) performs deep analysis on only those candidates, keeping AI costs under ~$1/day. A risk manager gates every trade before execution.
 
 The user is a capable developer with some trading experience who wants to start with paper trading, validate the system over 1-2 weeks, and then move to small real-money positions. Financial sector stocks are explicitly excluded. The system runs locally on the user's machine with SQLite for persistence and Telegram for notifications.
 
@@ -53,7 +53,7 @@ Create `.env.example` with placeholder keys for `ANTHROPIC_API_KEY`, `OPENAI_API
 ### Files to Create
 
 #### `config/settings.py`
-All configurable parameters as module-level constants. Include every setting from the spec: broker connection (host, port, client_id), market schedules (BIST 10:00-18:00 TRT, US 16:30-23:00 TRT), screening thresholds, risk limits, notification config. Load `.env` values via `python-dotenv`. Provide a `is_paper_mode()` helper that checks the port (7497=paper, 7496=live).
+All configurable parameters as module-level constants. Include every setting from the spec: broker connection (host, port, client_id), market schedule (US 16:30-23:00 TRT), screening thresholds, risk limits, notification config. Load `.env` values via `python-dotenv`. Provide a `is_paper_mode()` helper that checks the port (7497=paper, 7496=live).
 
 #### `config/.env`
 Actual API keys (gitignored). Copy from `.env.example`.
@@ -75,8 +75,8 @@ SQLite-backed portfolio tracker. Create tables on first run: `positions`, `trade
 
 #### `core/data.py`
 Market data service — IBKR is the primary data source for everything:
-- `get_historical_data(ib, contract, duration, bar_size)` — wraps `ib.reqHistoricalData()`. Works for both US and BIST contracts. Returns pandas DataFrame with OHLCV columns.
-- `get_historical_data_yfinance(ticker, period, interval)` — fallback for backtest mode when IBKR isn't connected. For BIST tickers, auto-appends `.IS` suffix.
+- `get_historical_data(ib, contract, duration, bar_size)` — wraps `ib.reqHistoricalData()`. Returns pandas DataFrame with OHLCV columns.
+- `get_historical_data_yfinance(ticker, period, interval)` — fallback for backtest mode when IBKR isn't connected.
 - `get_realtime_quote(ib, contract)` — requests snapshot from IBKR via `ib.reqMktData()`.
 - `subscribe_realtime(ib, contract, callback)` — streaming real-time data via IBKR.
 - `get_news(ticker, market)` — calls Tavily API for recent news headlines. Returns list of headline strings.
@@ -87,26 +87,26 @@ Market data service — IBKR is the primary data source for everything:
 - `connect(host, port, client_id)` — returns `ib_insync.IB()` instance. Handles connection timeout (10s default).
 - `disconnect(ib)` — clean shutdown.
 - `ensure_connected(ib)` — reconnects if connection dropped. IBKR drops connections after inactivity or TWS restart.
-- `create_contract(ticker, exchange)` — returns appropriate `ib_insync.Stock` contract. US stocks use "SMART" exchange; BIST stocks use "BIST" exchange with "TRY" currency.
+- `create_contract(ticker, exchange)` — returns appropriate `ib_insync.Stock` contract. US stocks use "SMART" exchange.
 - Important: TWS or IB Gateway must be running and configured to accept API connections on the correct port. This is a prerequisite the user must set up manually.
 
 #### `main.py`
 Entry point with `argparse`:
 - `--mode paper|live|backtest|dry-run` (default: paper)
-- `--market us|bist|all` (default: all)
+- `--market us` (default: us)
 - `--once` flag for single scan (useful for testing)
 - Validates settings, establishes IBKR connection (unless backtest mode), initializes portfolio DB, hands off to scheduler.
 
 ### Verification Steps
 1. `python main.py --mode paper --once` connects to TWS paper trading and prints account summary
-2. `core/data.py` unit test: fetch 30 days of AAPL and THYAO.IS data, verify DataFrame shape
+2. `core/data.py` unit test: fetch 30 days of AAPL data, verify DataFrame shape
 3. `core/portfolio.py` unit test: create DB, add/close position, verify trade record
-4. `core/connection.py` unit test: connect/disconnect to paper TWS, create US and BIST contracts
+4. `core/connection.py` unit test: connect/disconnect to paper TWS, create US contracts
 
 ### Critical Integration Notes
 - **TWS must be running**: The system cannot start without TWS or IB Gateway running. Document this clearly in README.
 - **API connection settings in TWS**: User must enable "Enable ActiveX and Socket Clients" in TWS API settings and set the socket port.
-- **BIST contract qualification**: BIST stocks may need `ib.qualifyContracts()` to resolve ambiguous contracts. Test with a known BIST ticker like THYAO.
+- **Contract qualification**: Some stocks may need `ib.qualifyContracts()` to resolve ambiguous contracts.
 
 ---
 
@@ -120,7 +120,7 @@ Entry point with `argparse`:
 
 #### `core/universe.py`
 Stock universe builder:
-- `build_universe(ib, markets)` — queries IBKR scanner for all stocks on NYSE, NASDAQ, BIST. Filters out financial sector (GICS sector code). Applies `MIN_DAILY_VOLUME` and `MIN_MARKET_CAP` filters from settings.
+- `build_universe(ib, markets)` — queries IBKR scanner for all stocks on NYSE, NASDAQ. Filters out financial sector (GICS sector code). Applies `MIN_DAILY_VOLUME` and `MIN_MARKET_CAP` filters from settings.
 - `cache_universe(stocks)` / `load_cached_universe()` — stores to/reads from a JSON file (`data/universe_{date}.json`). Only rebuilds once per day.
 - For IBKR scanning: use `ib.reqScannerSubscription()` with scan codes for each exchange, or `ib.reqScannerParameters()` to discover available scan types.
 - Fallback: if IBKR scanner is slow or limited, maintain a static ticker list seeded from YFinance's `Tickers` and filter via IBKR contract details for sector.
@@ -143,12 +143,11 @@ Technical screener using `pandas-ta`:
 1. Build universe for US market, verify financial sector stocks are excluded (spot-check: no JPM, BAC, GS)
 2. Run screener on a small subset (50 tickers), verify it produces candidates with valid indicator values
 3. Timing test: full US universe screen should complete within 5 minutes
-4. Verify BIST tickers resolve correctly (`.IS` suffix handling)
+4. Verify tickers resolve correctly via IBKR scanner
 
 ### Critical Integration Notes
 - **IBKR pacing rules**: Max 60 historical data requests per 10 minutes. Batch and cache aggressively. If pacing-limited, queue requests with delays.
-- **IBKR scanner limitations**: IBKR's scanner API has limited filtering capabilities for BIST. May need to maintain a manual BIST ticker list initially and filter by sector via contract details.
-- **Data quality**: Some BIST tickers may have sparse historical data. Handle missing data gracefully (skip ticker, log warning).
+- **IBKR scanner limitations**: The scanner API may not return all desired stocks. Static fallback ticker lists provide coverage when the scanner is unavailable.
 
 ---
 
@@ -227,7 +226,7 @@ Main orchestration loop:
   4. Pass approved signals through risk manager
   5. Execute approved trades
   6. Log everything
-- Market hours logic: BIST 10:00-18:00 TRT, US 16:30-23:00 TRT. During overlap (16:30-18:00), scan both.
+- Market hours logic: US 16:30-23:00 TRT.
 - End-of-day: 15 minutes before close, trigger `close_all_day_trades()`.
 - Graceful shutdown: catch SIGINT/SIGTERM, cancel pending orders, disconnect cleanly.
 
@@ -240,7 +239,7 @@ Main orchestration loop:
 
 ### Critical Integration Notes
 - **Bracket orders in IBKR**: `ib_insync` bracket orders require setting `parentId` on child orders. Use `ib.bracketOrder()` helper. Test carefully — incorrect bracket setup can leave orphaned stop-loss orders.
-- **Order types for BIST**: Verify that bracket orders work on BIST exchange. Some exchanges have restrictions on order types.
+- **Order types**: Verify that bracket orders work correctly on US exchanges.
 - **Fill timing**: IBKR fills are asynchronous. The executor must handle the case where a fill arrives while the system is processing other signals.
 - **Day trade close timing**: Account for potential delays. Start closing 15 minutes before close, but if fills are slow, may need to send market orders.
 - **Dry-run mode**: In dry-run, log the order that would be placed but do not call `ib.placeOrder()`. This is a simple flag check in `place_order()`.
@@ -428,17 +427,17 @@ Note: M5 and M6 can be worked on in parallel after M4 is complete.
 
 1. **IBKR Connection** (`core/connection.py`): The single most fragile integration. TWS/Gateway must be running, API connections enabled, correct port configured. Connection drops are common and must be handled gracefully. Test with paper account first (port 7497).
 
-2. **IBKR Bracket Orders** (`core/executor.py`): Bracket order setup with `ib_insync` requires correct parent/child order linking. Incorrect setup can result in orphaned orders. BIST exchange may have different order type support than US exchanges.
+2. **IBKR Bracket Orders** (`core/executor.py`): Bracket order setup with `ib_insync` requires correct parent/child order linking. Incorrect setup can result in orphaned orders.
 
-3. **IBKR Scanner/Universe** (`core/universe.py`): The scanner API has limitations, especially for BIST. May need a hybrid approach: IBKR scanner for US stocks, manual/alternative ticker list for BIST, with sector filtering via contract details.
+3. **IBKR Scanner/Universe** (`core/universe.py`): The scanner API has limitations. Uses a hybrid approach: IBKR scanner with static fallback ticker list, with sector filtering via contract details.
 
-4. **IBKR Historical Data Pacing** (`core/data.py`): IBKR limits to 60 historical data requests per 10 minutes. The screener must batch requests and cache results. For backtesting without IBKR, fall back to YFinance (BIST data via `.IS` suffix can be spotty).
+4. **IBKR Historical Data Pacing** (`core/data.py`): IBKR limits to 60 historical data requests per 10 minutes. The screener must batch requests and cache results. For backtesting without IBKR, fall back to YFinance.
 
 5. **LLM Structured Output** (`core/analyst.py`): Must use tool_use/function_calling for reliable JSON parsing. Free-text parsing will break. Retry logic is essential.
 
 6. **Backtester Code Reuse** (`backtest/engine.py`): The screener and risk manager must be written as pure functions that take data as input (not fetch it themselves) so the backtester can feed them historical data. This is an architectural constraint that must be enforced from Milestone 2 onward.
 
-7. **Market Hours + Time Zones**: All time logic must use Turkey time (TRT / Europe/Istanbul). Python's `zoneinfo` module handles this. Be careful with daylight saving transitions.
+7. **Market Hours + Time Zones**: All time logic uses Turkey time (TRT / Europe/Istanbul) since the developer is located there. Python's `zoneinfo` module handles this. Be careful with daylight saving transitions.
 
 ---
 
