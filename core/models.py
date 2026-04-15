@@ -105,7 +105,14 @@ class Trade:
     @property
     def duration(self) -> float:
         """Duration in hours."""
-        return (self.exit_time - self.entry_time).total_seconds() / 3600
+        entry = self.entry_time
+        exit_ = self.exit_time
+        if (entry.tzinfo is None) != (exit_.tzinfo is None):
+            if entry.tzinfo is None:
+                entry = entry.replace(tzinfo=timezone.utc)
+            else:
+                exit_ = exit_.replace(tzinfo=timezone.utc)
+        return (exit_ - entry).total_seconds() / 3600
 
 
 @dataclass

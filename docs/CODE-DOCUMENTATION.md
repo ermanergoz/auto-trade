@@ -199,7 +199,7 @@ Trade:
   - exit_price, exit_time
   - pnl → computed: (exit_price - entry_price) * quantity
   - pnl_pct → computed: percentage gain/loss (guards against zero entry_price)
-  - duration → computed: how long we held it
+  - duration → computed: how long we held it (handles mixed tz-aware/naive datetimes from DB rows or backtest deserializers)
 ```
 
 ### Other models
