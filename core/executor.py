@@ -469,12 +469,17 @@ def setup_exit_handler(ib: IB, signal: Signal, on_exit=None, parent_order=None) 
     ib.orderStatusEvent += on_order_status
 
 
-def setup_disconnect_handler(ib: IB) -> None:
+def setup_disconnect_handler(ib: IB, reconnect: bool = True) -> None:
     """Set up handler for connection drops.
 
     Skips reconnect during shutdown and uses a guard to prevent
     re-entrant reconnect loops. Clears realtime subscription tracking
     since IBKR drops all subscriptions on disconnect.
+
+    Args:
+        reconnect: If False, skip manual reconnect (use when Watchdog manages
+                   reconnection — manual reconnect competes with the watchdog
+                   and fails with "clientId already in use").
     """
     _reconnecting = threading.Event()
 
@@ -487,6 +492,10 @@ def setup_disconnect_handler(ib: IB) -> None:
         # IBKR drops all subscriptions on disconnect — clear tracking
         # so they can be re-established after reconnect
         clear_realtime_subscriptions(ib)
+        if not reconnect:
+            logger.warning("IBKR connection lost — watchdog will handle reconnect")
+            _reconnecting.clear()
+            return
         logger.warning("IBKR connection lost! Attempting reconnect...")
         try:
             ensure_connected(ib)

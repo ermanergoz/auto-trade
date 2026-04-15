@@ -172,6 +172,10 @@ def run_scan_cycle(
             continue
 
         # Step 1: Fetch data for all stocks
+        if not ib.isConnected():
+            logger.error("IBKR disconnected after universe build — aborting scan for %s", market)
+            notify_error("Scan aborted: IBKR disconnected after universe build")
+            return summary
         update_status("fetching_data", f"{len(market_stocks)} stocks for {market}")
         stock_data = _fetch_market_data(ib, market_stocks)
         sector_lookup = {s.ticker: s.sector for s in market_stocks}
@@ -417,6 +421,10 @@ def _fetch_market_data(
     """
     import pandas as pd
 
+    if not ib.isConnected():
+        logger.error("IBKR not connected — skipping data fetch for %d stocks", len(stocks))
+        return {}
+
     stock_data: dict[str, tuple[str, pd.DataFrame]] = {}
 
     for stock in stocks:
@@ -448,14 +456,19 @@ def start_scheduler(
     markets: list[str],
     mode: str = "paper",
     force: bool = False,
+    reconnect: bool = True,
 ) -> None:
     """Start the scan loop using ib_insync's event loop.
 
     Uses ib.sleep() instead of APScheduler so all IBKR calls stay on the
     main thread's asyncio event loop (ib_insync requirement).
+
+    Args:
+        reconnect: Passed to setup_disconnect_handler. Set False when the
+                   Watchdog manages reconnection to avoid competing reconnects.
     """
 
-    setup_disconnect_handler(ib)
+    setup_disconnect_handler(ib, reconnect=reconnect)
 
     # Graceful shutdown
     def shutdown(signum, frame):
