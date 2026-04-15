@@ -947,6 +947,10 @@ pending_orders (tracks unfilled order placement times):
 
 ### Key Operations
 
+**`init_db(db_path)`** — Creates all tables and indexes if they don't exist. Uses individual `conn.execute()` calls (not `executescript()`) so connection-level PRAGMAs such as `foreign_keys=ON` are never silently reset by an implicit commit.
+
+**`verify_db(db_path)`** — Called immediately after `init_db()` at startup. Queries `sqlite_master` for every required table and raises `RuntimeError` if any are missing, giving a clear error message rather than a cryptic "no such table" failure later during trading. Protects against silent `init_db` failures (e.g., disk full, permission error swallowed by a bug).
+
 **`add_position(position)`** — When a trade fills, save it to the positions table. Checks for an existing position with the same ticker before inserting to prevent duplicate positions (e.g., from a race condition where two fills arrive back-to-back for the same stock).
 
 **`close_position(ticker, exit_price)`** — When closing a trade:

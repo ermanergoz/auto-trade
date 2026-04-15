@@ -33,82 +33,94 @@ def _db_connection(db_path: Path = DB_PATH):
         conn.close()
 
 
+_TABLES = [
+    """CREATE TABLE IF NOT EXISTS positions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ticker TEXT NOT NULL,
+        exchange TEXT NOT NULL,
+        quantity INTEGER NOT NULL,
+        entry_price REAL NOT NULL,
+        entry_time TEXT NOT NULL,
+        stop_loss REAL NOT NULL,
+        take_profit REAL NOT NULL,
+        trade_type TEXT NOT NULL,
+        sector TEXT DEFAULT '',
+        created_at TEXT DEFAULT (datetime('now'))
+    )""",
+    """CREATE TABLE IF NOT EXISTS trades (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ticker TEXT NOT NULL,
+        exchange TEXT NOT NULL,
+        quantity INTEGER NOT NULL,
+        entry_price REAL NOT NULL,
+        exit_price REAL NOT NULL,
+        entry_time TEXT NOT NULL,
+        exit_time TEXT NOT NULL,
+        trade_type TEXT NOT NULL,
+        sector TEXT DEFAULT '',
+        reasoning TEXT DEFAULT '',
+        created_at TEXT DEFAULT (datetime('now'))
+    )""",
+    """CREATE TABLE IF NOT EXISTS daily_summary (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        date TEXT NOT NULL UNIQUE,
+        portfolio_value REAL NOT NULL,
+        daily_pnl REAL NOT NULL,
+        daily_pnl_pct REAL NOT NULL,
+        num_trades INTEGER NOT NULL,
+        winning_trades INTEGER DEFAULT 0,
+        losing_trades INTEGER DEFAULT 0
+    )""",
+    """CREATE TABLE IF NOT EXISTS signals (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ticker TEXT NOT NULL,
+        action TEXT NOT NULL,
+        confidence REAL NOT NULL,
+        entry_price REAL NOT NULL,
+        stop_loss REAL NOT NULL,
+        take_profit REAL NOT NULL,
+        reasoning TEXT DEFAULT '',
+        source TEXT NOT NULL,
+        exchange TEXT DEFAULT '',
+        trade_type TEXT DEFAULT 'day',
+        timestamp TEXT NOT NULL,
+        created_at TEXT DEFAULT (datetime('now'))
+    )""",
+    """CREATE TABLE IF NOT EXISTS pending_orders (
+        perm_id INTEGER PRIMARY KEY,
+        ticker TEXT NOT NULL,
+        placed_at TEXT NOT NULL
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_positions_ticker ON positions(ticker)",
+    "CREATE INDEX IF NOT EXISTS idx_trades_ticker ON trades(ticker)",
+    "CREATE INDEX IF NOT EXISTS idx_trades_exit_time ON trades(exit_time)",
+    "CREATE INDEX IF NOT EXISTS idx_signals_timestamp ON signals(timestamp)",
+]
+
+_REQUIRED_TABLES = {"positions", "trades", "daily_summary", "signals", "pending_orders"}
+
+
 def init_db(db_path: Path = DB_PATH) -> None:
     """Create all tables if they don't exist."""
     with _db_connection(db_path) as conn:
-        # executescript() issues an implicit COMMIT which resets
-        # connection-level PRAGMAs like foreign_keys=ON. Re-enable after.
-        conn.executescript("""
-            CREATE TABLE IF NOT EXISTS positions (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                ticker TEXT NOT NULL,
-                exchange TEXT NOT NULL,
-                quantity INTEGER NOT NULL,
-                entry_price REAL NOT NULL,
-                entry_time TEXT NOT NULL,
-                stop_loss REAL NOT NULL,
-                take_profit REAL NOT NULL,
-                trade_type TEXT NOT NULL,
-                sector TEXT DEFAULT '',
-                created_at TEXT DEFAULT (datetime('now'))
-            );
-
-            CREATE TABLE IF NOT EXISTS trades (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                ticker TEXT NOT NULL,
-                exchange TEXT NOT NULL,
-                quantity INTEGER NOT NULL,
-                entry_price REAL NOT NULL,
-                exit_price REAL NOT NULL,
-                entry_time TEXT NOT NULL,
-                exit_time TEXT NOT NULL,
-                trade_type TEXT NOT NULL,
-                sector TEXT DEFAULT '',
-                reasoning TEXT DEFAULT '',
-                created_at TEXT DEFAULT (datetime('now'))
-            );
-
-            CREATE TABLE IF NOT EXISTS daily_summary (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                date TEXT NOT NULL UNIQUE,
-                portfolio_value REAL NOT NULL,
-                daily_pnl REAL NOT NULL,
-                daily_pnl_pct REAL NOT NULL,
-                num_trades INTEGER NOT NULL,
-                winning_trades INTEGER DEFAULT 0,
-                losing_trades INTEGER DEFAULT 0
-            );
-
-            CREATE TABLE IF NOT EXISTS signals (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                ticker TEXT NOT NULL,
-                action TEXT NOT NULL,
-                confidence REAL NOT NULL,
-                entry_price REAL NOT NULL,
-                stop_loss REAL NOT NULL,
-                take_profit REAL NOT NULL,
-                reasoning TEXT DEFAULT '',
-                source TEXT NOT NULL,
-                exchange TEXT DEFAULT '',
-                trade_type TEXT DEFAULT 'day',
-                timestamp TEXT NOT NULL,
-                created_at TEXT DEFAULT (datetime('now'))
-            );
-
-            CREATE TABLE IF NOT EXISTS pending_orders (
-                perm_id INTEGER PRIMARY KEY,
-                ticker TEXT NOT NULL,
-                placed_at TEXT NOT NULL
-            );
-
-            CREATE INDEX IF NOT EXISTS idx_positions_ticker ON positions(ticker);
-            CREATE INDEX IF NOT EXISTS idx_trades_ticker ON trades(ticker);
-            CREATE INDEX IF NOT EXISTS idx_trades_exit_time ON trades(exit_time);
-            CREATE INDEX IF NOT EXISTS idx_signals_timestamp ON signals(timestamp);
-        """)
-        # Re-enable FK enforcement after executescript's implicit COMMIT
-        conn.execute("PRAGMA foreign_keys=ON")
+        for stmt in _TABLES:
+            conn.execute(stmt)
     logger.info("Database initialized at %s", db_path)
+
+
+def verify_db(db_path: Path = DB_PATH) -> None:
+    """Raise RuntimeError if any required table is missing."""
+    with _db_connection(db_path) as conn:
+        rows = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()
+    existing = {r["name"] for r in rows}
+    missing = _REQUIRED_TABLES - existing
+    if missing:
+        raise RuntimeError(
+            f"Database is missing tables after init: {sorted(missing)}. "
+            f"Delete {db_path} and restart to rebuild."
+        )
 
 
 # ---------------------------------------------------------------------------

@@ -14,7 +14,7 @@ from config.settings import (
     IBC_PATH, IBC_INI, TWS_PATH, TWS_VERSION, IBC_USERID, IBC_PASSWORD,
 )
 from core.connection import connect, disconnect, get_account_summary
-from core.portfolio import init_db
+from core.portfolio import init_db, verify_db
 
 console = Console()
 logger = logging.getLogger("auto_trader")
@@ -251,6 +251,7 @@ def main() -> None:
 
     # Initialize database
     init_db()
+    verify_db()
     logger.info("Portfolio database initialized")
 
     # Backtest mode doesn't need IBKR connection
