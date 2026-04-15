@@ -40,7 +40,7 @@ class TestDailyLossLimit:
         assert ok is True
 
     def test_fails_beyond_limit(self):
-        ok, reason = check_daily_loss_limit(-3000, 100_000)
+        ok, reason = check_daily_loss_limit(-3000, 100_000, limit_pct=2.0)
         assert ok is False
         assert "halted" in reason.lower()
 
@@ -52,14 +52,14 @@ class TestDailyLossLimit:
 class TestMaxPositions:
     def test_passes_under_limit(self):
         sig = _make_signal()
-        positions = [_make_position() for _ in range(5)]
-        ok, _ = check_max_positions(sig, positions)
+        positions = [_make_position(ticker=f"STK{i}") for i in range(5)]
+        ok, _ = check_max_positions(sig, positions, max_positions=10)
         assert ok is True
 
     def test_fails_at_limit(self):
         sig = _make_signal()
-        positions = [_make_position() for _ in range(10)]
-        ok, reason = check_max_positions(sig, positions)
+        positions = [_make_position(ticker=f"STK{i}") for i in range(10)]
+        ok, reason = check_max_positions(sig, positions, max_positions=10)
         assert ok is False
         assert "10/10" in reason
 
@@ -116,10 +116,15 @@ class TestNoDuplicate:
 
 class TestPositionSizing:
     def test_basic_sizing(self):
+        from unittest.mock import patch
+
         sig = _make_signal(entry_price=150.0, stop_loss=145.0)
-        qty = calculate_position_size(sig, 100_000)
+        # Pin RISK_PER_TRADE_PCT so risk-based sizing is the binding constraint.
+        # risk = 1% of $100k = $1000; stop distance = $5; qty_by_risk = 200.
+        # max_pct=5% → qty_by_size = $5000 / $150 = 33. min(33, 200) = 33.
+        with patch("core.risk.RISK_PER_TRADE_PCT", 1.0):
+            qty = calculate_position_size(sig, 100_000, max_pct=5.0)
         assert qty > 0
-        # Max position 5% = $5000 / $150 = 33 shares
         assert qty <= 33
 
     def test_zero_portfolio(self):
@@ -137,8 +142,12 @@ class TestFullEvaluation:
         assert result.reasons == []
 
     def test_rejected_daily_loss(self):
+        from config.settings import DAILY_LOSS_LIMIT_PCT
+
         sig = _make_signal()
-        result = evaluate(sig, [], 100_000, -3000)
+        # Loss exceeds the configured daily limit regardless of config value
+        loss = -(100_000 * DAILY_LOSS_LIMIT_PCT / 100) - 500
+        result = evaluate(sig, [], 100_000, loss)
         assert result.approved is False
         assert any("halted" in r.lower() for r in result.reasons)
 
@@ -178,10 +187,13 @@ class TestCumulativeRisk:
         assert "cumulative risk" in reason.lower()
 
     def test_passes_with_no_existing_positions(self):
+        from unittest.mock import patch
         from core.risk import check_cumulative_risk
 
         sig = _make_signal(entry_price=100.0, stop_loss=97.0)
-        ok, reason = check_cumulative_risk(sig, [], 100_000, limit_pct=2.0)
+        # risk_per_trade = 1% of $100k = $1000; new_risk = $1000 < $2000 limit.
+        with patch("core.risk.RISK_PER_TRADE_PCT", 1.0):
+            ok, _ = check_cumulative_risk(sig, [], 100_000, limit_pct=2.0)
         assert ok is True
 
     def test_cumulative_risk_included_in_evaluate(self):
