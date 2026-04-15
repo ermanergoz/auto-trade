@@ -320,10 +320,15 @@ def handle_fill(
         logger.warning("Ignoring fill with invalid quantity %d for %s", quantity, signal.ticker)
         return None
 
+    # IBKR reports filled quantity as positive regardless of side.
+    # For a short entry (SELL parent), store negative quantity so P&L
+    # math, reconciliation, and exit-side selection stay consistent.
+    signed_quantity = -quantity if signal.action == Action.SELL else quantity
+
     position = Position(
         ticker=signal.ticker,
         exchange=signal.exchange,
-        quantity=quantity,
+        quantity=signed_quantity,
         entry_price=fill_price,
         entry_time=datetime.now(timezone.utc),
         stop_loss=signal.stop_loss,
