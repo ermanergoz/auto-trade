@@ -92,6 +92,27 @@ def test_trade_losing():
     assert trade.duration == 24.0
 
 
+def test_trade_duration_mixed_tz():
+    """A Trade with one tz-aware and one tz-naive datetime must not crash.
+
+    Backtest deserializers and DB rows can yield either flavor; the property
+    should normalize before subtracting.
+    """
+    from datetime import timezone
+    trade = Trade(
+        ticker="AAPL",
+        exchange="SMART",
+        quantity=1,
+        entry_price=100.0,
+        exit_price=110.0,
+        entry_time=datetime(2024, 1, 15, 10, 0, tzinfo=timezone.utc),
+        exit_time=datetime(2024, 1, 15, 14, 0),  # naive
+        trade_type=TradeType.DAY,
+    )
+    # Must not raise TypeError on naive/aware subtraction
+    assert trade.duration == 4.0
+
+
 def test_enums():
     assert Action.BUY.value == "buy"
     assert Action.SELL.value == "sell"
