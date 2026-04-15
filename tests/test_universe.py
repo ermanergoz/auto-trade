@@ -13,6 +13,7 @@ from core.universe import (
     _fill_missing_sectors,
     _filter_universe,
     _is_excluded_sector,
+    _scan_ibkr,
     _static_fallback,
     cache_universe,
     load_cached_universe,
@@ -384,3 +385,65 @@ class TestGetTickersForMarket:
         ]
         us = get_tickers_for_market(universe, "US")
         assert len(us) == 2
+
+
+class TestScannerTimeout:
+    """Regression: a hung reqScannerData call used to freeze build_universe
+    for hours. Each scanner call must be bounded by a timeout so one bad
+    scan can't stall the rest."""
+
+    def _make_ib_with_scans(self, scan_behaviors):
+        """Build a fake IB whose reqScannerDataAsync follows a list of behaviors.
+
+        Each behavior is either:
+          - a list of mock items (returned normally)
+          - the string "hang" (simulates indefinite block via TimeoutError)
+        """
+        import asyncio
+
+        ib = MagicMock()
+        call_idx = {"i": 0}
+
+        async def fake_scan_async(sub):
+            idx = call_idx["i"]
+            call_idx["i"] += 1
+            behavior = scan_behaviors[idx] if idx < len(scan_behaviors) else []
+            if behavior == "hang":
+                await asyncio.sleep(60)  # longer than any sane timeout
+            return behavior
+
+        ib.reqScannerDataAsync = fake_scan_async
+        return ib, call_idx
+
+    def test_hanging_scanner_does_not_block_subsequent_scans(self):
+        """If scanner #3 hangs, scanners #4..#10 must still run."""
+        # Scanner 3 hangs; the other 9 return one result each (different tickers).
+        behaviors = []
+        for i in range(10):
+            if i == 2:
+                behaviors.append("hang")
+            else:
+                item = MagicMock()
+                item.contractDetails.contract.symbol = f"TICK{i}"
+                item.contractDetails.contract.currency = "USD"
+                item.contractDetails.contract.primaryExchange = "NASDAQ"
+                item.contractDetails.industry = "Technology"
+                item.contractDetails.category = ""
+                item.contractDetails.longName = f"Test {i}"
+                behaviors.append([item])
+
+        ib, counter = self._make_ib_with_scans(behaviors)
+
+        # With a short timeout, the hanging scanner must be abandoned and the
+        # rest of the scans must complete. The whole call should finish in
+        # well under 30s — proving it's bounded, not hanging for hours.
+        import time
+        start = time.monotonic()
+        result = _scan_ibkr(ib, "US", scan_timeout=0.5)
+        elapsed = time.monotonic() - start
+
+        assert elapsed < 10, f"_scan_ibkr took {elapsed}s — not bounded"
+        assert counter["i"] == 10, f"Only {counter['i']}/10 scanners ran"
+        tickers = {s.ticker for s in result}
+        # 9 good scanners returned unique tickers
+        assert len(tickers) == 9

@@ -1,5 +1,6 @@
 """Stock universe builder — discovers tradeable tickers, filters financials."""
 
+import asyncio
 import json
 import logging
 import urllib.request
@@ -8,7 +9,7 @@ from pathlib import Path
 from typing import Optional
 
 import yfinance as yf
-from ib_insync import IB, Stock, ScannerSubscription
+from ib_insync import IB, Stock, ScannerSubscription, util
 
 from config.settings import (
     AI_MODEL, DATA_DIR, EXCLUDED_COUNTRIES, EXCLUDED_SECTORS, EXCLUDED_TICKERS,
@@ -80,8 +81,16 @@ def build_universe(
     return all_stocks
 
 
-def _scan_ibkr(ib: IB, market: str) -> list[StockInfo]:
-    """Use IBKR scanner to get stocks for a market."""
+SCAN_TIMEOUT_SECONDS = 15.0
+
+
+def _scan_ibkr(ib: IB, market: str, scan_timeout: float = SCAN_TIMEOUT_SECONDS) -> list[StockInfo]:
+    """Use IBKR scanner to get stocks for a market.
+
+    Each scanner request is bounded by scan_timeout seconds. A hung scanner
+    is abandoned so subsequent scans still run — we saw the whole loop freeze
+    for hours when reqScannerData blocked indefinitely on the 3rd scanner.
+    """
     stocks: list[StockInfo] = []
 
     if market == "US":
@@ -113,7 +122,19 @@ def _scan_ibkr(ib: IB, market: str) -> list[StockInfo]:
                 scanCode=scan_code,
                 numberOfRows=50,
             )
-            results = ib.reqScannerData(sub)
+            async def _run_scan():
+                return await asyncio.wait_for(
+                    ib.reqScannerDataAsync(sub), timeout=scan_timeout,
+                )
+
+            try:
+                results = util.run(_run_scan())
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "IBKR scanner %s timed out after %.1fs — skipping",
+                    scan_code, scan_timeout,
+                )
+                continue
 
             added = 0
             for item in results:
