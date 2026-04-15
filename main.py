@@ -209,7 +209,7 @@ def run_watchdog_mode(args: argparse.Namespace, markets: list[str]) -> None:
 
             console.print("\n[cyan]Starting scheduler...[/cyan]")
             from core.scheduler import start_scheduler
-            start_scheduler(_ib, markets, mode=args.mode, force=args.force)
+            start_scheduler(_ib, markets, mode=args.mode, force=args.force, reconnect=False)
         else:
             logger.info("Watchdog reconnected to IBKR after gateway restart")
             from notifications.telegram import update_status
