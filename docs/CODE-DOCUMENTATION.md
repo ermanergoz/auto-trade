@@ -369,6 +369,11 @@ Step 2: Ask IBKR to scan the market using 10 different scanner types:
    - TOP_TRADE_COUNT     (most individual trades)
    - TOP_TRADE_RATE      (fastest rate of trades)
 
+   Each scanner call is bounded by a 15-second timeout (SCAN_TIMEOUT_SECONDS).
+   If IBKR hangs on one scanner (observed to block indefinitely in production),
+   that scan is skipped and the remaining scanners continue. This prevents a
+   single stuck scanner from freezing the entire universe build for hours.
+
 Step 3: Combine all results and remove duplicates.
         A stock that appears in 3 different scanners still only appears once.
         Typical result: ~200-350 unique stocks
