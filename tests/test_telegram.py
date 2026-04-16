@@ -196,6 +196,49 @@ class TestNotifyRiskResults:
 # TestConfidenceThreshold
 # ---------------------------------------------------------------------------
 
+class TestStatusRefreshesBeforeResponse:
+    """When user asks for /status, data must be refreshed from DB first."""
+
+    @patch("notifications.telegram.refresh_positions_cache")
+    @patch("notifications.telegram._send_sync")
+    @patch("notifications.telegram._get_updates_sync")
+    def test_status_command_triggers_refresh(self, mock_updates, mock_send, mock_refresh):
+        """Receiving 'status' must call refresh_positions_cache before responding."""
+        from notifications.telegram import _poll_loop, _stop_event, _system_status
+
+        _system_status["phase"] = "waiting"
+        _system_status["mode"] = "paper"
+
+        # Simulate one update with 'status', then stop the loop
+        mock_msg = MagicMock()
+        mock_msg.text = "status"
+        mock_msg.chat_id = "123"
+
+        mock_update = MagicMock()
+        mock_update.update_id = 1
+        mock_update.message = mock_msg
+
+        call_count = 0
+        def side_effect(offset=None):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return [mock_update]
+            _stop_event.set()
+            return []
+
+        mock_updates.side_effect = side_effect
+        mock_send.return_value = True
+
+        with patch("notifications.telegram.TELEGRAM_CHAT_ID", "123"):
+            _stop_event.clear()
+            _poll_loop()
+
+        # refresh_positions_cache must have been called before the response
+        mock_refresh.assert_called_once()
+        mock_send.assert_called_once()
+
+
 class TestConfidenceThreshold:
     """Test that confidence threshold is 65."""
 
@@ -228,3 +271,82 @@ class TestUpdatePortfolioData:
         assert _system_status["account"] == account
         assert _system_status["positions"] == positions
         assert _system_status["daily_pnl"] == 123.45
+
+
+class TestRefreshPositionsCache:
+    """Test that refresh_positions_cache reads DB and updates the cache."""
+
+    @patch("core.portfolio.get_daily_pnl", return_value=42.0)
+    @patch("core.portfolio.get_open_positions")
+    def test_refreshes_from_db(self, mock_get_pos, mock_get_pnl):
+        from notifications.telegram import refresh_positions_cache, _system_status
+
+        fake_pos = [_make_position(ticker="INTC")]
+        mock_get_pos.return_value = fake_pos
+
+        # Pre-populate with stale data
+        _system_status["positions"] = [_make_position(ticker="SYRE")]
+        _system_status["account"] = {}
+
+        refresh_positions_cache()
+
+        assert _system_status["positions"] == fake_pos
+        assert _system_status["positions"][0].ticker == "INTC"
+        mock_get_pos.assert_called_once()
+        mock_get_pnl.assert_called_once()
+
+
+class TestThreadSafety:
+    """Verify _system_status is protected by a lock for thread-safe access."""
+
+    def test_status_lock_exists(self):
+        """A threading.Lock must protect _system_status access."""
+        import notifications.telegram as tg
+        assert hasattr(tg, "_status_lock"), (
+            "_system_status must be protected by a _status_lock"
+        )
+
+    def test_concurrent_update_and_read_no_torn_state(self):
+        """Concurrent writes and reads must not produce inconsistent state.
+
+        This verifies that update_portfolio_data and _build_status_response
+        don't mix old and new values when called from different threads.
+        """
+        import threading
+        from notifications.telegram import (
+            update_portfolio_data, _build_status_response, _system_status,
+        )
+
+        _system_status["phase"] = "scan_complete"
+        _system_status["mode"] = "paper"
+        errors = []
+
+        account_a = {"NetLiquidation": 100_000.0, "TotalCashValue": 60_000.0,
+                      "GrossPositionValue": 40_000.0, "UnrealizedPnL": 0.0}
+        account_b = {"NetLiquidation": 200_000.0, "TotalCashValue": 120_000.0,
+                      "GrossPositionValue": 80_000.0, "UnrealizedPnL": 0.0}
+
+        def writer():
+            for _ in range(200):
+                update_portfolio_data(account_a, [], 100.0)
+                update_portfolio_data(account_b, [], 200.0)
+
+        def reader():
+            for _ in range(200):
+                resp = _build_status_response()
+                # If we see account_a's NLV, daily_pnl must be account_a's too
+                if "$100,000.00" in resp and "+200.00" in resp:
+                    errors.append("Torn read: account_a NLV with account_b pnl")
+                if "$200,000.00" in resp and "+100.00" in resp:
+                    errors.append("Torn read: account_b NLV with account_a pnl")
+
+        threads = [
+            threading.Thread(target=writer),
+            threading.Thread(target=reader),
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert errors == [], f"Torn reads detected: {errors[:5]}"

@@ -12,6 +12,7 @@ from core.models import Trade, DailySummary, Signal
 logger = logging.getLogger(__name__)
 
 # Shared system state for status responses
+_status_lock = threading.Lock()
 _system_status = {
     "phase": "initializing",
     "mode": "",
@@ -26,8 +27,9 @@ _system_status = {
 
 def update_status(phase: str, detail: str = "") -> None:
     """Update the current system status (called from scheduler/main)."""
-    _system_status["phase"] = phase
-    _system_status["detail"] = detail
+    with _status_lock:
+        _system_status["phase"] = phase
+        _system_status["detail"] = detail
 
 
 def _run_async(coro):
@@ -82,9 +84,26 @@ def _is_status_command(text: str) -> bool:
 
 def update_portfolio_data(account: dict, positions: list, daily_pnl: float) -> None:
     """Cache portfolio data for status responses (called from scheduler)."""
-    _system_status["account"] = account
-    _system_status["positions"] = positions
-    _system_status["daily_pnl"] = daily_pnl
+    with _status_lock:
+        _system_status["account"] = account
+        _system_status["positions"] = positions
+        _system_status["daily_pnl"] = daily_pnl
+
+
+def refresh_positions_cache() -> None:
+    """Re-read positions from DB and update the cache.
+
+    Call this after a position is opened/closed outside the scan cycle
+    (e.g. async stop-loss fill) so /status reflects reality immediately.
+    """
+    from core.portfolio import get_open_positions, get_daily_pnl
+    positions = get_open_positions()
+    with _status_lock:
+        unrealized = (_system_status.get("account") or {}).get("UnrealizedPnL", 0.0)
+    daily_pnl = get_daily_pnl(unrealized_pnl=unrealized)
+    with _status_lock:
+        _system_status["positions"] = positions
+        _system_status["daily_pnl"] = daily_pnl
 
 
 def _build_status_response() -> str:
@@ -93,9 +112,12 @@ def _build_status_response() -> str:
     tz = ZoneInfo(TIMEZONE)
     now = datetime.now(tz).strftime("%H:%M:%S")
 
-    phase = _system_status["phase"]
-    detail = _system_status["detail"]
-    mode = _system_status["mode"]
+    with _status_lock:
+        status_snapshot = dict(_system_status)
+
+    phase = status_snapshot["phase"]
+    detail = status_snapshot["detail"]
+    mode = status_snapshot["mode"]
 
     lines = [f"<b>Status</b> ({now})"]
 
@@ -125,7 +147,7 @@ def _build_status_response() -> str:
         lines.append(f"Detail: {detail}")
 
     # Account summary
-    account = _system_status.get("account")
+    account = status_snapshot.get("account")
     if account:
         lines.append("")
         lines.append("<b>Account</b>")
@@ -138,12 +160,12 @@ def _build_status_response() -> str:
         lines.append(f"Invested: ${invested:,.2f}")
         lines.append(f"Unrealized P&L: ${unrealized:+,.2f}")
 
-    daily_pnl = _system_status.get("daily_pnl")
+    daily_pnl = status_snapshot.get("daily_pnl")
     if daily_pnl is not None:
         lines.append(f"Daily P&L (realized): ${daily_pnl:+,.2f}")
 
     # Open positions
-    positions = _system_status.get("positions")
+    positions = status_snapshot.get("positions")
     if positions:
         lines.append("")
         lines.append(f"<b>Open Positions ({len(positions)})</b>")
@@ -155,7 +177,7 @@ def _build_status_response() -> str:
             lines.append(line)
 
     # Last scan summary
-    last = _system_status.get("last_summary")
+    last = status_snapshot.get("last_summary")
     if last:
         lines.append(f"\nLast scan: {last}")
 
@@ -190,6 +212,12 @@ def _poll_loop() -> None:
 
                 text = msg.text.strip()
                 if _is_status_command(text):
+                    # Refresh from DB so the response reflects the latest state,
+                    # not just what was cached at the last scan cycle
+                    try:
+                        refresh_positions_cache()
+                    except Exception as e:
+                        logger.debug("Position cache refresh failed: %s", e)
                     response = _build_status_response()
                     _send_sync(response)
 
@@ -233,7 +261,8 @@ def send_message(text: str) -> bool:
 
 def notify_startup(mode: str, account_summary: dict) -> bool:
     """Send startup notification with account info."""
-    _system_status["mode"] = mode
+    with _status_lock:
+        _system_status["mode"] = mode
     nlv = account_summary.get("NetLiquidation", 0)
     cash = account_summary.get("TotalCashValue", 0)
     text = (
@@ -247,7 +276,7 @@ def notify_startup(mode: str, account_summary: dict) -> bool:
 
 def notify_shutdown() -> bool:
     """Send shutdown notification."""
-    update_status("shutting_down")
+    update_status("shutting_down")  # already lock-protected
     return _send_sync("<b>System Stopped</b>\n\nTrader has been shut down.")
 
 
@@ -366,7 +395,8 @@ def notify_scan_summary(
         f"Candidates: {candidates} | AI approved: {ai_approved} | "
         f"Risk approved: {risk_approved} | Orders: {orders_placed}"
     )
-    _system_status["last_summary"] = summary_line
+    with _status_lock:
+        _system_status["last_summary"] = summary_line
 
     text = (
         f"\U0001f50d <b>Scan Complete</b>\n\n"
