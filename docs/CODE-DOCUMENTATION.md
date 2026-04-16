@@ -260,7 +260,7 @@ CIRCUIT_BREAKER_WINDOW_MIN = 60     # Within this many minutes
 
 These values are tuned for a small account ($500). For larger accounts, tighten them back — see [RISK-TUNING.md](RISK-TUNING.md) for a full comparison table and scaling guide.
 
-The risk manager also includes a **cumulative risk check** that ensures total open risk (all positions' max loss via stop-loss) stays within the daily loss limit. This prevents a scenario where 3 positions each sized at 5% risk = 15% total risk, exceeding the 10% daily limit.
+The risk manager also includes a **cumulative risk check** that ensures total open risk (all positions' max loss via stop-loss) stays within the daily loss limit. It uses the actual calculated position size (which reflects volatility scaling) rather than re-estimating from config, ensuring accurate risk assessment when position sizes are adjusted down. This prevents a scenario where 3 positions each sized at 5% risk = 15% total risk, exceeding the 10% daily limit.
 
 A **`validate_settings()`** function validates all configuration at startup and rejects invalid values (e.g., port not 7496/7497, negative ratios, zero positions).
 
@@ -798,13 +798,17 @@ This is **atomic** — all three orders are placed as a unit. You never end up w
 
 **`close_position_market(ib, position, dry_run)`** — Immediately close a position with a market order. Derives the closing action from the position's quantity sign (SELL for long, BUY for short). Used when day-trade positions need to be closed before market close.
 
-**`close_all_day_trades(ib, positions, dry_run)`** — Called 15 minutes before market close. Finds all positions marked as DAY trades and closes them with market orders. After placing all close orders, uses `monitor_orders()` with a 30-second timeout to wait for fills, and logs at ERROR level for any that haven't filled yet — critical because unfilled orders mean positions stay open overnight.
+**`close_all_day_trades(ib, positions, dry_run)`** — Called 15 minutes before market close. Finds all positions marked as DAY trades, cancels ALL open orders for those tickers at IBKR (unfilled parents AND orphaned TP/SL children from already-filled brackets) to prevent race conditions, then closes each position with a market order. After fill verification via `monitor_orders()` (30-second timeout), records each close in the portfolio DB via `db_close_position()` at the actual fill price. Logs at ERROR level for any unfilled orders — critical because unfilled orders mean positions stay open overnight.
 
 **`handle_fill(signal, quantity, fill_price)`** — Records a filled order in the SQLite database. Returns `None` if the fill quantity is zero or negative, preventing phantom positions from being recorded. IBKR always reports filled quantity as a positive integer regardless of trade direction. For short entries (SELL side), the stored quantity is negated so that P&L math `(exit − entry) × qty`, position reconciliation, and close-side selection all work correctly without special-casing shorts.
 
 **`setup_fill_handler(ib, signal, quantity, on_fill)`** — Attaches an async callback to handle entry order fills. Only processes parent entry orders (`parentId == 0`) matching the signal's ticker — child orders (take-profit, stop-loss) are handled by `setup_exit_handler` instead. Uses a `fired` flag to ensure each handler instance fires at most once, preventing duplicate position recording when multiple signals for the same ticker are active. When the parent order status changes to "Filled", it records the position in the database, calls the optional `on_fill` callback, and deregisters itself from `ib.orderStatusEvent` to prevent handler accumulation across scan cycles. The post-fill logic (handle_fill, remove_pending_order, callback, unsubscribe) is wrapped in try/finally to ensure the event handler is always cleaned up even if a callback raises an exception. Also logs warnings for partial fills (when filled_qty < requested quantity). The scheduler attaches this handler BEFORE placing the order to avoid a race condition where fast fills fire before the handler is registered.
 
 **`setup_exit_handler(ib, signal, on_exit)`** — Attaches a callback to handle exit order fills (take-profit and stop-loss). When a child order fills, it closes the position in the database via `portfolio.close_position()`, which also writes to the CSV trade journal. Logs a warning if the exit fill cannot be matched to a database position (e.g., position already closed or missing). Warns when `parent_order_id` is missing on the exit trade, as this risks cross-bracket interference (matching the wrong bracket's exit to a position). Calls the optional `on_exit` callback for Telegram notifications. Uses try/finally to ensure the event handler is always deregistered even if callback errors occur.
+
+**`import_ibkr_positions(ib, orphaned_tickers)`** — Imports IBKR positions that exist at the broker but not in the DB. Reads `avgCost` and quantity from `ib.positions()`, extracts stop-loss (STP/STP LMT child orders) and take-profit (LMT child orders) from `ib.openTrades()`. Positions without bracket orders get SL/TP defaulted to 0. Trade type defaults to SWING since the original intent is unknown.
+
+**`reattach_exit_handlers(ib)`** — Called at startup to re-register exit handlers for existing bracket orders. In-memory event handlers don't survive bot restarts, so this function scans `ib.openTrades()` for child orders (stop-loss/take-profit) that match open DB positions and attaches fresh exit handlers with Telegram cache refresh callbacks. Deduplicates by parent order ID so each bracket gets exactly one handler (not one per child), preventing duplicate `db_close_position` calls when a bracket has both TP and SL children. Returns the number of handlers attached. Uses `make_on_exit()` factory to avoid closure variable capture issues in the loop.
 
 **`setup_disconnect_handler(ib, reconnect=True)`** — Attaches a callback for connection drops. Important because IBKR connections are notoriously unstable. Uses a re-entrancy guard (`_reconnecting` flag) to prevent cascading reconnect loops where a reconnect triggers another disconnect event. Calls `clear_realtime_subscriptions()` to reset subscription tracking after IBKR drops connections, preventing stale callbacks from the old connection from accumulating. Reads the shared `shutting_down` flag from `core.state` to skip reconnection during intentional shutdown (avoiding the circular import that would result from importing directly from `scheduler.py`). When `reconnect=False`, manual reconnect is skipped entirely — used in Watchdog mode where IBC manages the gateway restart; a competing manual reconnect fails with "clientId already in use".
 
@@ -978,6 +982,8 @@ pending_orders (tracks unfilled order placement times):
 
 **`remove_pending_order(perm_id)`** — Deletes a pending order record. Called from `cancel_bracket_order()`, `cancel_order()`, and `setup_fill_handler()` when orders are cancelled or filled.
 
+**`reconcile_positions(ibkr_positions, auto_fix=False)`** — Compares DB positions against IBKR's live positions. Returns a reconciliation report with orphaned positions (in DB only or IBKR only) and quantity mismatches. When `auto_fix=True`, automatically closes orphaned DB positions by recording them as trades at entry price (actual fill price is unknown). Called at startup with `auto_fix=True` to sync state after restarts where stop-loss/take-profit orders may have filled while the bot was offline.
+
 ### Transaction Safety
 
 All database operations use Python's context manager pattern:
@@ -1064,6 +1070,8 @@ The system runs a background listener thread that polls for incoming Telegram me
 
 This runs on a daemon thread so it doesn't interfere with trading. The polling uses Telegram's long-polling with a 10-second timeout, so responses come within seconds.
 
+The status data is served from an in-memory cache (`_system_status`) updated at scan cycle start and on position changes. `refresh_positions_cache()` re-reads the DB and updates the cache immediately — called by exit handlers after stop-loss/take-profit fills so `/status` reflects reality without waiting for the next scan cycle.
+
 ### Design
 
 Notifications are fire-and-forget. If Telegram is down or the token is missing, the error is logged but the system keeps trading. Notifications are nice-to-have, not critical path.
@@ -1095,9 +1103,11 @@ Day-by-day replay:
 
 For each trading day in the date range:
   1. CHECK EXITS — Do any open positions hit their stop-loss or take-profit?
-     Look at today's high and low:
+     Look at today's open, high, and low:
        - If high >= take_profit → close at take_profit (win!)
-       - If low <= stop_loss → close at stop_loss (loss)
+       - If low <= stop_loss → close at stop_loss, using realistic fill:
+         * Gap scenario (open already past stop) → fill at open price
+         * Intraday scenario (open above stop, low dips below) → fill at stop price
 
   2. BUILD DATA — Gather all price history UP TO today (not including future!)
      This is critical: NO LOOK-AHEAD BIAS.
@@ -1109,7 +1119,8 @@ For each trading day in the date range:
 
   5. SIMULATE FILL — "Buy" at today's close price + slippage
 
-  6. RECORD EQUITY — Write down portfolio value at end of day
+  6. RECORD EQUITY — Write down portfolio value at end of day (mark-to-market
+     using current closing prices, not entry prices)
 
 After all days:
   Close any remaining open positions at last day's close
@@ -1121,8 +1132,8 @@ After all days:
 This is the #1 sin of backtesting: accidentally using future data to make past decisions. Our protection:
 
 ```python
-# Only use data up to current date
-historical = full_data[full_data.index <= current_date]
+# Only use data BEFORE current date (strict <, not <=)
+historical = full_data[full_data.index.date < current_date]
 candidates = screen_stocks(historical)  # screener only sees past
 ```
 
@@ -1132,9 +1143,11 @@ The screener genuinely doesn't know what happens tomorrow.
 
 An in-memory portfolio that tracks:
 - Cash remaining
-- Open positions
+- Open positions (long positions have positive quantity, short positions have negative quantity)
 - Closed trades
 - Equity curve (portfolio value at end of each day)
+
+Short positions are handled correctly: opening a short credits cash (sale proceeds), closing a short debits cash (buying back), and P&L is calculated via `(exit_price - entry_price) * quantity` where negative quantity inverts the sign as expected.
 
 No SQLite needed — it's all in memory since it's just a simulation.
 
@@ -1246,9 +1259,24 @@ This prevents accidentally trading with real money.
 6. If --watchdog → start IBC Watchdog (starts gateway, connects, monitors) → start scheduler on connect
 7. Otherwise → connect to IBKR directly (gateway must already be running)
 8. Display account summary
-9. If --once → run single scan cycle → exit
-10. Otherwise → start scheduler loop (runs until Ctrl+C)
+9. Reconcile positions (auto-fix: close orphaned DB positions not held at IBKR)
+10. Reattach exit handlers for existing bracket orders (survives restarts)
+11. Start Telegram listener + update portfolio cache
+12. If --once → run single scan cycle → exit
+13. Otherwise → start scheduler loop (runs until Ctrl+C)
 ```
+
+### Position Sync on Startup
+
+The bot's internal state (SQLite) can drift from IBKR's actual state when the bot is offline while stop-loss or take-profit orders fill. Three mechanisms keep them in sync:
+
+1. **Auto-fix reconciliation** (`reconcile_positions(auto_fix=True)`): Compares DB positions against IBKR's live positions. Any DB position not found at IBKR is automatically closed at the position's stop-loss price (the best available estimate of the actual fill). This ensures that daily P&L, loss limits, and circuit breaker checks reflect the estimated loss rather than recording $0 P&L.
+
+2. **Import orphaned IBKR positions** (`import_ibkr_positions(ib, orphaned_tickers)`): Positions held at IBKR but missing from the DB are automatically imported. Entry price comes from IBKR's `avgCost`, and stop-loss/take-profit are extracted from open bracket child orders. This handles cases where the DB was cleared, positions were opened manually, or the bot missed a fill event.
+
+3. **Exit handler reattachment** (`reattach_exit_handlers(ib)`): After reconciliation, scans `ib.openTrades()` for child orders (stop-loss/take-profit) belonging to open DB positions and attaches fresh exit handlers. This ensures fills that occur after restart are caught in real-time instead of waiting for the next scan cycle.
+
+4. **Immediate cache refresh** (`refresh_positions_cache()`): When an exit handler fires (stop-loss or take-profit fills), the Telegram status cache is updated immediately from the DB — not just at the next scan cycle. Additionally, every `/status` command from Telegram triggers a fresh DB read before building the response, so the user always sees the latest positions and P&L. All writes and reads to the status cache are protected by a threading lock to prevent torn reads across the scheduler, executor, and Telegram listener threads.
 
 ---
 
@@ -1272,8 +1300,9 @@ Every module has its own test file. Tests use **synthetic data** — hand-built 
 | `test_models.py` | Dataclass construction, computed properties (P&L, duration) |
 | `test_universe.py` | Universe building, filtering, caching |
 | `test_scheduler.py` | Streaming signal pipeline, callback-based risk check + execution |
+| `test_executor.py` | Fill direction, exit handler reattachment on startup, IBKR position import |
 | `test_stale_orders.py` | Persistent order timestamps, stale detection, DB cleanup on fill/cancel |
-| `test_telegram.py` | Status commands, portfolio display, risk notifications |
+| `test_telegram.py` | Status commands, portfolio display, risk notifications, cache refresh |
 | `test_backtest.py` | Full backtest loop, exit checking, no look-ahead |
 
 ### Running Tests

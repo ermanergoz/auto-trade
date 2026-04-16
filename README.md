@@ -694,7 +694,7 @@ The Telegram bot sends real-time alerts for all trading activity.
 1. Create a Telegram bot via @BotFather (see [Prerequisites](#3-telegram-bot-for-notifications))
 2. Add `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` to your `.env` file
 3. Notifications are fire-and-forget -- Telegram failures will not crash the trading system
-4. **Interactive status**: Send "status" to the bot to get a detailed status update including portfolio value, cash, open positions, P&L, and current phase with AI analysis progress
+4. **Interactive status**: Send "status" to the bot to get a detailed status update including portfolio value, cash, open positions, P&L, and current phase with AI analysis progress. The response always refreshes from the database first so you see the latest data, not a stale cache
 
 ---
 
@@ -790,10 +790,12 @@ pytest tests/ --cov=core --cov=backtest --cov=notifications
 | `test_universe.py` | Universe building, financial sector filtering, caching |
 | `test_screener.py` | Technical indicator calculations, scoring, signal generation |
 | `test_analyst.py` | LLM integration, response validation (including `trade_type`), cost tracking |
-| `test_risk.py` | All 12 risk checks, cumulative risk, sector concentration, circuit breaker |
+| `test_risk.py` | All 13 risk checks, cumulative risk, sector concentration, circuit breaker, volatility scaling |
+| `test_executor.py` | Fill handling, exit handlers, bracket deduplication, day trade close with bracket cancellation, IBKR position import |
 | `test_scheduler.py` | Streaming pipeline, fill handler ordering, exit tracking |
 | `test_telegram.py` | Status commands, portfolio display, risk notifications |
-| `test_backtest.py` | Backtest engine, gap-down stops, look-ahead bias checks |
+| `test_backtest.py` | Backtest engine, MTM equity curve, realistic gap fills, short positions, look-ahead bias checks |
+| `test_stale_orders.py` | Stale order detection, re-screening, cancellation |
 | `test_settings.py` | Configuration validation at startup |
 
 ---
@@ -893,6 +895,8 @@ This system is designed with multiple layers of safety:
 11b. **Defense/military exclusion** -- Defense contractors, weapons manufacturers, and military equipment companies are permanently excluded from the trading universe.
 
 12. **Non-equity ETF exclusion** -- Bond ETFs, leveraged/inverse ETFs, commodity ETFs, and volatility products are automatically filtered out. Equity index ETFs (SPY, QQQ, etc.) are kept.
+
+13. **Startup position sync** -- On every startup (and reconnect), the bot fully syncs its database with IBKR: positions closed at IBKR while offline are recorded as trades at the stop-loss price (best estimate of actual fill), positions held at IBKR but missing from the DB are imported (with stop-loss/take-profit extracted from open bracket orders), and exit handlers are reattached for all existing orders.
 
 13. **Circuit breaker** -- If the system takes 3 consecutive losing trades within 60 minutes (both configurable), all new trading is paused and a Telegram alert is sent. This catches regime changes, stale data, or systematic issues before the daily loss limit is hit.
 
