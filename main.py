@@ -195,8 +195,34 @@ def run_watchdog_mode(args: argparse.Namespace, markets: list[str]) -> None:
             logger.info("Watchdog connected to IBKR")
             display_account_summary(summary)
 
+            # Sync DB with IBKR — close orphaned DB positions, import orphaned IBKR positions
+            from core.portfolio import reconcile_positions, get_open_positions, get_daily_pnl
+            from core.executor import reattach_exit_handlers, import_ibkr_positions
+            ibkr_positions = [
+                {"ticker": p.contract.symbol, "quantity": int(p.position)}
+                for p in _ib.positions()
+            ]
+            recon = reconcile_positions(ibkr_positions, auto_fix=True)
+            if recon["auto_closed"]:
+                console.print(
+                    f"[yellow]Auto-closed orphaned DB positions: {recon['auto_closed']} "
+                    f"(filled at IBKR while bot was offline)[/yellow]"
+                )
+            if recon["orphaned_ibkr"]:
+                imported = import_ibkr_positions(_ib, recon["orphaned_ibkr"])
+                if imported:
+                    console.print(
+                        f"[green]Imported IBKR positions into DB: {imported}[/green]"
+                    )
+            if recon["in_sync"] and not recon["auto_closed"]:
+                logger.info("Position reconciliation OK: %d in sync", recon["db_count"])
+
+            # Reattach exit handlers for existing bracket orders
+            reattached = reattach_exit_handlers(_ib)
+            if reattached:
+                console.print(f"[green]Reattached {reattached} exit handler(s) for existing orders[/green]")
+
             from notifications.telegram import notify_startup, start_listener, update_status, update_portfolio_data
-            from core.portfolio import get_open_positions, get_daily_pnl
             notify_startup(args.mode, summary)
             start_listener()
             update_status("startup_complete")
@@ -212,8 +238,24 @@ def run_watchdog_mode(args: argparse.Namespace, markets: list[str]) -> None:
             start_scheduler(_ib, markets, mode=args.mode, force=args.force, reconnect=False)
         else:
             logger.info("Watchdog reconnected to IBKR after gateway restart")
-            from notifications.telegram import update_status
+            # Re-reconcile on reconnect — fills may have occurred during disconnect
+            from core.portfolio import reconcile_positions, get_open_positions, get_daily_pnl
+            from core.executor import reattach_exit_handlers, import_ibkr_positions
+            ibkr_positions = [
+                {"ticker": p.contract.symbol, "quantity": int(p.position)}
+                for p in _ib.positions()
+            ]
+            recon = reconcile_positions(ibkr_positions, auto_fix=True)
+            if recon["auto_closed"]:
+                logger.warning("Auto-closed orphaned positions on reconnect: %s", recon["auto_closed"])
+            if recon["orphaned_ibkr"]:
+                import_ibkr_positions(_ib, recon["orphaned_ibkr"])
+
+            reattach_exit_handlers(_ib)
+
+            from notifications.telegram import update_status, update_portfolio_data
             update_status("reconnected", "Gateway restarted — reconnected")
+            update_portfolio_data(get_account_summary(_ib), get_open_positions(), get_daily_pnl())
 
     watchdog.startedEvent += on_connected
 
@@ -286,20 +328,32 @@ def main() -> None:
         summary = get_account_summary(ib)
         display_account_summary(summary)
 
-        # Reconcile positions with IBKR
+        # Sync DB with IBKR — close orphaned DB positions, import orphaned IBKR positions
         from core.portfolio import reconcile_positions, get_open_positions, get_daily_pnl
+        from core.executor import reattach_exit_handlers, import_ibkr_positions
         ibkr_positions = [
             {"ticker": p.contract.symbol, "quantity": int(p.position)}
             for p in ib.positions()
         ]
-        recon = reconcile_positions(ibkr_positions)
-        if not recon["in_sync"]:
+        recon = reconcile_positions(ibkr_positions, auto_fix=True)
+        if recon["auto_closed"]:
             console.print(
-                f"[yellow]Position mismatch: DB has {recon['orphaned_db']}, "
-                f"IBKR has {recon['orphaned_ibkr']}[/yellow]"
+                f"[yellow]Auto-closed orphaned DB positions: {recon['auto_closed']} "
+                f"(filled at IBKR while bot was offline)[/yellow]"
             )
-        else:
+        if recon["orphaned_ibkr"]:
+            imported = import_ibkr_positions(ib, recon["orphaned_ibkr"])
+            if imported:
+                console.print(
+                    f"[green]Imported IBKR positions into DB: {imported}[/green]"
+                )
+        if recon["in_sync"] and not recon["auto_closed"]:
             logger.info("Position reconciliation OK: %d in sync", recon["db_count"])
+
+        # Reattach exit handlers for existing bracket orders (survives restarts)
+        reattached = reattach_exit_handlers(ib)
+        if reattached:
+            console.print(f"[green]Reattached {reattached} exit handler(s) for existing orders[/green]")
 
         # Start Telegram notifications + listener
         from notifications.telegram import notify_startup, start_listener, update_status, update_portfolio_data

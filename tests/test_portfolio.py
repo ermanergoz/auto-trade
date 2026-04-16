@@ -172,7 +172,7 @@ class TestReconcilePositions:
         add_position(pos, db_path)
 
         ibkr_positions = [{"ticker": "AAPL", "quantity": pos.quantity}]
-        report = reconcile_positions(ibkr_positions, db_path)
+        report = reconcile_positions(ibkr_positions, db_path=db_path)
 
         assert report["in_sync"] is True
         assert report["orphaned_db"] == []
@@ -186,7 +186,7 @@ class TestReconcilePositions:
         add_position(pos, db_path)
 
         ibkr_positions = [{"ticker": "AAPL", "quantity": 100}]
-        report = reconcile_positions(ibkr_positions, db_path)
+        report = reconcile_positions(ibkr_positions, db_path=db_path)
 
         assert report["in_sync"] is False
         assert "AAPL" in report["qty_mismatches"]
@@ -200,7 +200,7 @@ class TestReconcilePositions:
         add_position(pos, db_path)
 
         ibkr_positions = []  # IBKR has nothing
-        report = reconcile_positions(ibkr_positions, db_path)
+        report = reconcile_positions(ibkr_positions, db_path=db_path)
 
         assert report["in_sync"] is False
         assert "AAPL" in report["orphaned_db"]
@@ -209,7 +209,7 @@ class TestReconcilePositions:
         from core.portfolio import reconcile_positions
 
         ibkr_positions = [{"ticker": "MSFT", "quantity": 50}]
-        report = reconcile_positions(ibkr_positions, db_path)
+        report = reconcile_positions(ibkr_positions, db_path=db_path)
 
         assert report["in_sync"] is False
         assert "MSFT" in report["orphaned_ibkr"]
@@ -217,5 +217,79 @@ class TestReconcilePositions:
     def test_empty_both(self, db_path):
         from core.portfolio import reconcile_positions
 
-        report = reconcile_positions([], db_path)
+        report = reconcile_positions([], db_path=db_path)
         assert report["in_sync"] is True
+
+    def test_auto_fix_closes_orphaned_db_positions(self, db_path):
+        from core.portfolio import reconcile_positions
+
+        pos = _make_position(ticker="SYRE")
+        add_position(pos, db_path)
+        pos2 = _make_position(ticker="AAOI", entry_price=148.0)
+        add_position(pos2, db_path)
+
+        # IBKR has neither — they were stopped out while bot was offline
+        report = reconcile_positions([], auto_fix=True, db_path=db_path)
+
+        assert report["auto_closed"] == ["AAOI", "SYRE"]
+        # DB should now be empty
+        assert get_open_positions(db_path) == []
+        # Trades should be recorded
+        trades = get_trades(db_path=db_path)
+        assert len(trades) == 2
+        tickers = {t.ticker for t in trades}
+        assert tickers == {"SYRE", "AAOI"}
+
+    def test_auto_fix_preserves_matching_positions(self, db_path):
+        from core.portfolio import reconcile_positions
+
+        pos = _make_position(ticker="INTC")
+        add_position(pos, db_path)
+        pos2 = _make_position(ticker="SYRE")
+        add_position(pos2, db_path)
+
+        # IBKR still holds INTC but not SYRE
+        ibkr = [{"ticker": "INTC", "quantity": pos.quantity}]
+        report = reconcile_positions(ibkr, auto_fix=True, db_path=db_path)
+
+        assert report["auto_closed"] == ["SYRE"]
+        remaining = get_open_positions(db_path)
+        assert len(remaining) == 1
+        assert remaining[0].ticker == "INTC"
+
+    def test_auto_fix_false_does_not_close(self, db_path):
+        from core.portfolio import reconcile_positions
+
+        pos = _make_position(ticker="AAPL")
+        add_position(pos, db_path)
+
+        report = reconcile_positions([], auto_fix=False, db_path=db_path)
+
+        assert report["auto_closed"] == []
+        assert len(get_open_positions(db_path)) == 1
+
+    def test_auto_fix_uses_stop_loss_as_exit_price(self, db_path):
+        """Auto-reconcile should use stop_loss as exit price, not entry_price.
+
+        When a position disappears from IBKR (likely filled via stop-loss while
+        bot was offline), recording exit at entry_price produces $0 P&L which
+        hides the real loss. The stop_loss is the best available estimate of
+        the actual fill price.
+        """
+        from core.portfolio import reconcile_positions
+
+        pos = _make_position(
+            ticker="SYRE", entry_price=150.0, stop_loss=145.5,
+        )
+        add_position(pos, db_path)
+
+        # IBKR has nothing — position was stopped out while offline
+        report = reconcile_positions([], auto_fix=True, db_path=db_path)
+
+        assert report["auto_closed"] == ["SYRE"]
+        trades = get_trades(db_path=db_path)
+        assert len(trades) == 1
+        # Exit price should be stop_loss (145.5), not entry_price (150.0)
+        assert trades[0].exit_price == 145.5
+        # P&L should reflect the loss: (145.5 - 150.0) * 10 = -$45
+        assert trades[0].pnl == pytest.approx(-45.0)

@@ -273,7 +273,12 @@ def close_all_day_trades(
     positions: list[Position],
     dry_run: bool = False,
 ) -> list[IBTrade]:
-    """Close all positions marked as day trades. Called before market close."""
+    """Close all positions marked as day trades. Called before market close.
+
+    Cancels any open bracket orders (TP/SL) for the closed positions to
+    prevent orphaned orders at IBKR after the market close fills.
+    Records the close in the portfolio database.
+    """
     day_trades = [p for p in positions if p.trade_type == TradeType.DAY]
 
     if not day_trades:
@@ -281,29 +286,51 @@ def close_all_day_trades(
         return []
 
     logger.info("Closing %d day trade positions", len(day_trades))
-    trades = []
 
+    # Build a set of tickers being closed for bracket order cancellation
+    closing_tickers = {p.ticker for p in day_trades}
+
+    # Cancel ALL open orders for the positions being closed BEFORE placing
+    # market orders — prevents race where bracket SL/TP fills between
+    # our market order placement and fill. This includes:
+    # - Unfilled parent entry orders (cancelling parent auto-cancels children)
+    # - Orphaned TP/SL children from already-filled parents
+    if not dry_run:
+        for trade in ib.openTrades():
+            if trade.contract.symbol in closing_tickers:
+                try:
+                    ib.cancelOrder(trade.order)
+                    logger.info("Cancelled order %s (%s) for %s (day trade close)",
+                                 trade.order.orderId, trade.order.orderType,
+                                 trade.contract.symbol)
+                except Exception as e:
+                    logger.warning("Failed to cancel order for %s: %s",
+                                   trade.contract.symbol, e)
+
+    trades = []
     for pos in day_trades:
         trade = close_position_market(ib, pos, dry_run)
         if trade:
-            trades.append(trade)
+            trades.append((pos, trade))
 
     # Verify fills with extended timeout — market orders near close
     # may take longer than expected under adverse conditions
     if trades and not dry_run:
-        statuses = monitor_orders(ib, trades, timeout=30.0)
-        unfilled = [
-            s["orderId"] for s in statuses
-            if s["status"] != "Filled"
-        ]
-        if unfilled:
-            logger.error(
-                "CRITICAL: Day trade close orders NOT filled after 30s: %s — "
-                "positions may remain open overnight! Manual intervention needed.",
-                unfilled,
-            )
+        ib_trades = [t for _, t in trades]
+        statuses = monitor_orders(ib, ib_trades, timeout=30.0)
+        for (pos, ib_trade), status in zip(trades, statuses):
+            if status["status"] == "Filled":
+                fill_price = status["avgFillPrice"]
+                db_close_position(pos.ticker, fill_price)
+                logger.info("Day trade closed: %s @ $%.2f", pos.ticker, fill_price)
+            else:
+                logger.error(
+                    "CRITICAL: Day trade close for %s NOT filled after 30s "
+                    "(status=%s) — position may remain open overnight!",
+                    pos.ticker, status["status"],
+                )
 
-    return trades
+    return [t for _, t in trades]
 
 
 def handle_fill(
@@ -467,6 +494,175 @@ def setup_exit_handler(ib: IB, signal: Signal, on_exit=None, parent_order=None) 
             ib.orderStatusEvent -= on_order_status
 
     ib.orderStatusEvent += on_order_status
+
+
+def import_ibkr_positions(ib: IB, orphaned_tickers: list[str]) -> list[str]:
+    """Import IBKR positions that exist at the broker but not in the DB.
+
+    Constructs Position objects from IBKR data (avgCost, quantity) and
+    extracts stop-loss/take-profit prices from open bracket orders.
+
+    Args:
+        ib: Connected IB instance.
+        orphaned_tickers: List of tickers present at IBKR but missing from DB.
+
+    Returns:
+        List of tickers successfully imported.
+    """
+    if not orphaned_tickers:
+        return []
+
+    orphaned_set = set(orphaned_tickers)
+    imported: list[str] = []
+
+    # Build a map of IBKR positions: ticker -> (quantity, avgCost, exchange)
+    ibkr_data: dict[str, dict] = {}
+    for p in ib.positions():
+        ticker = p.contract.symbol
+        if ticker in orphaned_set:
+            ibkr_data[ticker] = {
+                "quantity": int(p.position),
+                "avg_cost": p.avgCost,
+                "exchange": p.contract.primaryExchange or p.contract.exchange or "SMART",
+            }
+
+    # Extract stop-loss and take-profit from open bracket orders
+    sl_prices: dict[str, float] = {}
+    tp_prices: dict[str, float] = {}
+    for trade in ib.openTrades():
+        ticker = trade.contract.symbol
+        if ticker not in orphaned_set:
+            continue
+        order = trade.order
+        # Child orders have parentId > 0
+        if order.parentId == 0:
+            continue
+        if order.orderType in ("STP", "STP LMT"):
+            sl_prices[ticker] = order.auxPrice
+        elif order.orderType == "LMT":
+            tp_prices[ticker] = order.lmtPrice
+
+    for ticker in orphaned_tickers:
+        data = ibkr_data.get(ticker)
+        if data is None:
+            continue
+
+        qty = data["quantity"]
+        entry_price = data["avg_cost"]
+        stop_loss = sl_prices.get(ticker, 0.0)
+        take_profit = tp_prices.get(ticker, 0.0)
+
+        # Determine trade type from order TIF if available
+        trade_type = TradeType.SWING  # Default assumption for imported positions
+
+        position = Position(
+            ticker=ticker,
+            exchange=data["exchange"],
+            quantity=qty,
+            entry_price=entry_price,
+            entry_time=datetime.now(timezone.utc),
+            stop_loss=stop_loss,
+            take_profit=take_profit,
+            trade_type=trade_type,
+        )
+        add_position(position)
+        imported.append(ticker)
+        logger.warning(
+            "Imported IBKR position %s: %d @ $%.2f (SL=$%.2f, TP=$%.2f). "
+            "Entry time set to now — actual entry time unknown.",
+            ticker, qty, entry_price, stop_loss, take_profit,
+        )
+
+    return imported
+
+
+def reattach_exit_handlers(ib: IB) -> int:
+    """Re-register exit handlers for existing bracket orders after restart.
+
+    On startup, open positions in the DB may have live stop-loss/take-profit
+    orders at IBKR.  Since in-memory event handlers don't survive restarts,
+    this function finds those orders and attaches new exit handlers so fills
+    are detected and the DB + Telegram cache stay in sync.
+
+    Returns the number of handlers attached.
+    """
+    from core.portfolio import get_open_positions
+    open_positions = get_open_positions()
+    if not open_positions:
+        return 0
+
+    db_tickers = {p.ticker for p in open_positions}
+    open_trades = ib.openTrades()
+
+    # Build a map: ticker -> parent orderId for open parent (entry) orders
+    parent_ids: dict[str, int] = {}
+    for trade in open_trades:
+        order = trade.order
+        if order.parentId == 0 and trade.contract.symbol in db_tickers:
+            parent_ids[trade.contract.symbol] = order.orderId
+
+    # Deduplicate: one handler per bracket (parent), not per child order.
+    # Without this, a bracket with 2 children (SL + TP) would create 2
+    # independent handlers, both firing on the same exit fill — causing
+    # duplicate db_close_position calls and spurious warnings.
+    handled_parents: set[int] = set()
+    attached = 0
+    for trade in open_trades:
+        order = trade.order
+        ticker = trade.contract.symbol
+        if ticker not in db_tickers:
+            continue
+        # Only child orders (stop-loss / take-profit)
+        if order.parentId == 0:
+            continue
+        # Match child to a known parent for this ticker
+        expected_parent = parent_ids.get(ticker)
+        if expected_parent and order.parentId != expected_parent:
+            continue
+
+        # Skip if we already attached a handler for this bracket
+        bracket_key = order.parentId
+        if bracket_key in handled_parents:
+            continue
+        handled_parents.add(bracket_key)
+
+        # Build a minimal Signal for the handler
+        pos = next(p for p in open_positions if p.ticker == ticker)
+        signal = Signal(
+            ticker=ticker,
+            action=Action.BUY if pos.quantity > 0 else Action.SELL,
+            confidence=0.0,
+            entry_price=pos.entry_price,
+            stop_loss=pos.stop_loss,
+            take_profit=pos.take_profit,
+            reasoning="reattached on startup",
+            source="reattach",
+        )
+
+        def make_on_exit(t):
+            def _on_exit(ticker, exit_price, exit_type):
+                from notifications.telegram import notify_trade_closed, refresh_positions_cache
+                from core.portfolio import get_trades
+                trades_list = get_trades(ticker=ticker)
+                if trades_list:
+                    notify_trade_closed(trades_list[0])
+                refresh_positions_cache()
+            return _on_exit
+
+        # Find the parent Order object to pass for precise matching
+        parent_order = None
+        if expected_parent:
+            for t in open_trades:
+                if t.order.orderId == expected_parent:
+                    parent_order = t.order
+                    break
+
+        setup_exit_handler(ib, signal, on_exit=make_on_exit(ticker), parent_order=parent_order)
+        attached += 1
+        logger.info("Reattached exit handler for %s (parentId=%d)",
+                     ticker, order.parentId)
+
+    return attached
 
 
 def setup_disconnect_handler(ib: IB, reconnect: bool = True) -> None:
