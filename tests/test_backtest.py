@@ -4,7 +4,7 @@ from datetime import datetime, date
 
 import pytest
 
-from core.models import Trade, TradeType
+from core.models import Action, Trade, TradeType
 from core.risk import RiskResult
 from backtest.engine import SimulatedPortfolio, BacktestConfig
 from backtest.report import (
@@ -59,6 +59,103 @@ class TestSimulatedPortfolio:
         assert p.equity_curve[0][1] == 100_000
 
 
+class TestShortPositionAccounting:
+    """Short positions must credit cash on open and debit on close."""
+
+    def test_short_open_credits_cash(self):
+        """Opening a short sale should ADD cash (you receive sale proceeds)."""
+        p = SimulatedPortfolio(initial_capital=100_000, slippage_pct=0, commission=0)
+        sig = _make_signal(action=Action.SELL, entry_price=100.0,
+                           stop_loss=110.0, take_profit=90.0)
+        p.open_position(sig, 10, 100.0, datetime(2024, 1, 15))
+
+        assert len(p.positions) == 1
+        # Short sale proceeds: 100 * 10 = $1000 credited
+        assert p.cash == 100_000 + 1000.0
+
+    def test_short_position_stores_negative_quantity(self):
+        """Short positions must have negative quantity."""
+        p = SimulatedPortfolio(initial_capital=100_000, slippage_pct=0, commission=0)
+        sig = _make_signal(action=Action.SELL, entry_price=100.0,
+                           stop_loss=110.0, take_profit=90.0)
+        p.open_position(sig, 10, 100.0, datetime(2024, 1, 15))
+
+        assert p.positions[0].quantity == -10
+
+    def test_short_close_debits_cash(self):
+        """Closing a short (buying back) should DEBIT cash."""
+        p = SimulatedPortfolio(initial_capital=100_000, slippage_pct=0, commission=0)
+        sig = _make_signal(action=Action.SELL, entry_price=100.0,
+                           stop_loss=110.0, take_profit=90.0)
+        p.open_position(sig, 10, 100.0, datetime(2024, 1, 15))
+        cash_after_open = p.cash  # 101_000
+
+        trade = p.close_position("AAPL", 90.0, datetime(2024, 1, 16))
+        assert trade is not None
+        # Buying back 10 shares at $90 costs $900
+        assert p.cash == cash_after_open - 900.0
+
+    def test_short_profitable_trade_pnl(self):
+        """Short that drops in price should have positive P&L."""
+        p = SimulatedPortfolio(initial_capital=100_000, slippage_pct=0, commission=0)
+        sig = _make_signal(action=Action.SELL, entry_price=100.0,
+                           stop_loss=110.0, take_profit=90.0)
+        p.open_position(sig, 10, 100.0, datetime(2024, 1, 15))
+
+        trade = p.close_position("AAPL", 90.0, datetime(2024, 1, 16))
+        assert trade is not None
+        # Sold at 100, bought back at 90, qty=-10 → P&L = (90-100)*(-10) = $100
+        assert trade.pnl == 100.0
+
+    def test_short_losing_trade_pnl(self):
+        """Short that rises in price should have negative P&L."""
+        p = SimulatedPortfolio(initial_capital=100_000, slippage_pct=0, commission=0)
+        sig = _make_signal(action=Action.SELL, entry_price=100.0,
+                           stop_loss=110.0, take_profit=90.0)
+        p.open_position(sig, 10, 100.0, datetime(2024, 1, 15))
+
+        trade = p.close_position("AAPL", 110.0, datetime(2024, 1, 16))
+        assert trade is not None
+        # Sold at 100, bought back at 110, qty=-10 → P&L = (110-100)*(-10) = -$100
+        assert trade.pnl == -100.0
+
+    def test_short_mtm_reduces_portfolio_value(self):
+        """Short position should reduce portfolio value by its notional."""
+        p = SimulatedPortfolio(initial_capital=100_000, slippage_pct=0, commission=0)
+        sig = _make_signal(action=Action.SELL, entry_price=100.0,
+                           stop_loss=110.0, take_profit=90.0)
+        p.open_position(sig, 10, 100.0, datetime(2024, 1, 15))
+
+        # Cash = 101_000, position value = -10 * 100 = -1000
+        # Portfolio = 101_000 - 1000 = 100_000
+        assert p.portfolio_value == pytest.approx(100_000)
+
+    def test_short_exit_check_triggers_on_high(self):
+        """Short stop-loss should trigger when high >= stop_loss, fill at open for gap."""
+        import pandas as pd
+        from backtest.engine import _check_exits
+        from core.models import Position, TradeType
+
+        portfolio = SimulatedPortfolio(initial_capital=100_000, slippage_pct=0, commission=0)
+        portfolio.positions.append(Position(
+            ticker="SHORT", exchange="SMART", quantity=-10,
+            entry_price=100.0, entry_time=datetime(2024, 1, 1),
+            stop_loss=110.0, take_profit=90.0, trade_type=TradeType.DAY,
+        ))
+
+        # Bar gaps up above stop (open=$108 < stop=$110, but high=$112 >= stop)
+        day_data = {
+            "SHORT": pd.Series({"open": 108.0, "high": 112.0, "low": 107.0, "close": 111.0}),
+        }
+        _check_exits(portfolio, day_data, datetime(2024, 1, 2))
+
+        assert len(portfolio.positions) == 0
+        assert len(portfolio.trades) == 1
+        assert portfolio.trades[0].pnl < 0  # losing trade
+        # Open ($108) is below stop ($110), so intraday hit → fill at stop price
+        assert portfolio.trades[0].exit_price == pytest.approx(110.0)
+
+
 class TestMetrics:
     def _make_trades(self):
         return [
@@ -105,14 +202,15 @@ class TestMetrics:
 
 
 class TestGapDownStopLoss:
-    """Verify stop-loss uses min(low, stop_loss) for gap-down modeling."""
+    """Verify stop-loss uses open price for gap-down modeling (not bar low)."""
 
-    def test_gap_down_fills_at_low(self):
+    def test_gap_down_fills_at_open_not_low(self):
+        """When price gaps past stop, fill at open (first available price)."""
         import pandas as pd
         from backtest.engine import SimulatedPortfolio, _check_exits
         from core.models import Position, TradeType
 
-        portfolio = SimulatedPortfolio(initial_capital=100_000)
+        portfolio = SimulatedPortfolio(initial_capital=100_000, slippage_pct=0, commission=0)
         # Position with stop-loss at $95
         portfolio.positions.append(Position(
             ticker="GAP", exchange="SMART", quantity=100,
@@ -120,7 +218,7 @@ class TestGapDownStopLoss:
             stop_loss=95.0, take_profit=110.0, trade_type=TradeType.DAY,
         ))
 
-        # Day bar gaps down to $90 (below stop of $95)
+        # Day bar gaps down: open=$91 (below stop of $95), low=$90
         day_data = {
             "GAP": pd.Series({"open": 91.0, "high": 92.0, "low": 90.0, "close": 91.0}),
         }
@@ -129,9 +227,63 @@ class TestGapDownStopLoss:
 
         assert len(portfolio.positions) == 0, "Position should be closed"
         assert len(portfolio.trades) == 1
-        # Fill should be at $90 (the low), not $95 (the stop price)
-        assert portfolio.trades[0].exit_price < 95.0, (
-            f"Gap-down should fill below stop price, got {portfolio.trades[0].exit_price}"
+        # Fill should be at $91 (the open), not $90 (the low) or $95 (the stop)
+        assert portfolio.trades[0].exit_price == pytest.approx(91.0), (
+            f"Gap-down should fill at open price, got {portfolio.trades[0].exit_price}"
+        )
+
+    def test_no_gap_fills_at_stop_price(self):
+        """When intraday price crosses stop (no gap), fill at stop price."""
+        import pandas as pd
+        from backtest.engine import SimulatedPortfolio, _check_exits
+        from core.models import Position, TradeType
+
+        portfolio = SimulatedPortfolio(initial_capital=100_000, slippage_pct=0, commission=0)
+        portfolio.positions.append(Position(
+            ticker="NORM", exchange="SMART", quantity=100,
+            entry_price=100.0, entry_time=datetime(2024, 1, 1),
+            stop_loss=95.0, take_profit=110.0, trade_type=TradeType.DAY,
+        ))
+
+        # Open above stop, but low dips below — intraday stop hit
+        day_data = {
+            "NORM": pd.Series({"open": 97.0, "high": 98.0, "low": 93.0, "close": 94.0}),
+        }
+
+        _check_exits(portfolio, day_data, datetime(2024, 1, 2))
+
+        assert len(portfolio.positions) == 0
+        assert len(portfolio.trades) == 1
+        # Fill at stop price since open was above stop
+        assert portfolio.trades[0].exit_price == pytest.approx(95.0), (
+            f"Intraday stop should fill at stop price, got {portfolio.trades[0].exit_price}"
+        )
+
+    def test_short_gap_up_fills_at_open(self):
+        """Short position: gap-up past stop fills at open, not high."""
+        import pandas as pd
+        from backtest.engine import SimulatedPortfolio, _check_exits
+        from core.models import Position, TradeType
+
+        portfolio = SimulatedPortfolio(initial_capital=200_000, slippage_pct=0, commission=0)
+        portfolio.positions.append(Position(
+            ticker="SGAP", exchange="SMART", quantity=-100,
+            entry_price=100.0, entry_time=datetime(2024, 1, 1),
+            stop_loss=105.0, take_profit=90.0, trade_type=TradeType.DAY,
+        ))
+
+        # Gap-up: open=$108 (above stop of $105), high=$112
+        day_data = {
+            "SGAP": pd.Series({"open": 108.0, "high": 112.0, "low": 107.0, "close": 111.0}),
+        }
+
+        _check_exits(portfolio, day_data, datetime(2024, 1, 2))
+
+        assert len(portfolio.positions) == 0
+        assert len(portfolio.trades) == 1
+        # Fill at open ($108), not high ($112)
+        assert portfolio.trades[0].exit_price == pytest.approx(108.0), (
+            f"Short gap-up should fill at open, got {portfolio.trades[0].exit_price}"
         )
 
 
@@ -147,6 +299,39 @@ class TestDailyPnlBaseline:
         p.record_equity(date(2024, 1, 1))
         # Cash unchanged, so PnL should be 0
         assert p.daily_pnl == 0.0
+
+
+class TestEquityCurveMTM:
+    """Equity curve must reflect mark-to-market prices, not entry prices."""
+
+    def test_equity_curve_uses_current_prices(self):
+        """record_equity with current_prices should value positions at market price."""
+        p = SimulatedPortfolio(initial_capital=100_000, slippage_pct=0, commission=0)
+        sig = _make_signal(entry_price=100.0)
+        p.open_position(sig, 10, 100.0, datetime(2024, 1, 15))
+        # Cash = 99_000, position = 10 shares entered at $100
+
+        # Record equity with current price at $110
+        current_prices = {"AAPL": 110.0}
+        p.record_equity(date(2024, 1, 15), current_prices=current_prices)
+
+        # Equity should be cash(99_000) + 10*110 = 100_100, not 100_000
+        assert p.equity_curve[-1][1] == pytest.approx(100_100.0)
+
+    def test_daily_pnl_reflects_price_changes(self):
+        """daily_pnl should capture unrealized gains from price movement."""
+        p = SimulatedPortfolio(initial_capital=100_000, slippage_pct=0, commission=0)
+        sig = _make_signal(entry_price=100.0)
+        p.open_position(sig, 10, 100.0, datetime(2024, 1, 15))
+
+        # Day 1: record at entry price
+        p.record_equity(date(2024, 1, 15), current_prices={"AAPL": 100.0})
+        # Day 2: price rose to $110
+        day2_prices = {"AAPL": 110.0}
+        pnl = p.daily_pnl_mtm(day2_prices)
+
+        # Unrealized gain = 10 * ($110 - $100) = $100
+        assert pnl == pytest.approx(100.0)
 
 
 class TestLookAheadBias:
