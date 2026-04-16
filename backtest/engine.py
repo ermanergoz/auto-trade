@@ -69,17 +69,24 @@ class SimulatedPortfolio:
         else:
             adjusted_price = fill_price * (1 - self.slippage_pct / 100)
 
-        cost = adjusted_price * quantity + self.commission
-        if cost > self.cash:
-            logger.debug("Insufficient cash for %s: need $%.2f, have $%.2f",
-                        signal.ticker, cost, self.cash)
-            return
+        if signal.action == Action.BUY:
+            # Long: debit cash (pay for shares)
+            cost = adjusted_price * quantity + self.commission
+            if cost > self.cash:
+                logger.debug("Insufficient cash for %s: need $%.2f, have $%.2f",
+                            signal.ticker, cost, self.cash)
+                return
+            self.cash -= cost
+            stored_quantity = quantity
+        else:
+            # Short: credit cash (receive sale proceeds)
+            self.cash += adjusted_price * quantity - self.commission
+            stored_quantity = -quantity
 
-        self.cash -= cost
         self.positions.append(Position(
             ticker=signal.ticker,
             exchange=signal.exchange,
-            quantity=quantity,
+            quantity=stored_quantity,
             entry_price=adjusted_price,
             entry_time=current_date,
             stop_loss=signal.stop_loss,
@@ -120,9 +127,18 @@ class SimulatedPortfolio:
         self.trades.append(trade)
         return trade
 
-    def record_equity(self, current_date: date) -> None:
-        """Snapshot equity for the day."""
-        self.equity_curve.append((current_date, self.portfolio_value))
+    def daily_pnl_mtm(self, current_prices: dict[str, float] | None = None) -> float:
+        """Daily P&L using mark-to-market prices.
+
+        Compares current MTM value against the last recorded equity point.
+        """
+        if not self.equity_curve:
+            return 0.0
+        return self.portfolio_value_mtm(current_prices) - self.equity_curve[-1][1]
+
+    def record_equity(self, current_date: date, current_prices: dict[str, float] | None = None) -> None:
+        """Snapshot equity for the day using mark-to-market prices."""
+        self.equity_curve.append((current_date, self.portfolio_value_mtm(current_prices)))
 
 
 # ---------------------------------------------------------------------------
@@ -140,19 +156,24 @@ def _check_exits(portfolio: SimulatedPortfolio, day_data: dict[str, pd.Series], 
         bar = day_data[pos.ticker]
         low = bar["low"]
         high = bar["high"]
+        open_price = bar["open"]
 
         if pos.quantity > 0:  # Long position
-            # Stop-loss hit — fill at the worse of stop price or bar low (gap-down)
+            # Stop-loss hit
             if low <= pos.stop_loss:
-                actual_exit = min(low, pos.stop_loss)
+                # Gap-down: open already below stop → fill at open (first available price)
+                # Intraday: open above stop but low dips below → fill at stop price
+                actual_exit = open_price if open_price <= pos.stop_loss else pos.stop_loss
                 to_close.append((pos.ticker, actual_exit, "stop-loss"))
             # Take-profit hit — limit order fills at target price
             elif high >= pos.take_profit:
                 to_close.append((pos.ticker, pos.take_profit, "take-profit"))
         else:  # Short position
-            # Stop-loss hit — fill at worse of stop price or bar high (gap-up)
+            # Stop-loss hit
             if high >= pos.stop_loss:
-                actual_exit = max(high, pos.stop_loss)
+                # Gap-up: open already above stop → fill at open
+                # Intraday: open below stop but high rises above → fill at stop price
+                actual_exit = open_price if open_price >= pos.stop_loss else pos.stop_loss
                 to_close.append((pos.ticker, actual_exit, "stop-loss"))
             # Take-profit hit — limit order fills at target price
             elif low <= pos.take_profit:
@@ -303,15 +324,16 @@ def run_backtest(config: BacktestConfig) -> SimulatedPortfolio:
                     break
 
         # Step 4: Risk check and execute
-        # Use mark-to-market prices for accurate portfolio value
+        # Use mark-to-market prices for accurate portfolio value and daily PnL
         current_prices = {t: bar["close"] for t, bar in day_data.items()}
         mtm_value = portfolio.portfolio_value_mtm(current_prices)
+        mtm_daily_pnl = portfolio.daily_pnl_mtm(current_prices)
         for signal in candidates:
             result = evaluate(
                 signal,
                 portfolio.positions,
                 mtm_value,
-                portfolio.daily_pnl,
+                mtm_daily_pnl,
                 volatility=market_volatility,
             )
             if not result.approved:
@@ -326,7 +348,7 @@ def run_backtest(config: BacktestConfig) -> SimulatedPortfolio:
 
             portfolio.open_position(signal, result.position_size, fill_price, current_dt)
 
-        portfolio.record_equity(current_date)
+        portfolio.record_equity(current_date, current_prices=current_prices)
 
     # Close remaining positions at last available price
     for pos in list(portfolio.positions):
