@@ -270,11 +270,17 @@ def check_cumulative_risk(
     open_positions: list[Position],
     portfolio_value: float,
     limit_pct: float = DAILY_LOSS_LIMIT_PCT,
+    position_size: int | None = None,
 ) -> tuple[bool, str]:
     """Ensure total open risk across all positions stays within daily loss limit.
 
     If all open positions hit their stop-losses simultaneously (correlated
     market move), total loss must not exceed the daily loss limit.
+
+    Args:
+        position_size: Actual calculated position size. When provided, uses
+            this instead of re-deriving from RISK_PER_TRADE_PCT, so volatility
+            scaling and other adjustments are reflected accurately.
     """
     if portfolio_value <= 0:
         return False, "Portfolio value is zero or negative"
@@ -285,12 +291,16 @@ def check_cumulative_risk(
         if p.stop_loss > 0
     )
 
-    # Estimate new position risk using the shared RISK_PER_TRADE_PCT constant
     stop_distance = abs(signal.entry_price - signal.stop_loss)
     if stop_distance > 0:
-        risk_per_trade = portfolio_value * (RISK_PER_TRADE_PCT / 100)
-        estimated_qty = int(risk_per_trade / stop_distance)
-        new_risk = stop_distance * estimated_qty
+        if position_size is not None:
+            # Use actual sized quantity (reflects volatility scaling, etc.)
+            new_risk = stop_distance * position_size
+        else:
+            # Fallback: estimate from config (legacy callers)
+            risk_per_trade = portfolio_value * (RISK_PER_TRADE_PCT / 100)
+            estimated_qty = int(risk_per_trade / stop_distance)
+            new_risk = stop_distance * estimated_qty
     else:
         new_risk = 0
 
@@ -577,7 +587,8 @@ def evaluate(
         check_short_selling(signal, open_positions),
         check_position_size(signal, portfolio_value),
         check_daily_loss_limit(daily_pnl, portfolio_value),
-        check_cumulative_risk(signal, open_positions, portfolio_value),
+        check_cumulative_risk(signal, open_positions, portfolio_value,
+                              position_size=estimated_size),
         check_max_positions(signal, open_positions),
         check_stop_loss(signal),
         check_sector_concentration(signal, open_positions, portfolio_value,

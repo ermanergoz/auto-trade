@@ -203,6 +203,43 @@ class TestCumulativeRisk:
         # Should still pass with no positions
         assert result.approved is True
 
+    def test_uses_actual_position_size_not_config_estimate(self):
+        """check_cumulative_risk should use actual position_size when provided.
+
+        Without this, volatility-scaled positions are overestimated: the check
+        re-derives quantity from RISK_PER_TRADE_PCT which ignores vol scaling,
+        causing false rejections when volatility is elevated.
+        """
+        from core.risk import check_cumulative_risk
+
+        sig = _make_signal(entry_price=100.0, stop_loss=90.0)
+        # 1 existing position risking $100 (10 shares * $10 stop distance)
+        positions = [
+            _make_position(ticker="STK0", entry_price=100.0, stop_loss=90.0, quantity=10)
+        ]
+        # With position_size=5 (vol-scaled down), new_risk = $10 * 5 = $50
+        # Total risk = $100 + $50 = $150, limit = 2% of $100K = $2000 → pass
+        ok, _ = check_cumulative_risk(
+            sig, positions, 100_000, limit_pct=2.0, position_size=5,
+        )
+        assert ok is True
+
+    def test_position_size_zero_means_no_new_risk(self):
+        """When position_size=0, new risk contribution should be 0."""
+        from core.risk import check_cumulative_risk
+
+        sig = _make_signal(entry_price=100.0, stop_loss=90.0)
+        positions = [
+            _make_position(ticker=f"STK{i}", entry_price=100.0, stop_loss=90.0, quantity=10)
+            for i in range(20)
+        ]
+        # Existing risk = 20 * $100 = $2000, limit = 2% of $100K = $2000
+        # With position_size=0, new_risk=0, total=$2000 <= $2000 → pass
+        ok, _ = check_cumulative_risk(
+            sig, positions, 100_000, limit_pct=2.0, position_size=0,
+        )
+        assert ok is True
+
 
 class TestSectorConcentrationCurrentPrice:
     """Verify sector concentration uses current_price when available."""
