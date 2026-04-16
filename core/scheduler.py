@@ -274,11 +274,12 @@ def run_scan_cycle(
                 )
 
             def _on_exit(ticker, exit_price, exit_type):
-                from notifications.telegram import notify_trade_closed
+                from notifications.telegram import notify_trade_closed, refresh_positions_cache
                 from core.portfolio import get_trades
                 trades_list = get_trades(ticker=ticker)
                 if trades_list:
                     notify_trade_closed(trades_list[0])
+                refresh_positions_cache()
 
             trades = place_order(ib, signal, result.position_size, dry_run=dry_run)
 
