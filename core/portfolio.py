@@ -300,15 +300,20 @@ def get_trades(
 
 def reconcile_positions(
     ibkr_positions: list[dict],
+    auto_fix: bool = False,
     db_path: Path = DB_PATH,
 ) -> dict:
     """Compare IBKR positions with database. Returns reconciliation report.
 
     Args:
         ibkr_positions: List of dicts with 'ticker' and 'quantity' from ib.positions().
+        auto_fix: When True, close DB positions that no longer exist at IBKR
+                  (e.g. stop-loss filled while bot was offline). Uses entry_price
+                  as exit_price since the actual fill price is unknown.
 
     Returns:
-        Dict with db_count, ibkr_count, orphaned_db, orphaned_ibkr, in_sync.
+        Dict with db_count, ibkr_count, orphaned_db, orphaned_ibkr, in_sync,
+        and auto_closed (list of tickers closed when auto_fix=True).
     """
     db_positions = get_open_positions(db_path)
     db_tickers = {p.ticker for p in db_positions}
@@ -336,12 +341,39 @@ def reconcile_positions(
                 "type": "sign_mismatch" if is_sign else "quantity_mismatch",
             }
 
+    # Auto-fix: close orphaned DB positions that IBKR no longer holds
+    auto_closed: list[str] = []
+    if auto_fix and orphaned_db:
+        for ticker in orphaned_db:
+            pos = next((p for p in db_positions if p.ticker == ticker), None)
+            if pos is None:
+                continue
+            # Use stop_loss as exit_price — it's the best estimate for a
+            # position that was likely stopped out while the bot was offline.
+            # Using entry_price would record $0 P&L and hide the real loss,
+            # causing daily loss limits and circuit breakers to under-count.
+            exit_price = pos.stop_loss if pos.stop_loss > 0 else pos.entry_price
+            trade = close_position(
+                ticker, exit_price, db_path=db_path,
+                reasoning="Auto-reconcile: position no longer exists at IBKR "
+                          "(likely filled via stop-loss/take-profit while bot was offline)",
+            )
+            if trade:
+                auto_closed.append(ticker)
+                logger.warning(
+                    "Auto-closed orphaned position %s (entry $%.2f, "
+                    "recorded exit at stop-loss $%.2f). "
+                    "Actual fill price unknown.",
+                    ticker, pos.entry_price, exit_price,
+                )
+
     report = {
         "db_count": len(db_positions),
         "ibkr_count": len(ibkr_tickers),
         "orphaned_db": orphaned_db,
         "orphaned_ibkr": orphaned_ibkr,
         "qty_mismatches": qty_mismatches,
+        "auto_closed": auto_closed,
         "in_sync": len(orphaned_db) == 0 and len(orphaned_ibkr) == 0 and len(qty_mismatches) == 0,
     }
 
@@ -359,6 +391,9 @@ def reconcile_positions(
                 "Manual intervention required.",
                 sign_mismatches,
             )
+
+    if auto_closed:
+        logger.info("Auto-reconcile closed %d orphaned positions: %s", len(auto_closed), auto_closed)
 
     return report
 
