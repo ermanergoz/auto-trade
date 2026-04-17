@@ -391,9 +391,14 @@ def _filter_universe(stocks: list[StockInfo]) -> list[StockInfo]:
 
 
 def _is_excluded_sector(sector: str) -> bool:
-    """Check if the sector should be excluded (financials, defense, non-equity ETFs)."""
-    if not sector:
-        return False
+    """Check if the sector should be excluded (financials, defense, non-equity ETFs).
+
+    Fail-closed on unknown: a blank/missing sector is treated as excluded so
+    that cached entries without verified classification cannot slip through
+    the financial/defense safety filter.
+    """
+    if not sector or not sector.strip():
+        return True
     sector_lower = sector.lower()
 
     # Exclude non-equity ETFs (bond, leveraged, commodity, etc.)

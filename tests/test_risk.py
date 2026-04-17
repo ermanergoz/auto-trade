@@ -675,12 +675,36 @@ class TestVolatilityAdjustedPositionSize:
         qty_none = calculate_position_size(sig, 100_000, volatility=None)
         assert qty_base == qty_none
 
-    def test_extreme_vol_floors_at_one_share(self):
-        """Even in extreme volatility, should allow at least 1 share if base > 0."""
+    def test_extreme_vol_allows_tiny_position_on_cheap_stock(self):
+        """On a cheap stock, even 150% vol leaves the scaled position >= 1."""
         sig = _make_signal(entry_price=50.0, stop_loss=45.0)
         qty = calculate_position_size(sig, 100_000, volatility=1.5)
-        # With 150% annualized vol, position should be tiny but >= 1
+        # Base qty is large (~1000 on this signal); vol_scale = 0.2/1.5 ≈ 0.133;
+        # scaled ≈ 133 shares — still a real position.
         assert qty >= 1
+
+    def test_extreme_vol_rejects_expensive_stock_with_tiny_base(self):
+        """When vol scaling drops the size to <1 share, return 0 — don't floor to 1.
+
+        Previous behavior used `max(int(qty * vol_scale), min(1, qty))`, which
+        forced a 1-share trade through even when the volatility-adjusted size
+        rounded to zero. In a high-vol regime that means taking a trade the
+        vol check intended to reject, with a max-loss that can exceed the
+        intended per-trade risk budget because the 1-share stop distance may
+        represent >RISK_PER_TRADE_PCT of equity on an expensive stock.
+
+        The correct behavior is to let vol-scaled size fall to zero so
+        evaluate() can reject the signal entirely.
+        """
+        # Expensive stock with a tight stop → small base quantity
+        sig = _make_signal(entry_price=10_000.0, stop_loss=9_999.0)
+        # Base qty_by_size = 50_000 / 10_000 = 5, qty_by_risk = huge
+        # vol_scale = 0.2 / 1.5 ≈ 0.133 → 5 * 0.133 ≈ 0.66 → int = 0
+        qty = calculate_position_size(sig, 100_000, volatility=1.5)
+        assert qty == 0, (
+            "Extreme volatility on an expensive stock must scale the position "
+            f"to 0 (rejection), not floor to 1 — got {qty} shares"
+        )
 
 
 class TestVolatilityInEvaluate:

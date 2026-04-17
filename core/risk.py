@@ -566,10 +566,14 @@ def calculate_position_size(
     # Take the smaller
     quantity = min(qty_by_size, qty_by_risk)
 
-    # Volatility regime adjustment: scale down when vol > baseline
+    # Volatility regime adjustment: scale down when vol > baseline.
+    # Let scaled size fall to 0 so evaluate() rejects the signal — the
+    # previous `min(1, quantity)` floor forced a 1-share trade through the
+    # vol filter even when the scaled size rounded to zero, which on an
+    # expensive stock could exceed the per-trade risk budget.
     if volatility is not None and volatility > 0 and VOLATILITY_BASELINE > 0:
         vol_scale = min(VOLATILITY_BASELINE / volatility, 1.0)  # cap at 1.0 (no leverage)
-        quantity = max(int(quantity * vol_scale), min(1, quantity))
+        quantity = int(quantity * vol_scale)
 
     return max(quantity, 0)
 
