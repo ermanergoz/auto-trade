@@ -95,6 +95,40 @@ class TestPositions:
         result = close_position("NOPE", 100.0, db_path=db_path)
         assert result is None
 
+    def test_concurrent_add_position_does_not_duplicate(self, db_path):
+        """Two threads calling add_position for the same ticker must not
+        both succeed in INSERTing a row.
+
+        The fill handler runs on ib_insync's event thread while the main
+        scheduler loop also calls add_position through reconciliation /
+        handle_fill paths. Without a DB-level uniqueness guarantee, the
+        SELECT-then-INSERT check inside add_position is a TOCTOU race: both
+        threads' SELECTs can return empty before either INSERT commits, and
+        both INSERTs succeed. The DB must enforce uniqueness so that at
+        most one row per ticker exists no matter how calls interleave.
+        """
+        import threading
+
+        pos = _make_position(ticker="AAPL")
+        barrier = threading.Barrier(4)
+
+        def _insert():
+            barrier.wait()
+            add_position(_make_position(ticker="AAPL"), db_path)
+
+        threads = [threading.Thread(target=_insert) for _ in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        positions = get_open_positions(db_path)
+        tickers = [p.ticker for p in positions]
+        assert tickers.count("AAPL") == 1, (
+            f"Expected exactly one AAPL row after 4 concurrent inserts; "
+            f"got {tickers.count('AAPL')}: {positions}"
+        )
+
 
 class TestTrades:
     def test_get_trades_empty(self, db_path):

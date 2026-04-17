@@ -4,6 +4,7 @@ import logging
 import signal as sig
 import sys
 from datetime import datetime
+from typing import Optional
 from zoneinfo import ZoneInfo
 
 from ib_insync import IB
@@ -47,16 +48,29 @@ _tz = ZoneInfo(TIMEZONE)
 # Market hours
 # ---------------------------------------------------------------------------
 
-def is_market_open(market: str) -> bool:
-    """Check if a market is currently open based on Istanbul time."""
-    now = datetime.now(_tz)
-
-    # Weekends — check before parsing to avoid errors on misconfigured hours
-    if now.weekday() >= 5:
-        return False
-
+def _market_tz(market: str) -> Optional[ZoneInfo]:
+    """Return the market's native ZoneInfo, or None if market is unknown."""
     hours = MARKET_HOURS.get(market.upper())
     if not hours:
+        return None
+    return ZoneInfo(hours.get("tz", TIMEZONE))
+
+
+def is_market_open(market: str) -> bool:
+    """Check if a market is currently open.
+
+    Evaluates using the market's native timezone (e.g. America/New_York for
+    NYSE) so DST transitions are handled by ZoneInfo rather than the local
+    display timezone.
+    """
+    hours = MARKET_HOURS.get(market.upper())
+    if not hours:
+        return False
+
+    market_tz = ZoneInfo(hours.get("tz", TIMEZONE))
+    now = datetime.now(market_tz)
+
+    if now.weekday() >= 5:
         return False
 
     open_h, open_m = map(int, hours["open"].split(":"))
@@ -74,11 +88,13 @@ def get_active_markets(markets: list[str]) -> list[str]:
 
 
 def minutes_to_close(market: str) -> int:
-    """Minutes remaining until market close."""
-    now = datetime.now(_tz)
+    """Minutes remaining until market close (in the market's native tz)."""
     hours = MARKET_HOURS.get(market.upper())
     if not hours:
         return 999
+
+    market_tz = ZoneInfo(hours.get("tz", TIMEZONE))
+    now = datetime.now(market_tz)
 
     close_h, close_m = map(int, hours["close"].split(":"))
     market_close = now.replace(hour=close_h, minute=close_m, second=0, microsecond=0)
@@ -306,9 +322,14 @@ def run_scan_cycle(
                 # place_order() returning and handler registration. Handlers
                 # only act on "Filled" status, so they're no-ops for rejected
                 # orders (which show "Inactive"/"Cancelled").
+                #
+                # Pass parent_trade so the handler can detect a fast fill that
+                # completed during place_order's permId poll — those would
+                # otherwise never be replayed by ib_insync.
                 setup_fill_handler(
                     ib, signal, result.position_size,
                     on_fill=_on_fill, parent_order=trades[0].order,
+                    parent_trade=trades[0],
                 )
                 setup_exit_handler(
                     ib, signal, on_exit=_on_exit, parent_order=trades[0].order,

@@ -266,3 +266,73 @@ class TestStreamingPipeline:
         # The signal passed to evaluate should have sector in indicator_values
         evaluated_signal = self.m["evaluate"].call_args[0][0]
         assert evaluated_signal.indicator_values.get("sector") == "Technology"
+
+
+class TestMarketHoursDST:
+    """Verify NYSE market hours follow US DST, not the local display timezone.
+
+    NYSE uses America/New_York which observes DST (EDT summer = UTC-4,
+    EST winter = UTC-5). Europe/Istanbul (TRT) is a fixed UTC+3 offset.
+    The gap between NYSE open (09:30 ET) in Istanbul wall-clock time is:
+      - 16:30 TRT in summer (EDT)
+      - 17:30 TRT in winter (EST)
+
+    If market hours are stored as Istanbul clock times, the bot opens and
+    closes scanning an hour off during DST shifts. The authoritative hours
+    must be in ET so the NYSE open/close tracks the actual market.
+    """
+
+    def _run_at(self, iso_utc: str):
+        """Return is_market_open('US') as if now() were the given UTC timestamp."""
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        from unittest.mock import patch
+        import core.scheduler as sched
+
+        fixed = datetime.fromisoformat(iso_utc).replace(tzinfo=ZoneInfo("UTC"))
+
+        class FakeDT(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return fixed.astimezone(tz) if tz else fixed.replace(tzinfo=None)
+
+        with patch.object(sched, "datetime", FakeDT):
+            return sched.is_market_open("US")
+
+    def test_nyse_open_summer_edt(self):
+        """2026-07-15 is EDT. 09:30 ET = 13:30 UTC → market open."""
+        assert self._run_at("2026-07-15T13:35:00") is True
+
+    def test_nyse_closed_before_open_summer(self):
+        """2026-07-15 09:00 ET = 13:00 UTC → market not yet open."""
+        assert self._run_at("2026-07-15T13:00:00") is False
+
+    def test_nyse_open_winter_est(self):
+        """2026-01-15 is EST. 09:30 ET = 14:30 UTC → market open.
+
+        This is the critical DST case: in winter, NYSE opens 1 hour later
+        in UTC than in summer. If hours are hard-coded as Istanbul clock
+        times the winter NYSE open is missed entirely for the first hour.
+        """
+        assert self._run_at("2026-01-15T14:35:00") is True
+
+    def test_nyse_closed_before_open_winter(self):
+        """2026-01-15 09:00 ET = 14:00 UTC → market not yet open.
+
+        In summer this same UTC time would be market-open. The test ensures
+        the bot does not scan before the ET open during EST.
+        """
+        assert self._run_at("2026-01-15T14:00:00") is False
+
+    def test_nyse_closed_after_close_winter(self):
+        """2026-01-15 16:05 ET = 21:05 UTC → past close."""
+        assert self._run_at("2026-01-15T21:05:00") is False
+
+    def test_nyse_open_just_before_close_winter(self):
+        """2026-01-15 15:55 ET = 20:55 UTC → still open."""
+        assert self._run_at("2026-01-15T20:55:00") is True
+
+    def test_weekend_closed(self):
+        """Saturday is closed regardless of time."""
+        # 2026-01-17 is a Saturday
+        assert self._run_at("2026-01-17T15:00:00") is False

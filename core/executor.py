@@ -296,16 +296,44 @@ def close_all_day_trades(
     # - Unfilled parent entry orders (cancelling parent auto-cancels children)
     # - Orphaned TP/SL children from already-filled parents
     if not dry_run:
+        cancelled = 0
         for trade in ib.openTrades():
             if trade.contract.symbol in closing_tickers:
                 try:
                     ib.cancelOrder(trade.order)
+                    cancelled += 1
                     logger.info("Cancelled order %s (%s) for %s (day trade close)",
                                  trade.order.orderId, trade.order.orderType,
                                  trade.contract.symbol)
                 except Exception as e:
                     logger.warning("Failed to cancel order for %s: %s",
                                    trade.contract.symbol, e)
+
+        # IBKR cancels are asynchronous — the request returns immediately but
+        # the order can still fill before the broker processes the cancel.
+        # Poll openTrades() until the brackets clear (or timeout) so our
+        # market close doesn't race a still-live SL/TP to a double-close.
+        if cancelled:
+            max_wait_sec = 3.0
+            poll_interval = 0.25
+            waited = 0.0
+            while waited < max_wait_sec:
+                ib.sleep(poll_interval)
+                waited += poll_interval
+                still_open = [
+                    t for t in ib.openTrades()
+                    if t.contract.symbol in closing_tickers
+                    and t.orderStatus.status in ("Submitted", "PreSubmitted", "PendingCancel")
+                ]
+                if not still_open:
+                    break
+            if waited >= max_wait_sec and still_open:
+                logger.warning(
+                    "Timeout waiting for bracket cancels to clear for %s — "
+                    "%d orders still open; proceeding with market close",
+                    ", ".join(sorted({t.contract.symbol for t in still_open})),
+                    len(still_open),
+                )
 
     trades = []
     for pos in day_trades:
@@ -370,13 +398,25 @@ def handle_fill(
     return position
 
 
-def setup_fill_handler(ib: IB, signal: Signal, quantity: int, on_fill=None, parent_order=None) -> None:
+def setup_fill_handler(
+    ib: IB,
+    signal: Signal,
+    quantity: int,
+    on_fill=None,
+    parent_order=None,
+    parent_trade: Optional[IBTrade] = None,
+) -> None:
     """Attach a callback to handle entry order fills asynchronously.
 
     Args:
         on_fill: Optional callback(signal, filled_qty, fill_price) called on fill.
         parent_order: Optional parent order object; when set, matches by permId
                       instead of ticker to prevent double-recording.
+        parent_trade: Optional parent trade snapshot. If the trade is already
+                      "Filled" at registration time (fast fill during place_order's
+                      permId poll), the fill path runs immediately. ib_insync
+                      does not replay past events, so without this check a fast
+                      fill would be silently dropped.
     """
 
     # Use threading.Event for atomic check-and-set to prevent double-fill
@@ -385,38 +425,64 @@ def setup_fill_handler(ib: IB, signal: Signal, quantity: int, on_fill=None, pare
     # Capture permId at registration time for precise matching
     _parent_perm_id = getattr(parent_order, "permId", 0) if parent_order else 0
 
+    def _process_fill(trade: IBTrade) -> None:
+        fill_price = trade.orderStatus.avgFillPrice
+        filled_qty = int(trade.orderStatus.filled)
+        if filled_qty < quantity:
+            logger.warning(
+                "Partial fill for %s: %d/%d shares @ $%.2f",
+                signal.ticker, filled_qty, quantity, fill_price,
+            )
+        handle_fill(signal, filled_qty, fill_price)
+        if trade.order.permId:
+            remove_pending_order(trade.order.permId)
+        if on_fill:
+            on_fill(signal, filled_qty, fill_price)
+
     def on_order_status(trade: IBTrade):
         if _fired.is_set():
             return
-        if trade.orderStatus.status == "Filled":
-            # Match by permId when available (precise), fall back to ticker
-            if _parent_perm_id:
-                if trade.order.permId != _parent_perm_id:
-                    return
-            else:
-                if trade.contract.symbol != signal.ticker:
-                    return
-            fill_price = trade.orderStatus.avgFillPrice
-            filled_qty = int(trade.orderStatus.filled)
-            if trade.order.action in ("BUY", "SELL") and getattr(trade.order, "parentId", 0) == 0:
-                if _fired.is_set():
-                    return
-                _fired.set()
-                try:
-                    if filled_qty < quantity:
-                        logger.warning(
-                            "Partial fill for %s: %d/%d shares @ $%.2f",
-                            signal.ticker, filled_qty, quantity, fill_price,
-                        )
-                    handle_fill(signal, filled_qty, fill_price)
-                    if trade.order.permId:
-                        remove_pending_order(trade.order.permId)
-                    if on_fill:
-                        on_fill(signal, filled_qty, fill_price)
-                finally:
-                    ib.orderStatusEvent -= on_order_status
+        if trade.orderStatus.status != "Filled":
+            return
+        # Match by permId when available (precise), fall back to ticker
+        if _parent_perm_id:
+            if trade.order.permId != _parent_perm_id:
+                return
+        else:
+            if trade.contract.symbol != signal.ticker:
+                return
+        if trade.order.action not in ("BUY", "SELL"):
+            return
+        if getattr(trade.order, "parentId", 0) != 0:
+            return
+        if _fired.is_set():
+            return
+        _fired.set()
+        try:
+            _process_fill(trade)
+        finally:
+            try:
+                ib.orderStatusEvent -= on_order_status
+            except Exception:
+                pass
 
     ib.orderStatusEvent += on_order_status
+
+    # Race guard: fast fills can arrive before the handler attaches. If the
+    # parent trade is already Filled, run the fill path synchronously here.
+    # _fired prevents the same fill from being processed twice if a late event
+    # also fires for the same Filled status.
+    if parent_trade is not None and parent_trade.orderStatus.status == "Filled":
+        if getattr(parent_trade.order, "parentId", 0) == 0:
+            if not _fired.is_set():
+                _fired.set()
+                try:
+                    _process_fill(parent_trade)
+                finally:
+                    try:
+                        ib.orderStatusEvent -= on_order_status
+                    except Exception:
+                        pass
 
 
 def setup_exit_handler(ib: IB, signal: Signal, on_exit=None, parent_order=None) -> None:

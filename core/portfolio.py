@@ -91,7 +91,10 @@ _TABLES = [
         ticker TEXT NOT NULL,
         placed_at TEXT NOT NULL
     )""",
-    "CREATE INDEX IF NOT EXISTS idx_positions_ticker ON positions(ticker)",
+    # UNIQUE index enforces one-open-row-per-ticker at the DB level so that
+    # concurrent inserts (fill handler thread vs scheduler) cannot both create
+    # duplicate rows through the SELECT-then-INSERT check in add_position.
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_positions_ticker ON positions(ticker)",
     "CREATE INDEX IF NOT EXISTS idx_trades_ticker ON trades(ticker)",
     "CREATE INDEX IF NOT EXISTS idx_trades_exit_time ON trades(exit_time)",
     "CREATE INDEX IF NOT EXISTS idx_signals_timestamp ON signals(timestamp)",
@@ -130,22 +133,13 @@ def verify_db(db_path: Path = DB_PATH) -> None:
 def add_position(position: Position, db_path: Path = DB_PATH) -> int:
     """Insert a new open position. Returns the row ID.
 
-    Rejects duplicates for the same ticker to prevent phantom positions
-    from partial fills or double-attached handlers.
+    A UNIQUE index on `ticker` enforces one-row-per-ticker at the DB level.
+    Two threads (fill handler + scheduler) calling this concurrently will
+    not both INSERT — the loser sees an IntegrityError / OR IGNORE no-op.
     """
     with _db_connection(db_path) as conn:
-        existing = conn.execute(
-            "SELECT id FROM positions WHERE ticker = ?", (position.ticker,)
-        ).fetchone()
-        if existing:
-            logger.warning(
-                "Duplicate position for %s (existing id=%d) — skipping insert",
-                position.ticker, existing["id"],
-            )
-            return existing["id"]
-
         cursor = conn.execute(
-            """INSERT INTO positions
+            """INSERT OR IGNORE INTO positions
                (ticker, exchange, quantity, entry_price, entry_time,
                 stop_loss, take_profit, trade_type, sector)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
@@ -156,6 +150,16 @@ def add_position(position: Position, db_path: Path = DB_PATH) -> int:
                 position.trade_type.value, position.sector,
             ),
         )
+        if cursor.rowcount == 0:
+            existing = conn.execute(
+                "SELECT id FROM positions WHERE ticker = ?", (position.ticker,)
+            ).fetchone()
+            existing_id = existing["id"] if existing else 0
+            logger.warning(
+                "Duplicate position for %s (existing id=%d) — skipping insert",
+                position.ticker, existing_id,
+            )
+            return existing_id
         logger.info("Added position: %s %d @ %.2f",
                      position.ticker, position.quantity, position.entry_price)
         return cursor.lastrowid
