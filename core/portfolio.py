@@ -302,9 +302,39 @@ def get_trades(
     ]
 
 
+def _find_closing_fill(
+    ticker: str,
+    entry_time: datetime,
+    ibkr_fills: Optional[list[dict]],
+) -> Optional[dict]:
+    """Find the most recent SLD fill for ticker after entry_time.
+
+    Used by reconcile_positions to pick an accurate exit price when a DB
+    position was filled at IBKR while the bot was offline. Only SLD
+    (sell-to-close) fills are considered — BOT fills belong to entries
+    and must not be used as exits.
+    """
+    if not ibkr_fills:
+        return None
+    # Normalize entry_time to UTC for comparison against IBKR fill times
+    if entry_time.tzinfo is None:
+        entry_time = entry_time.replace(tzinfo=timezone.utc)
+    matches = [
+        f for f in ibkr_fills
+        if f.get("ticker") == ticker
+        and f.get("side") == "SLD"
+        and f.get("time") is not None
+        and f["time"] >= entry_time
+    ]
+    if not matches:
+        return None
+    return max(matches, key=lambda f: f["time"])
+
+
 def reconcile_positions(
     ibkr_positions: list[dict],
     auto_fix: bool = False,
+    ibkr_fills: Optional[list[dict]] = None,
     db_path: Path = DB_PATH,
 ) -> dict:
     """Compare IBKR positions with database. Returns reconciliation report.
@@ -312,8 +342,13 @@ def reconcile_positions(
     Args:
         ibkr_positions: List of dicts with 'ticker' and 'quantity' from ib.positions().
         auto_fix: When True, close DB positions that no longer exist at IBKR
-                  (e.g. stop-loss filled while bot was offline). Uses entry_price
-                  as exit_price since the actual fill price is unknown.
+                  (e.g. stop-loss filled while bot was offline).
+        ibkr_fills: Optional list of fill dicts from IBKR. Each dict should
+                    contain: ticker, side ('SLD'/'BOT'), shares, price, time
+                    (timezone-aware datetime). When provided, the most recent
+                    SLD fill after position entry_time is used as exit_price
+                    — giving accurate P&L. Falls back to stop_loss when no
+                    matching fill exists.
 
     Returns:
         Dict with db_count, ibkr_count, orphaned_db, orphaned_ibkr, in_sync,
@@ -352,23 +387,55 @@ def reconcile_positions(
             pos = next((p for p in db_positions if p.ticker == ticker), None)
             if pos is None:
                 continue
-            # Use stop_loss as exit_price — it's the best estimate for a
-            # position that was likely stopped out while the bot was offline.
-            # Using entry_price would record $0 P&L and hide the real loss,
-            # causing daily loss limits and circuit breakers to under-count.
-            exit_price = pos.stop_loss if pos.stop_loss > 0 else pos.entry_price
+
+            # Prefer the actual IBKR fill price when available — that gives
+            # accurate P&L for positions filled while the bot was offline.
+            # Fallback hierarchy when no fill data is available:
+            #   1. midpoint of SL and TP — unbiased expected-value estimator
+            #      assuming equal prior probability of hitting either bracket.
+            #      Using SL alone (previous behavior) always records a loss,
+            #      systematically biasing the circuit breaker and trade journal.
+            #   2. stop_loss alone — if no TP was set
+            #   3. entry_price — neutral $0 P&L when neither bracket is known
+            fill = _find_closing_fill(ticker, pos.entry_time, ibkr_fills)
+            if fill is not None:
+                exit_price = fill["price"]
+                exit_time = fill["time"]
+                reasoning = (
+                    f"Auto-reconcile: closed at actual IBKR fill price "
+                    f"${exit_price:.4f} (fill recorded at {exit_time.isoformat()})"
+                )
+                log_detail = f"actual IBKR fill price ${exit_price:.4f}"
+            else:
+                if pos.stop_loss > 0 and pos.take_profit > 0:
+                    exit_price = (pos.stop_loss + pos.take_profit) / 2.0
+                    estimate_detail = (
+                        f"midpoint estimate ${exit_price:.4f} of "
+                        f"SL ${pos.stop_loss:.4f} and TP ${pos.take_profit:.4f}"
+                    )
+                elif pos.stop_loss > 0:
+                    exit_price = pos.stop_loss
+                    estimate_detail = f"stop-loss estimate ${exit_price:.4f} (no TP set)"
+                else:
+                    exit_price = pos.entry_price
+                    estimate_detail = f"entry-price estimate ${exit_price:.4f} (no brackets set)"
+                exit_time = None
+                reasoning = (
+                    "Auto-reconcile: position no longer exists at IBKR "
+                    "(likely filled while bot was offline). Exit price is an "
+                    f"estimate — {estimate_detail}."
+                )
+                log_detail = f"{estimate_detail} (no IBKR fill data)"
+
             trade = close_position(
-                ticker, exit_price, db_path=db_path,
-                reasoning="Auto-reconcile: position no longer exists at IBKR "
-                          "(likely filled via stop-loss/take-profit while bot was offline)",
+                ticker, exit_price, exit_time=exit_time,
+                db_path=db_path, reasoning=reasoning,
             )
             if trade:
                 auto_closed.append(ticker)
                 logger.warning(
-                    "Auto-closed orphaned position %s (entry $%.2f, "
-                    "recorded exit at stop-loss $%.2f). "
-                    "Actual fill price unknown.",
-                    ticker, pos.entry_price, exit_price,
+                    "Auto-closed orphaned position %s (entry $%.2f, exit at %s)",
+                    ticker, pos.entry_price, log_detail,
                 )
 
     report = {

@@ -302,46 +302,67 @@ class TestReconcilePositions:
         assert report["auto_closed"] == []
         assert len(get_open_positions(db_path)) == 1
 
-    def test_auto_fix_uses_stop_loss_as_exit_price(self, db_path):
-        """Auto-reconcile should use stop_loss as exit price, not entry_price.
+    def test_auto_fix_uses_midpoint_exit_price_when_no_fills(self, db_path):
+        """Auto-reconcile must use the unbiased midpoint of SL/TP, not stop_loss.
 
-        When a position disappears from IBKR (likely filled via stop-loss while
-        bot was offline), recording exit at entry_price produces $0 P&L which
-        hides the real loss. The stop_loss is the best available estimate of
-        the actual fill price.
+        Previous behavior used stop_loss unconditionally, which records a loss
+        for every orphaned position regardless of whether it actually hit SL or
+        TP. That systematically biases the trade journal and circuit-breaker
+        history toward losses.
+
+        Assuming equal prior probability that a bracketed position exited via
+        SL or TP, the midpoint (SL + TP) / 2 is the unbiased expected-value
+        estimator of the exit price. Individual trades carry an "estimated"
+        flag in the reasoning so downstream consumers know it is not actual.
         """
         from core.portfolio import reconcile_positions
 
         pos = _make_position(
-            ticker="SYRE", entry_price=150.0, stop_loss=145.5,
+            ticker="SYRE", entry_price=150.0, stop_loss=145.5, take_profit=159.0,
         )
         add_position(pos, db_path)
 
-        # IBKR has nothing — position was stopped out while offline
         report = reconcile_positions([], auto_fix=True, db_path=db_path)
 
         assert report["auto_closed"] == ["SYRE"]
         trades = get_trades(db_path=db_path)
         assert len(trades) == 1
-        # Exit price should be stop_loss (145.5), not entry_price (150.0)
-        assert trades[0].exit_price == 145.5
-        # P&L should reflect the loss: (145.5 - 150.0) * 10 = -$45
-        assert trades[0].pnl == pytest.approx(-45.0)
+        # Midpoint of SL (145.5) and TP (159.0) = 152.25
+        assert trades[0].exit_price == pytest.approx(152.25)
+        # P&L: (152.25 - 150.0) * 10 = $22.50
+        assert trades[0].pnl == pytest.approx(22.5)
+        # Reasoning must flag the exit as an estimate so downstream logic
+        # (circuit breaker, daily P&L) can recognize unreliable data.
+        assert "estimate" in trades[0].reasoning.lower()
 
-    def test_auto_fix_uses_entry_price_when_no_stop_loss(self, db_path):
-        """When stop_loss is 0, fall back to entry_price as exit."""
+    def test_auto_fix_uses_entry_price_when_no_stop_loss_or_tp(self, db_path):
+        """When both SL and TP are 0, fall back to entry_price (0 P&L)."""
         from core.portfolio import reconcile_positions
 
         pos = _make_position(
-            ticker="NOSTOP", entry_price=150.0, stop_loss=0.0,
+            ticker="NOSTOP", entry_price=150.0, stop_loss=0.0, take_profit=0.0,
         )
         add_position(pos, db_path)
 
         report = reconcile_positions([], auto_fix=True, db_path=db_path)
         trades = get_trades(db_path=db_path)
         assert len(trades) == 1
-        # No stop_loss → falls back to entry_price
+        # No SL/TP → falls back to entry_price (neutral, $0 P&L)
         assert trades[0].exit_price == 150.0
+
+    def test_auto_fix_uses_stop_loss_when_no_tp(self, db_path):
+        """When only stop_loss is set (no TP), use stop_loss as fallback."""
+        from core.portfolio import reconcile_positions
+
+        pos = _make_position(
+            ticker="SLONLY", entry_price=150.0, stop_loss=145.5, take_profit=0.0,
+        )
+        add_position(pos, db_path)
+
+        report = reconcile_positions([], auto_fix=True, db_path=db_path)
+        trades = get_trades(db_path=db_path)
+        assert len(trades) == 1
+        assert trades[0].exit_price == 145.5
 
     def test_sign_mismatch_detected(self, db_path):
         """Direction mismatch (DB long but IBKR short) must be flagged."""
@@ -357,3 +378,176 @@ class TestReconcilePositions:
         assert report["in_sync"] is False
         assert "AAPL" in report["qty_mismatches"]
         assert report["qty_mismatches"]["AAPL"]["type"] == "sign_mismatch"
+
+
+class TestAutoFixWithFills:
+    """Auto-reconcile should prefer actual IBKR fill prices over stop_loss
+    estimates when fills are provided — so P&L reflects reality."""
+
+    def test_fill_price_overrides_stop_loss(self, db_path):
+        """When a matching IBKR fill exists, use its price, not stop_loss."""
+        from core.portfolio import reconcile_positions
+        from datetime import timezone
+
+        pos = _make_position(
+            ticker="IMOS", quantity=5, entry_price=48.40, stop_loss=46.00,
+            entry_time=datetime(2026, 4, 16, 14, 0, tzinfo=timezone.utc),
+        )
+        add_position(pos, db_path)
+
+        # IBKR reports the actual sell fill at $45.725 (below stop_loss)
+        fills = [{
+            "ticker": "IMOS", "side": "SLD", "shares": 5.0, "price": 45.725,
+            "time": datetime(2026, 4, 17, 13, 42, 43, tzinfo=timezone.utc),
+            "realized_pnl": -15.38,
+        }]
+        report = reconcile_positions(
+            [], auto_fix=True, ibkr_fills=fills, db_path=db_path,
+        )
+
+        assert report["auto_closed"] == ["IMOS"]
+        trades = get_trades(db_path=db_path)
+        assert len(trades) == 1
+        # Must use actual fill price, not stop_loss
+        assert trades[0].exit_price == pytest.approx(45.725)
+        # P&L based on actual fill: (45.725 - 48.40) * 5 = -13.375
+        assert trades[0].pnl == pytest.approx(-13.375)
+
+    def test_fill_price_overrides_when_take_profit_hit(self, db_path):
+        """A take-profit fill above stop_loss must also use actual price.
+
+        Without fill data, auto-reconcile would record this as a stop-out
+        (loss), when in reality it was a take-profit (gain).
+        """
+        from core.portfolio import reconcile_positions
+        from datetime import timezone
+
+        pos = _make_position(
+            ticker="INTC", quantity=3, entry_price=64.33, stop_loss=60.00,
+            take_profit=69.00,
+            entry_time=datetime(2026, 4, 16, 9, 0, tzinfo=timezone.utc),
+        )
+        add_position(pos, db_path)
+
+        fills = [{
+            "ticker": "INTC", "side": "SLD", "shares": 3.0, "price": 69.00,
+            "time": datetime(2026, 4, 17, 13, 30, 3, tzinfo=timezone.utc),
+            "realized_pnl": 13.00,
+        }]
+        report = reconcile_positions(
+            [], auto_fix=True, ibkr_fills=fills, db_path=db_path,
+        )
+
+        trades = get_trades(db_path=db_path)
+        assert trades[0].exit_price == pytest.approx(69.00)
+        # Gain: (69.00 - 64.33) * 3 = 14.01 (gross, ignoring commission)
+        assert trades[0].pnl == pytest.approx(14.01)
+
+    def test_falls_back_to_midpoint_when_no_matching_fill(self, db_path):
+        """When no fill is provided for a ticker, fall back to SL/TP midpoint.
+
+        Using the midpoint (rather than SL alone) avoids systematically biasing
+        the trade journal toward recorded losses when the actual outcome is
+        unknown.
+        """
+        from core.portfolio import reconcile_positions
+        from datetime import timezone
+
+        pos = _make_position(
+            ticker="ORPHAN", entry_price=100.0,
+            stop_loss=95.0, take_profit=110.0,
+            entry_time=datetime(2026, 4, 16, 9, 0, tzinfo=timezone.utc),
+        )
+        add_position(pos, db_path)
+
+        fills = [{
+            "ticker": "OTHER", "side": "SLD", "shares": 1.0, "price": 50.0,
+            "time": datetime(2026, 4, 17, 13, 0, tzinfo=timezone.utc),
+            "realized_pnl": 0.0,
+        }]
+        report = reconcile_positions(
+            [], auto_fix=True, ibkr_fills=fills, db_path=db_path,
+        )
+
+        trades = get_trades(db_path=db_path)
+        # Midpoint of SL 95 and TP 110 = 102.5
+        assert trades[0].exit_price == pytest.approx(102.5)
+
+    def test_ignores_fills_before_position_entry(self, db_path):
+        """A fill from a prior, unrelated trade on the same ticker must
+        not be used to close the current position."""
+        from core.portfolio import reconcile_positions
+        from datetime import timezone
+
+        pos = _make_position(
+            ticker="AAPL", entry_price=150.0,
+            stop_loss=145.0, take_profit=159.0,
+            entry_time=datetime(2026, 4, 17, 10, 0, tzinfo=timezone.utc),
+        )
+        add_position(pos, db_path)
+
+        # Old fill from last week — belongs to a prior trade, ignore it
+        fills = [{
+            "ticker": "AAPL", "side": "SLD", "shares": 10.0, "price": 200.0,
+            "time": datetime(2026, 4, 10, 10, 0, tzinfo=timezone.utc),
+            "realized_pnl": 500.0,
+        }]
+        report = reconcile_positions(
+            [], auto_fix=True, ibkr_fills=fills, db_path=db_path,
+        )
+
+        trades = get_trades(db_path=db_path)
+        # Old fill ignored, falls back to SL/TP midpoint = (145+159)/2 = 152
+        assert trades[0].exit_price == pytest.approx(152.0)
+
+    def test_uses_most_recent_fill_when_multiple(self, db_path):
+        """If multiple sell fills exist after entry (partial fills), use
+        the most recent one's price."""
+        from core.portfolio import reconcile_positions
+        from datetime import timezone
+
+        pos = _make_position(
+            ticker="MULT", quantity=10, entry_price=100.0, stop_loss=95.0,
+            entry_time=datetime(2026, 4, 17, 9, 0, tzinfo=timezone.utc),
+        )
+        add_position(pos, db_path)
+
+        fills = [
+            {"ticker": "MULT", "side": "SLD", "shares": 5.0, "price": 98.0,
+             "time": datetime(2026, 4, 17, 10, 0, tzinfo=timezone.utc),
+             "realized_pnl": -10.0},
+            {"ticker": "MULT", "side": "SLD", "shares": 5.0, "price": 97.0,
+             "time": datetime(2026, 4, 17, 11, 0, tzinfo=timezone.utc),
+             "realized_pnl": -15.0},
+        ]
+        report = reconcile_positions(
+            [], auto_fix=True, ibkr_fills=fills, db_path=db_path,
+        )
+
+        trades = get_trades(db_path=db_path)
+        assert trades[0].exit_price == pytest.approx(97.0)
+
+    def test_ignores_buy_fills(self, db_path):
+        """BOT (buy) fills must not be used to close a long position."""
+        from core.portfolio import reconcile_positions
+        from datetime import timezone
+
+        pos = _make_position(
+            ticker="AAPL", entry_price=100.0,
+            stop_loss=95.0, take_profit=110.0,
+            entry_time=datetime(2026, 4, 17, 9, 0, tzinfo=timezone.utc),
+        )
+        add_position(pos, db_path)
+
+        fills = [{
+            "ticker": "AAPL", "side": "BOT", "shares": 10.0, "price": 110.0,
+            "time": datetime(2026, 4, 17, 10, 0, tzinfo=timezone.utc),
+            "realized_pnl": 0.0,
+        }]
+        report = reconcile_positions(
+            [], auto_fix=True, ibkr_fills=fills, db_path=db_path,
+        )
+
+        trades = get_trades(db_path=db_path)
+        # BOT fill ignored, falls back to SL/TP midpoint = (95+110)/2 = 102.5
+        assert trades[0].exit_price == pytest.approx(102.5)
