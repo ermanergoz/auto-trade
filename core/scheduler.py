@@ -3,7 +3,7 @@
 import logging
 import signal as sig
 import sys
-from datetime import datetime
+from datetime import datetime, date
 from typing import Optional
 from zoneinfo import ZoneInfo
 
@@ -34,7 +34,7 @@ from notifications.telegram import (
     notify_scan_summary, notify_trade, notify_error,
     notify_shutdown, update_status, notify_risk_results,
     update_portfolio_data, notify_risk_warning,
-    notify_stale_order_cancelled,
+    notify_stale_order_cancelled, notify_reconciliation_mismatch,
 )
 
 from core import state as _state
@@ -383,6 +383,65 @@ def run_scan_cycle(
     return summary
 
 
+def run_nightly_reconciliation(ib: IB, db_path=None) -> dict:
+    """Read-only nightly check that DB positions match IBKR positions.
+
+    Fetches ib.positions() + ib.fills() and calls reconcile_positions with
+    auto_fix=False (report-only). Sends a Telegram alert on any mismatch.
+
+    Reconnect-time reconciliation (in main.py) auto-fixes orphans because
+    the bot was offline; this nightly check is purely for drift detection
+    during normal operation and must never silently close positions.
+    """
+    from core.portfolio import reconcile_positions, DB_PATH
+    if db_path is None:
+        db_path = DB_PATH
+
+    try:
+        ibkr_positions = [
+            {"ticker": p.contract.symbol, "quantity": int(p.position)}
+            for p in ib.positions()
+        ]
+    except Exception as e:
+        logger.error("Nightly reconcile: failed to fetch IBKR positions: %s", e)
+        notify_error(f"Nightly reconciliation failed: {e}")
+        return {"error": str(e), "in_sync": False}
+
+    ibkr_fills: list[dict] = []
+    try:
+        for f in ib.fills():
+            try:
+                ibkr_fills.append({
+                    "ticker": f.contract.symbol,
+                    "side": f.execution.side,
+                    "shares": float(f.execution.shares),
+                    "price": float(f.execution.price),
+                    "time": f.execution.time,
+                })
+            except Exception:
+                continue
+    except Exception as e:
+        logger.debug("Nightly reconcile: could not fetch fills: %s", e)
+
+    report = reconcile_positions(
+        ibkr_positions, auto_fix=False,
+        ibkr_fills=ibkr_fills, db_path=db_path,
+    )
+
+    if not report["in_sync"]:
+        logger.warning(
+            "Nightly reconcile mismatch: orphaned_db=%s orphaned_ibkr=%s qty_mismatches=%s",
+            report["orphaned_db"], report["orphaned_ibkr"], report["qty_mismatches"],
+        )
+        notify_reconciliation_mismatch(report)
+    else:
+        logger.info(
+            "Nightly reconcile OK: %d positions in sync", report["db_count"],
+        )
+
+    return report
+
+
 def check_stale_orders(ib: IB, mode: str = "paper") -> dict:
     """Re-screen unfilled orders older than STALE_ORDER_MINUTES.
 
@@ -532,11 +591,23 @@ def start_scheduler(
     )
 
     watchdog_mode = not reconnect
+    last_reconcile_date: Optional[date] = None
 
     try:
         while not _state.shutting_down:
             if ib.isConnected():
                 run_scan_cycle(ib, markets, mode, force=force)
+
+                # Nightly reconciliation — runs once per day after all markets
+                # have closed. Separate from reconnect-time reconciliation
+                # (which auto-fixes) — this is report-only drift detection.
+                today = datetime.now(_tz).date()
+                if last_reconcile_date != today and not get_active_markets(markets):
+                    try:
+                        run_nightly_reconciliation(ib)
+                    except Exception as e:
+                        logger.error("Nightly reconciliation failed: %s", e)
+                    last_reconcile_date = today
 
             if _state.shutting_down:
                 break

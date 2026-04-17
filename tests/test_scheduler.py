@@ -268,6 +268,324 @@ class TestStreamingPipeline:
         assert evaluated_signal.indicator_values.get("sector") == "Technology"
 
 
+# ---------------------------------------------------------------------------
+# Feature 3: Nightly reconciliation
+# ---------------------------------------------------------------------------
+
+from datetime import datetime, date, timezone  # noqa: E402
+
+from core.scheduler import run_nightly_reconciliation  # noqa: E402
+
+
+class _FakeIBPos:
+    def __init__(self, symbol, quantity):
+        self.contract = type("C", (), {"symbol": symbol})()
+        self.position = quantity
+
+
+class TestNightlyReconciliation:
+    """run_nightly_reconciliation(ib) fetches positions + fills, calls
+    reconcile_positions (read-only), and sends Telegram alert on mismatch.
+    """
+
+    def test_in_sync_does_not_alert(self, tmp_path):
+        """When DB and IBKR agree, no alert should be sent."""
+        from core.portfolio import init_db, add_position
+        from core.models import TradeType, Position
+
+        db_path = tmp_path / "test.db"
+        init_db(db_path)
+        add_position(Position(
+            ticker="AAPL", exchange="SMART", quantity=10,
+            entry_price=150.0, entry_time=datetime(2024, 1, 1),
+            stop_loss=145.0, take_profit=160.0, trade_type=TradeType.DAY,
+        ), db_path)
+
+        ib = MagicMock()
+        ib.positions.return_value = [_FakeIBPos("AAPL", 10)]
+        ib.fills.return_value = []
+
+        with patch("core.scheduler.notify_reconciliation_mismatch") as mock_notify:
+            report = run_nightly_reconciliation(ib, db_path=db_path)
+
+        assert report["in_sync"] is True
+        mock_notify.assert_not_called()
+
+    def test_orphaned_db_position_sends_alert(self, tmp_path):
+        """DB has AAPL but IBKR doesn't → alert."""
+        from core.portfolio import init_db, add_position
+        from core.models import TradeType, Position
+
+        db_path = tmp_path / "test.db"
+        init_db(db_path)
+        add_position(Position(
+            ticker="AAPL", exchange="SMART", quantity=10,
+            entry_price=150.0, entry_time=datetime(2024, 1, 1),
+            stop_loss=145.0, take_profit=160.0, trade_type=TradeType.DAY,
+        ), db_path)
+
+        ib = MagicMock()
+        ib.positions.return_value = []
+        ib.fills.return_value = []
+
+        with patch("core.scheduler.notify_reconciliation_mismatch") as mock_notify:
+            report = run_nightly_reconciliation(ib, db_path=db_path)
+
+        assert report["in_sync"] is False
+        assert "AAPL" in report["orphaned_db"]
+        mock_notify.assert_called_once()
+        args = mock_notify.call_args.args[0]
+        assert args["orphaned_db"] == ["AAPL"]
+
+    def test_orphaned_ibkr_position_sends_alert(self, tmp_path):
+        """IBKR has MSFT but DB doesn't → alert."""
+        from core.portfolio import init_db
+
+        db_path = tmp_path / "test.db"
+        init_db(db_path)
+
+        ib = MagicMock()
+        ib.positions.return_value = [_FakeIBPos("MSFT", 20)]
+        ib.fills.return_value = []
+
+        with patch("core.scheduler.notify_reconciliation_mismatch") as mock_notify:
+            report = run_nightly_reconciliation(ib, db_path=db_path)
+
+        assert "MSFT" in report["orphaned_ibkr"]
+        mock_notify.assert_called_once()
+
+    def test_quantity_mismatch_sends_alert(self, tmp_path):
+        """DB says 10 shares, IBKR says 100 → alert."""
+        from core.portfolio import init_db, add_position
+        from core.models import TradeType, Position
+
+        db_path = tmp_path / "test.db"
+        init_db(db_path)
+        add_position(Position(
+            ticker="AAPL", exchange="SMART", quantity=10,
+            entry_price=150.0, entry_time=datetime(2024, 1, 1),
+            stop_loss=145.0, take_profit=160.0, trade_type=TradeType.DAY,
+        ), db_path)
+
+        ib = MagicMock()
+        ib.positions.return_value = [_FakeIBPos("AAPL", 100)]
+        ib.fills.return_value = []
+
+        with patch("core.scheduler.notify_reconciliation_mismatch") as mock_notify:
+            report = run_nightly_reconciliation(ib, db_path=db_path)
+
+        assert "AAPL" in report["qty_mismatches"]
+        mock_notify.assert_called_once()
+
+    def test_does_not_auto_close_positions(self, tmp_path):
+        """Nightly reconciliation is read-only — never closes positions.
+        Auto-fix is reserved for reconnect-time reconciliation only.
+        """
+        from core.portfolio import init_db, add_position, get_open_positions
+        from core.models import TradeType, Position
+
+        db_path = tmp_path / "test.db"
+        init_db(db_path)
+        add_position(Position(
+            ticker="AAPL", exchange="SMART", quantity=10,
+            entry_price=150.0, entry_time=datetime(2024, 1, 1),
+            stop_loss=145.0, take_profit=160.0, trade_type=TradeType.DAY,
+        ), db_path)
+
+        ib = MagicMock()
+        ib.positions.return_value = []  # IBKR disagrees
+        ib.fills.return_value = []
+
+        with patch("core.scheduler.notify_reconciliation_mismatch"):
+            run_nightly_reconciliation(ib, db_path=db_path)
+
+        # Position must still be in DB (not auto-closed)
+        assert len(get_open_positions(db_path)) == 1
+
+    def test_returns_full_report(self, tmp_path):
+        """Return value should be the reconcile_positions report dict."""
+        from core.portfolio import init_db
+
+        db_path = tmp_path / "test.db"
+        init_db(db_path)
+
+        ib = MagicMock()
+        ib.positions.return_value = []
+        ib.fills.return_value = []
+
+        with patch("core.scheduler.notify_reconciliation_mismatch"):
+            report = run_nightly_reconciliation(ib, db_path=db_path)
+
+        # Report should include all standard reconcile_positions keys
+        for key in ("db_count", "ibkr_count", "orphaned_db",
+                    "orphaned_ibkr", "qty_mismatches", "in_sync"):
+            assert key in report
+
+    def test_handles_ibkr_positions_error(self, tmp_path):
+        """If ib.positions() raises, fail gracefully and notify error."""
+        from core.portfolio import init_db
+
+        db_path = tmp_path / "test.db"
+        init_db(db_path)
+
+        ib = MagicMock()
+        ib.positions.side_effect = ConnectionError("disconnected")
+        ib.fills.return_value = []
+
+        # Should not propagate the exception; should return error report
+        with patch("core.scheduler.notify_error") as mock_err, \
+             patch("core.scheduler.notify_reconciliation_mismatch"):
+            report = run_nightly_reconciliation(ib, db_path=db_path)
+
+        assert report.get("error") is not None
+        mock_err.assert_called_once()
+
+    def test_sign_mismatch_marks_critical(self, tmp_path):
+        """Direction mismatch (DB long, IBKR short) is a critical alert."""
+        from core.portfolio import init_db, add_position
+        from core.models import TradeType, Position
+
+        db_path = tmp_path / "test.db"
+        init_db(db_path)
+        add_position(Position(
+            ticker="AAPL", exchange="SMART", quantity=10,
+            entry_price=150.0, entry_time=datetime(2024, 1, 1),
+            stop_loss=145.0, take_profit=160.0, trade_type=TradeType.DAY,
+        ), db_path)
+
+        ib = MagicMock()
+        ib.positions.return_value = [_FakeIBPos("AAPL", -10)]  # short!
+        ib.fills.return_value = []
+
+        with patch("core.scheduler.notify_reconciliation_mismatch") as mock_notify:
+            report = run_nightly_reconciliation(ib, db_path=db_path)
+
+        assert report["qty_mismatches"]["AAPL"]["type"] == "sign_mismatch"
+        mock_notify.assert_called_once()
+
+    def test_multiple_mismatches_single_alert(self, tmp_path):
+        """All mismatches reported in one alert, not one per ticker."""
+        from core.portfolio import init_db, add_position
+        from core.models import TradeType, Position
+
+        db_path = tmp_path / "test.db"
+        init_db(db_path)
+        for t in ("AAPL", "MSFT", "NVDA"):
+            add_position(Position(
+                ticker=t, exchange="SMART", quantity=10,
+                entry_price=150.0, entry_time=datetime(2024, 1, 1),
+                stop_loss=145.0, take_profit=160.0, trade_type=TradeType.DAY,
+            ), db_path)
+
+        ib = MagicMock()
+        ib.positions.return_value = []  # IBKR has none of them
+        ib.fills.return_value = []
+
+        with patch("core.scheduler.notify_reconciliation_mismatch") as mock_notify:
+            run_nightly_reconciliation(ib, db_path=db_path)
+
+        mock_notify.assert_called_once()
+        args = mock_notify.call_args.args[0]
+        assert sorted(args["orphaned_db"]) == ["AAPL", "MSFT", "NVDA"]
+
+    def test_empty_both_sides_is_in_sync(self, tmp_path):
+        """DB empty and IBKR empty = in sync, no alert."""
+        from core.portfolio import init_db
+
+        db_path = tmp_path / "test.db"
+        init_db(db_path)
+
+        ib = MagicMock()
+        ib.positions.return_value = []
+        ib.fills.return_value = []
+
+        with patch("core.scheduler.notify_reconciliation_mismatch") as mock_notify:
+            report = run_nightly_reconciliation(ib, db_path=db_path)
+
+        assert report["in_sync"] is True
+        mock_notify.assert_not_called()
+
+
+class TestNotifyReconciliationMismatch:
+    """notify_reconciliation_mismatch(report) formats and sends alert."""
+
+    def test_formats_orphaned_db(self):
+        from notifications.telegram import notify_reconciliation_mismatch
+
+        report = {
+            "db_count": 2, "ibkr_count": 1,
+            "orphaned_db": ["AAPL", "MSFT"],
+            "orphaned_ibkr": [],
+            "qty_mismatches": {},
+            "in_sync": False,
+        }
+        with patch("notifications.telegram._send_sync") as mock_send:
+            mock_send.return_value = True
+            notify_reconciliation_mismatch(report)
+
+        mock_send.assert_called_once()
+        text = mock_send.call_args.args[0]
+        assert "AAPL" in text
+        assert "MSFT" in text
+
+    def test_formats_orphaned_ibkr(self):
+        from notifications.telegram import notify_reconciliation_mismatch
+
+        report = {
+            "db_count": 0, "ibkr_count": 1,
+            "orphaned_db": [],
+            "orphaned_ibkr": ["GOOG"],
+            "qty_mismatches": {},
+            "in_sync": False,
+        }
+        with patch("notifications.telegram._send_sync") as mock_send:
+            mock_send.return_value = True
+            notify_reconciliation_mismatch(report)
+
+        text = mock_send.call_args.args[0]
+        assert "GOOG" in text
+
+    def test_formats_qty_mismatch(self):
+        from notifications.telegram import notify_reconciliation_mismatch
+
+        report = {
+            "db_count": 1, "ibkr_count": 1,
+            "orphaned_db": [], "orphaned_ibkr": [],
+            "qty_mismatches": {
+                "AAPL": {"db": 10, "ibkr": 100, "type": "quantity_mismatch"},
+            },
+            "in_sync": False,
+        }
+        with patch("notifications.telegram._send_sync") as mock_send:
+            mock_send.return_value = True
+            notify_reconciliation_mismatch(report)
+
+        text = mock_send.call_args.args[0]
+        assert "AAPL" in text
+        assert "10" in text and "100" in text
+
+    def test_sign_mismatch_flagged_critical(self):
+        from notifications.telegram import notify_reconciliation_mismatch
+
+        report = {
+            "db_count": 1, "ibkr_count": 1,
+            "orphaned_db": [], "orphaned_ibkr": [],
+            "qty_mismatches": {
+                "AAPL": {"db": 10, "ibkr": -10, "type": "sign_mismatch"},
+            },
+            "in_sync": False,
+        }
+        with patch("notifications.telegram._send_sync") as mock_send:
+            mock_send.return_value = True
+            notify_reconciliation_mismatch(report)
+
+        text = mock_send.call_args.args[0]
+        # Message should loudly warn about direction mismatch
+        assert "direction" in text.lower() or "critical" in text.lower() or "sign" in text.lower()
+
+
+
+
 class TestMarketHoursDST:
     """Verify NYSE market hours follow US DST, not the local display timezone.
 

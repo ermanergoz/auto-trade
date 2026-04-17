@@ -464,6 +464,43 @@ def notify_error(error: str) -> bool:
     return _send_sync(text)
 
 
+def notify_reconciliation_mismatch(report: dict) -> bool:
+    """Alert when nightly reconciliation detects DB/IBKR drift.
+
+    Sign mismatches (DB long vs IBKR short) are flagged as critical —
+    manual intervention required.
+    """
+    qty_mismatches = report.get("qty_mismatches", {}) or {}
+    sign_mismatches = [t for t, v in qty_mismatches.items() if v.get("type") == "sign_mismatch"]
+
+    header = "\U0001f6a8 <b>CRITICAL: Direction Mismatch</b>" if sign_mismatches \
+        else "\u26a0\ufe0f <b>Reconciliation Mismatch</b>"
+
+    lines = [header, ""]
+
+    orphaned_db = report.get("orphaned_db", []) or []
+    if orphaned_db:
+        lines.append(f"<b>In DB but not in IBKR</b> ({len(orphaned_db)}):")
+        for t in orphaned_db:
+            lines.append(f"  \u2022 <code>{t}</code>")
+
+    orphaned_ibkr = report.get("orphaned_ibkr", []) or []
+    if orphaned_ibkr:
+        lines.append(f"<b>In IBKR but not in DB</b> ({len(orphaned_ibkr)}):")
+        for t in orphaned_ibkr:
+            lines.append(f"  \u2022 <code>{t}</code>")
+
+    if qty_mismatches:
+        lines.append(f"<b>Quantity mismatches</b> ({len(qty_mismatches)}):")
+        for t, v in qty_mismatches.items():
+            tag = " [sign mismatch]" if v.get("type") == "sign_mismatch" else ""
+            lines.append(f"  \u2022 <code>{t}</code>: DB={v.get('db')} IBKR={v.get('ibkr')}{tag}")
+
+    lines.append("")
+    lines.append("Manual review required.")
+    return _send_sync("\n".join(lines))
+
+
 def notify_stale_order_cancelled(ticker: str, age_hours: float, reason: str = "Failed re-screening") -> bool:
     """Notify that a stale unfilled order was cancelled after re-evaluation."""
     text = (

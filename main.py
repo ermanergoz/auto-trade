@@ -108,6 +108,34 @@ def display_account_summary(summary: dict) -> None:
     console.print(table)
 
 
+def _extract_ibkr_fills(ib) -> list[dict]:
+    """Convert ib.fills() to plain dicts for reconcile_positions.
+
+    ib_insync populates ib.fills() during connection sync, giving us the
+    actual execution prices for orders that filled while the bot was
+    offline. Using those beats guessing with stop_loss.
+    """
+    try:
+        fills = ib.fills()
+    except Exception as e:
+        logger.debug("Could not fetch ib.fills(): %s", e)
+        return []
+    result = []
+    for f in fills:
+        try:
+            result.append({
+                "ticker": f.contract.symbol,
+                "side": f.execution.side,
+                "shares": float(f.execution.shares),
+                "price": float(f.execution.price),
+                "time": f.execution.time,
+                "realized_pnl": float(getattr(f.commissionReport, "realizedPNL", 0.0) or 0.0),
+            })
+        except Exception as e:
+            logger.debug("Skipping unparseable fill: %s", e)
+    return result
+
+
 def _resolve_markets(market_arg: str) -> list[str]:
     if market_arg == "all":
         return MARKETS
@@ -192,7 +220,8 @@ def run_watchdog_mode(args: argparse.Namespace, markets: list[str]) -> None:
             {"ticker": p.contract.symbol, "quantity": int(p.position)}
             for p in _ib.positions()
         ]
-        recon = reconcile_positions(ibkr_positions, auto_fix=True)
+        ibkr_fills = _extract_ibkr_fills(_ib)
+        recon = reconcile_positions(ibkr_positions, auto_fix=True, ibkr_fills=ibkr_fills)
         if recon["auto_closed"]:
             logger.warning("Auto-closed orphaned positions: %s", recon["auto_closed"])
         if recon["orphaned_ibkr"]:
@@ -337,7 +366,8 @@ def main() -> None:
             {"ticker": p.contract.symbol, "quantity": int(p.position)}
             for p in ib.positions()
         ]
-        recon = reconcile_positions(ibkr_positions, auto_fix=True)
+        ibkr_fills = _extract_ibkr_fills(ib)
+        recon = reconcile_positions(ibkr_positions, auto_fix=True, ibkr_fills=ibkr_fills)
         if recon["auto_closed"]:
             console.print(
                 f"[yellow]Auto-closed orphaned DB positions: {recon['auto_closed']} "
