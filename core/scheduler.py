@@ -180,6 +180,17 @@ def run_scan_cycle(
         stock_data = _fetch_market_data(ib, market_stocks)
         sector_lookup = {s.ticker: s.sector for s in market_stocks}
 
+        if not ib.isConnected():
+            logger.error(
+                "IBKR disconnected during data fetch — aborting scan for %s "
+                "(got %d/%d stocks)", market, len(stock_data), len(market_stocks),
+            )
+            notify_error(
+                f"Scan aborted: IBKR disconnected during data fetch "
+                f"({len(stock_data)}/{len(market_stocks)} stocks fetched)"
+            )
+            return summary
+
         # Step 2: Run screener
         update_status("screening", f"{len(stock_data)} stocks")
         candidates = screen_stocks(stock_data)
@@ -251,7 +262,13 @@ def run_scan_cycle(
             # would miss trades closed before 03:00 Istanbul time.
             from datetime import timezone as _utc_tz
             recent_trades = get_trades(start_date=datetime.now(_utc_tz.utc).date())
-            result = evaluate(signal, open_positions, portfolio_value, fresh_daily_pnl, current_price=current_price, recent_trades=recent_trades)
+
+            # Fetch analyst consensus to block buys on sell-rated stocks
+            from core.data import get_analyst_recommendation
+            analyst_data = get_analyst_recommendation(signal.ticker)
+            analyst_consensus = analyst_data["consensus"] if analyst_data else None
+
+            result = evaluate(signal, open_positions, portfolio_value, fresh_daily_pnl, current_price=current_price, recent_trades=recent_trades, analyst_consensus=analyst_consensus)
             if not result.approved:
                 logger.info("Risk rejected %s: %s", signal.ticker, "; ".join(result.reasons))
                 if any("circuit breaker" in r.lower() for r in result.reasons):
@@ -284,6 +301,19 @@ def run_scan_cycle(
             trades = place_order(ib, signal, result.position_size, dry_run=dry_run)
 
             if trades:
+                # Register handlers BEFORE the rejection check sleep.
+                # This closes a race window where a fill could fire between
+                # place_order() returning and handler registration. Handlers
+                # only act on "Filled" status, so they're no-ops for rejected
+                # orders (which show "Inactive"/"Cancelled").
+                setup_fill_handler(
+                    ib, signal, result.position_size,
+                    on_fill=_on_fill, parent_order=trades[0].order,
+                )
+                setup_exit_handler(
+                    ib, signal, on_exit=_on_exit, parent_order=trades[0].order,
+                )
+
                 # Give IBKR time to accept or reject the order before
                 # checking status — rejections (e.g. insufficient funds)
                 # arrive asynchronously within ~500ms.
@@ -306,17 +336,6 @@ def run_scan_cycle(
                         f"Reason: {reason or 'unknown'}"
                     )
                 else:
-                    # Attach fill/exit handlers AFTER placing order so we can
-                    # pass the parent order for precise permId matching.
-                    # The bracket uses transmit=False until the last child,
-                    # so fills cannot arrive before place_order returns.
-                    setup_fill_handler(
-                        ib, signal, result.position_size,
-                        on_fill=_on_fill, parent_order=trades[0].order,
-                    )
-                    setup_exit_handler(
-                        ib, signal, on_exit=_on_exit, parent_order=trades[0].order,
-                    )
                     summary["orders_placed"] += 1
                     notify_trade(signal, result.position_size, action_type="SUBMITTED")
 
@@ -429,6 +448,13 @@ def _fetch_market_data(
     stock_data: dict[str, tuple[str, pd.DataFrame]] = {}
 
     for stock in stocks:
+        if not ib.isConnected():
+            logger.warning(
+                "IBKR disconnected mid-fetch — got %d/%d stocks before disconnect",
+                len(stock_data), len(stocks),
+            )
+            break
+
         try:
             contract = create_contract(stock.ticker, stock.exchange)
             df = get_historical_data(ib, contract, duration="60 D", bar_size="1 day")
@@ -484,11 +510,44 @@ def start_scheduler(
         SCAN_INTERVAL_MINUTES, markets,
     )
 
+    watchdog_mode = not reconnect
+
     try:
         while not _state.shutting_down:
-            run_scan_cycle(ib, markets, mode, force=force)
-            if not _state.shutting_down:
-                ib.sleep(SCAN_INTERVAL_MINUTES * 60)
+            if ib.isConnected():
+                run_scan_cycle(ib, markets, mode, force=force)
+
+            if _state.shutting_down:
+                break
+
+            # Sleep between scans, keeping the event loop alive.
+            # When disconnected in watchdog mode, use shorter sleeps so we
+            # resume scanning promptly once the watchdog reconnects.
+            if ib.isConnected():
+                try:
+                    ib.sleep(SCAN_INTERVAL_MINUTES * 60)
+                except Exception:
+                    if _state.shutting_down:
+                        break
+                    if watchdog_mode:
+                        logger.debug("ib.sleep() interrupted — will retry")
+                    else:
+                        raise
+            elif watchdog_mode:
+                import asyncio
+                from ib_insync.util import run
+                logger.info(
+                    "IBKR disconnected — waiting for watchdog to reconnect..."
+                )
+                while not ib.isConnected() and not _state.shutting_down:
+                    run(asyncio.sleep(5))
+                if ib.isConnected():
+                    logger.info("Watchdog reconnected — resuming scans")
+            else:
+                # Non-watchdog mode with no connection — give up
+                logger.error("IBKR disconnected and no watchdog — exiting scheduler")
+                break
+
     except (KeyboardInterrupt, SystemExit):
         pass
     finally:
@@ -502,4 +561,5 @@ def start_scheduler(
         except Exception:
             pass
         notify_shutdown()
-        disconnect(ib)
+        if not watchdog_mode:
+            disconnect(ib)

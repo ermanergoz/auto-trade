@@ -32,6 +32,7 @@ from config.settings import (
     CIRCUIT_BREAKER_LOSSES,
     CIRCUIT_BREAKER_WINDOW_MIN,
     VOLATILITY_BASELINE,
+    CHECK_ANALYST_CONSENSUS,
 )
 
 logger = logging.getLogger(__name__)
@@ -475,6 +476,30 @@ def check_circuit_breaker(
     return True, ""
 
 
+def check_analyst_consensus(
+    signal: Signal,
+    consensus: str | None,
+    enabled: bool = CHECK_ANALYST_CONSENSUS,
+) -> tuple[bool, str]:
+    """Block BUY when analyst consensus is sell or strong sell.
+
+    Args:
+        consensus: "strong_buy", "buy", "hold", "sell", "strong_sell", or None.
+        enabled: Feature toggle (from settings.CHECK_ANALYST_CONSENSUS).
+
+    Pass-through when: disabled, not a BUY signal, or no data available.
+    """
+    if not enabled or signal.action != Action.BUY or consensus is None:
+        return True, ""
+
+    if consensus in ("sell", "strong_sell"):
+        return False, (
+            f"Analyst consensus is '{consensus}' — blocking BUY. "
+            "Analysts recommend selling this stock."
+        )
+    return True, ""
+
+
 # ---------------------------------------------------------------------------
 # Volatility
 # ---------------------------------------------------------------------------
@@ -561,6 +586,7 @@ def evaluate(
     current_price: float = 0.0,
     recent_trades: list[Trade] | None = None,
     volatility: float | None = None,
+    analyst_consensus: str | None = None,
 ) -> RiskResult:
     """Run all risk checks on a signal. Returns RiskResult.
 
@@ -569,6 +595,8 @@ def evaluate(
     Args:
         volatility: Current annualized market volatility. When provided,
                     position sizes are scaled inversely (high vol → smaller).
+        analyst_consensus: Analyst recommendation consensus string
+                          ("buy", "sell", "hold", etc.) or None if unavailable.
     """
     reasons = []
 
@@ -577,6 +605,19 @@ def evaluate(
 
     # Get indicator values for trend check
     indicator_values = getattr(signal, "indicator_values", {}) or {}
+
+    # Detect if this signal is closing an existing position (exit signal).
+    # Exit signals must not be blocked by discipline checks (trend, anti-momentum,
+    # risk/reward, analyst consensus) — those only apply to new entries. Blocking
+    # an exit can trap the trader in a losing position indefinitely.
+    is_exit = False
+    for pos in open_positions:
+        if pos.ticker == signal.ticker and pos.quantity != 0:
+            # SELL on existing long = exit, BUY on existing short = exit
+            if (signal.action == Action.SELL and pos.quantity > 0) or \
+               (signal.action == Action.BUY and pos.quantity < 0):
+                is_exit = True
+                break
 
     # Pre-compute position size for sector concentration check
     # so we use the actual risk-sized value, not a fixed max estimate
@@ -594,13 +635,20 @@ def evaluate(
         check_sector_concentration(signal, open_positions, portfolio_value,
                                     proposed_value=proposed_value),
         check_no_duplicate(signal, open_positions),
-        # Discipline rules
         check_excluded_sector(signal),
-        check_risk_reward(signal),
-        check_anti_momentum(signal, price),
-        check_trend_confirmation(signal, indicator_values),
         check_circuit_breaker(recent_trades or []),
     ]
+
+    # Discipline checks only apply to new entries, not exits.
+    # Blocking an exit with trend/momentum/R:R checks would prevent
+    # closing losing positions when the market moves against us.
+    if not is_exit:
+        checks.extend([
+            check_risk_reward(signal),
+            check_anti_momentum(signal, price),
+            check_trend_confirmation(signal, indicator_values),
+            check_analyst_consensus(signal, analyst_consensus),
+        ])
 
     for passed, reason in checks:
         if not passed:
