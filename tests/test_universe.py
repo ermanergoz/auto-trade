@@ -44,7 +44,18 @@ class TestFinancialFilter:
         assert _is_excluded_sector("Healthcare") is False
         assert _is_excluded_sector("Energy") is False
         assert _is_excluded_sector("Industrials") is False
-        assert _is_excluded_sector("") is False
+
+    def test_blank_sector_excluded_fail_closed(self):
+        """Unknown sector must be excluded — defense-in-depth for cached/stale entries.
+
+        A stock loaded from cache with a blank sector string has no verified
+        classification. The safety contract is 'never trade a stock we cannot
+        confirm is not financial/defense.' Returning False here would let an
+        unclassified financial slip through the filter.
+        """
+        assert _is_excluded_sector("") is True
+        assert _is_excluded_sector(None) is True  # type: ignore[arg-type]
+        assert _is_excluded_sector("   ") is True
 
     def test_case_insensitive(self):
         assert _is_excluded_sector("FINANCIALS") is True
@@ -141,6 +152,22 @@ class TestFilterUniverse:
         stocks = [StockInfo("UNK", "SMART", "Technology", 0, 0)]
         filtered = _filter_universe(stocks)
         assert len(filtered) == 1
+
+    def test_blank_sector_from_cache_excluded(self):
+        """A cached stock with missing sector must be dropped (safety default).
+
+        _fill_missing_sectors drops unclassified stocks, but when build_universe
+        loads from cache (day 2+) it only reapplies _filter_universe. Any cached
+        entry with sector="" would otherwise bypass both filters.
+        """
+        stocks = [
+            StockInfo("AAPL", "SMART", "Technology", 0, 0),
+            StockInfo("MYSTERY", "SMART", "", 0, 0),  # unclassified
+        ]
+        filtered = _filter_universe(stocks)
+        tickers = {s.ticker for s in filtered}
+        assert "AAPL" in tickers
+        assert "MYSTERY" not in tickers
 
     def test_equity_etf_passes_filter(self):
         stocks = [StockInfo("SPY", "SMART", "Equity ETF", 0, 0)]
