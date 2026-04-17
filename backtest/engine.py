@@ -5,8 +5,8 @@ Only replaces the data source (YFinance) and execution (simulated).
 """
 
 import logging
-from dataclasses import dataclass, field
-from datetime import datetime, date
+from dataclasses import dataclass, field, replace
+from datetime import datetime, date, timedelta
 from typing import Optional
 
 import pandas as pd
@@ -76,6 +76,25 @@ class SimulatedPortfolio:
         else:
             adjusted_price = fill_price * (1 - self.slippage_pct / 100)
 
+        # Rescale SL/TP to preserve the intended risk/reward percentage relative
+        # to the actual fill price. The signal's SL/TP are computed from the
+        # screener's entry_price (yesterday's close); when the next bar opens
+        # with a gap, executing at the new open would otherwise leave SL/TP on
+        # the wrong side of entry and invalidate the risk calibration.
+        stop_loss = signal.stop_loss
+        take_profit = signal.take_profit
+        if signal.entry_price > 0:
+            if signal.action == Action.BUY:
+                sl_pct = (signal.entry_price - signal.stop_loss) / signal.entry_price
+                tp_pct = (signal.take_profit - signal.entry_price) / signal.entry_price
+                stop_loss = adjusted_price * (1 - sl_pct)
+                take_profit = adjusted_price * (1 + tp_pct)
+            else:
+                sl_pct = (signal.stop_loss - signal.entry_price) / signal.entry_price
+                tp_pct = (signal.entry_price - signal.take_profit) / signal.entry_price
+                stop_loss = adjusted_price * (1 + sl_pct)
+                take_profit = adjusted_price * (1 - tp_pct)
+
         if signal.action == Action.BUY:
             # Long: debit cash (pay for shares)
             cost = adjusted_price * quantity + self.commission
@@ -96,8 +115,8 @@ class SimulatedPortfolio:
             quantity=stored_quantity,
             entry_price=adjusted_price,
             entry_time=current_date,
-            stop_loss=signal.stop_loss,
-            take_profit=signal.take_profit,
+            stop_loss=stop_loss,
+            take_profit=take_profit,
             trade_type=signal.trade_type,
             sector=signal.indicator_values.get("sector", ""),
         ))
@@ -404,3 +423,114 @@ def run_backtest(config: BacktestConfig) -> SimulatedPortfolio:
     )
 
     return portfolio
+
+
+# ---------------------------------------------------------------------------
+# Walk-forward validation
+# ---------------------------------------------------------------------------
+
+@dataclass
+class WalkForwardResult:
+    """Results from a walk-forward backtest.
+
+    Splits the date range into an in-sample (IS) training period and an
+    out-of-sample (OOS) testing period. Both are run with the same config
+    and fresh capital; large IS→OOS degradation means the strategy was
+    overfit to the in-sample window.
+    """
+    in_sample_portfolio: SimulatedPortfolio
+    out_of_sample_portfolio: SimulatedPortfolio
+    in_sample_metrics: dict
+    out_of_sample_metrics: dict
+    degradation: dict
+    in_sample_start: date
+    in_sample_end: date
+    out_of_sample_start: date
+    out_of_sample_end: date
+    split_date: date
+
+
+def walk_forward_backtest(
+    config: BacktestConfig,
+    train_ratio: float = 0.6,
+) -> WalkForwardResult:
+    """Split the date range into IS/OOS and run both — detects overfitting.
+
+    A robust strategy produces similar metrics on both halves. If OOS metrics
+    are much worse than IS, the strategy memorized the IS period's noise.
+
+    Args:
+        config: Standard BacktestConfig — must have both start_date and end_date.
+        train_ratio: Fraction of the date range used for in-sample (default 0.6).
+    """
+    if not 0.0 < train_ratio < 1.0:
+        raise ValueError(
+            f"train_ratio must be between 0 and 1 (exclusive), got {train_ratio}"
+        )
+    if not config.start_date or not config.end_date:
+        raise ValueError(
+            "walk_forward_backtest requires both config.start_date and config.end_date"
+        )
+
+    start = date.fromisoformat(config.start_date)
+    end = date.fromisoformat(config.end_date)
+    if end <= start:
+        raise ValueError(
+            f"end_date ({end}) must be after start_date ({start})"
+        )
+
+    total_days = (end - start).days
+    split_offset = int(total_days * train_ratio)
+    split_date = start + timedelta(days=split_offset)
+    # In-sample ends the day before split_date; out-of-sample starts on split_date.
+    is_end = split_date - timedelta(days=1)
+
+    # Import here to avoid circular import
+    from backtest.report import calculate_metrics
+
+    is_config = replace(
+        config,
+        start_date=start.isoformat(),
+        end_date=is_end.isoformat(),
+    )
+    oos_config = replace(
+        config,
+        start_date=split_date.isoformat(),
+        end_date=end.isoformat(),
+    )
+
+    logger.info(
+        "Walk-forward: IS %s → %s (%d days), OOS %s → %s (%d days)",
+        start, is_end, (is_end - start).days,
+        split_date, end, (end - split_date).days,
+    )
+
+    is_portfolio = run_backtest(is_config)
+    oos_portfolio = run_backtest(oos_config)
+
+    is_metrics = calculate_metrics(
+        is_portfolio.trades, is_portfolio.equity_curve, is_config.initial_capital,
+    )
+    oos_metrics = calculate_metrics(
+        oos_portfolio.trades, oos_portfolio.equity_curve, oos_config.initial_capital,
+    )
+
+    # Degradation: OOS - IS for each numeric metric.
+    degradation: dict = {}
+    for key, is_val in is_metrics.items():
+        oos_val = oos_metrics.get(key)
+        if isinstance(is_val, (int, float)) and isinstance(oos_val, (int, float)):
+            degradation[key] = oos_val - is_val
+
+    return WalkForwardResult(
+        in_sample_portfolio=is_portfolio,
+        out_of_sample_portfolio=oos_portfolio,
+        in_sample_metrics=is_metrics,
+        out_of_sample_metrics=oos_metrics,
+        degradation=degradation,
+        in_sample_start=start,
+        in_sample_end=is_end,
+        out_of_sample_start=split_date,
+        out_of_sample_end=end,
+        split_date=split_date,
+    )

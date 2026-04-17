@@ -1,7 +1,9 @@
 """Tests for backtest/engine.py and backtest/report.py."""
 
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
+from unittest.mock import patch, MagicMock
 
+import pandas as pd
 import pytest
 
 from core.models import Action, Trade, TradeType
@@ -12,6 +14,9 @@ from backtest.report import (
     compare_ai_value_add,
 )
 from tests.conftest import make_signal as _make_signal
+
+# New walk-forward API (Feature 2)
+from backtest.engine import walk_forward_backtest, WalkForwardResult
 
 
 class TestSimulatedPortfolio:
@@ -57,6 +62,62 @@ class TestSimulatedPortfolio:
         p.record_equity(date(2024, 1, 16))
         assert len(p.equity_curve) == 2
         assert p.equity_curve[0][1] == 100_000
+
+    def test_stop_and_target_rescaled_to_fill_on_gap_down_long(self):
+        """On a gap-down entry, stop/take-profit must track the fill price.
+
+        The screener computes SL/TP relative to yesterday's close (signal
+        entry_price). When the next-day open gaps, executing at open means
+        the intended risk percentage is preserved only if SL/TP are
+        rescaled from the actual fill price. Otherwise a long can enter
+        with a stop already ABOVE the fill price, triggering an immediate
+        non-sensical exit.
+        """
+        p = SimulatedPortfolio(
+            initial_capital=100_000, slippage_pct=0.0, commission=0.0,
+        )
+        # Signal: long AAPL at $100 with SL=$95 (5% risk) and TP=$110 (10% target)
+        sig = _make_signal(
+            action=Action.BUY, entry_price=100.0,
+            stop_loss=95.0, take_profit=110.0,
+        )
+        # Gap down — today's open is $90
+        p.open_position(sig, 10, fill_price=90.0, current_date=datetime(2024, 1, 15))
+
+        assert len(p.positions) == 1
+        pos = p.positions[0]
+        # Percentages preserved relative to fill ($90):
+        #   SL_pct = 5% → new SL = 90 * 0.95 = 85.5
+        #   TP_pct = 10% → new TP = 90 * 1.10 = 99.0
+        assert pos.stop_loss == pytest.approx(85.5)
+        assert pos.take_profit == pytest.approx(99.0)
+        # Critical: stop must be BELOW the entry price for a long
+        assert pos.stop_loss < pos.entry_price, (
+            f"Long position stop must be below fill; got stop={pos.stop_loss}, "
+            f"entry={pos.entry_price}"
+        )
+
+    def test_stop_and_target_rescaled_to_fill_on_gap_up_short(self):
+        """Short version of the gap rescaling: SL above fill, TP below."""
+        p = SimulatedPortfolio(
+            initial_capital=100_000, slippage_pct=0.0, commission=0.0,
+        )
+        # Short AAPL at $100 with SL=$105 (5% risk above) and TP=$90 (10% target below)
+        sig = _make_signal(
+            action=Action.SELL, entry_price=100.0,
+            stop_loss=105.0, take_profit=90.0,
+        )
+        # Gap up — fill at $110
+        p.open_position(sig, 10, fill_price=110.0, current_date=datetime(2024, 1, 15))
+
+        pos = p.positions[0]
+        # SL_pct = 5% above entry → new SL = 110 * 1.05 = 115.5
+        # TP_pct = 10% below entry → new TP = 110 * 0.90 = 99.0
+        assert pos.stop_loss == pytest.approx(115.5)
+        assert pos.take_profit == pytest.approx(99.0)
+        # Short: stop must be ABOVE fill, TP below fill
+        assert pos.stop_loss > pos.entry_price
+        assert pos.take_profit < pos.entry_price
 
 
 class TestShortPositionAccounting:
@@ -756,3 +817,318 @@ class TestDailyPnlMTMConsistency:
         # but the equity curve recorded MTM. This is the bug:
         # daily_pnl compares entry-price portfolio_value against MTM equity_curve
         assert pnl != pnl_mtm or True  # Document the inconsistency exists
+
+
+# ---------------------------------------------------------------------------
+# Feature 2: Walk-forward backtest
+# ---------------------------------------------------------------------------
+
+def _make_trade(pnl: float, exit_dt: datetime) -> Trade:
+    """Quick trade fixture for walk-forward tests."""
+    entry_price = 100.0
+    exit_price = entry_price + pnl  # quantity=1
+    return Trade(
+        ticker="TEST", exchange="SMART", quantity=1,
+        entry_price=entry_price, exit_price=exit_price,
+        entry_time=exit_dt - timedelta(hours=1),
+        exit_time=exit_dt,
+        trade_type=TradeType.DAY, sector="Technology",
+    )
+
+
+def _make_portfolio_with_trades(n_trades: int, avg_pnl: float) -> SimulatedPortfolio:
+    """Build a SimulatedPortfolio with fake trades + equity curve."""
+    p = SimulatedPortfolio(initial_capital=100_000)
+    start = datetime(2024, 1, 1)
+    equity = 100_000.0
+    p.equity_curve.append((start.date(), equity))
+    for i in range(n_trades):
+        t = _make_trade(avg_pnl, start + timedelta(days=i + 1))
+        p.trades.append(t)
+        equity += avg_pnl
+        p.equity_curve.append((t.exit_time.date(), equity))
+    p.cash = equity
+    return p
+
+
+class TestWalkForwardSplit:
+    """Date-range splitting logic for walk-forward backtesting."""
+
+    @patch("backtest.engine.run_backtest")
+    def test_default_ratio_is_60_40(self, mock_run):
+        """Default train_ratio=0.6 should give 60% IS, 40% OOS."""
+        mock_run.side_effect = [
+            _make_portfolio_with_trades(5, 10.0),   # IS
+            _make_portfolio_with_trades(3, 5.0),    # OOS
+        ]
+        config = BacktestConfig(
+            tickers=["AAPL"],
+            start_date="2023-01-01",
+            end_date="2024-01-01",
+        )
+        result = walk_forward_backtest(config)
+
+        # Should have called run_backtest twice with different date ranges
+        assert mock_run.call_count == 2
+        is_cfg = mock_run.call_args_list[0].args[0]
+        oos_cfg = mock_run.call_args_list[1].args[0]
+
+        # Total range ~ 365 days; IS should be ~219 days, OOS ~146
+        is_days = (date.fromisoformat(is_cfg.end_date) - date.fromisoformat(is_cfg.start_date)).days
+        oos_days = (date.fromisoformat(oos_cfg.end_date) - date.fromisoformat(oos_cfg.start_date)).days
+        total = is_days + oos_days
+        assert abs(is_days / total - 0.6) < 0.05
+
+    @patch("backtest.engine.run_backtest")
+    def test_custom_ratio_50_50(self, mock_run):
+        mock_run.side_effect = [
+            _make_portfolio_with_trades(5, 10.0),
+            _make_portfolio_with_trades(5, 10.0),
+        ]
+        config = BacktestConfig(
+            tickers=["AAPL"],
+            start_date="2023-01-01",
+            end_date="2023-12-31",
+        )
+        walk_forward_backtest(config, train_ratio=0.5)
+
+        is_cfg = mock_run.call_args_list[0].args[0]
+        oos_cfg = mock_run.call_args_list[1].args[0]
+        is_days = (date.fromisoformat(is_cfg.end_date) - date.fromisoformat(is_cfg.start_date)).days
+        oos_days = (date.fromisoformat(oos_cfg.end_date) - date.fromisoformat(oos_cfg.start_date)).days
+        assert abs(is_days - oos_days) <= 2
+
+    @patch("backtest.engine.run_backtest")
+    def test_is_and_oos_do_not_overlap(self, mock_run):
+        """Out-of-sample must start strictly after in-sample ends."""
+        mock_run.side_effect = [
+            _make_portfolio_with_trades(1, 0.0),
+            _make_portfolio_with_trades(1, 0.0),
+        ]
+        config = BacktestConfig(
+            tickers=["AAPL"], start_date="2023-01-01", end_date="2023-12-31",
+        )
+        walk_forward_backtest(config)
+
+        is_cfg = mock_run.call_args_list[0].args[0]
+        oos_cfg = mock_run.call_args_list[1].args[0]
+        assert date.fromisoformat(is_cfg.end_date) < date.fromisoformat(oos_cfg.start_date)
+
+
+class TestWalkForwardValidation:
+    """Invalid configurations must raise, not silently misbehave."""
+
+    def test_train_ratio_zero_raises(self):
+        cfg = BacktestConfig(tickers=["AAPL"], start_date="2023-01-01", end_date="2023-12-31")
+        with pytest.raises(ValueError):
+            walk_forward_backtest(cfg, train_ratio=0.0)
+
+    def test_train_ratio_one_raises(self):
+        cfg = BacktestConfig(tickers=["AAPL"], start_date="2023-01-01", end_date="2023-12-31")
+        with pytest.raises(ValueError):
+            walk_forward_backtest(cfg, train_ratio=1.0)
+
+    def test_train_ratio_negative_raises(self):
+        cfg = BacktestConfig(tickers=["AAPL"], start_date="2023-01-01", end_date="2023-12-31")
+        with pytest.raises(ValueError):
+            walk_forward_backtest(cfg, train_ratio=-0.1)
+
+    def test_train_ratio_greater_than_one_raises(self):
+        cfg = BacktestConfig(tickers=["AAPL"], start_date="2023-01-01", end_date="2023-12-31")
+        with pytest.raises(ValueError):
+            walk_forward_backtest(cfg, train_ratio=1.5)
+
+    def test_missing_start_date_raises(self):
+        """Walk-forward needs bounded dates to split — empty start must error."""
+        cfg = BacktestConfig(tickers=["AAPL"], start_date="", end_date="2023-12-31")
+        with pytest.raises(ValueError):
+            walk_forward_backtest(cfg)
+
+    def test_missing_end_date_raises(self):
+        cfg = BacktestConfig(tickers=["AAPL"], start_date="2023-01-01", end_date="")
+        with pytest.raises(ValueError):
+            walk_forward_backtest(cfg)
+
+    def test_inverted_date_range_raises(self):
+        """end_date before start_date must error."""
+        cfg = BacktestConfig(tickers=["AAPL"], start_date="2024-01-01", end_date="2023-01-01")
+        with pytest.raises(ValueError):
+            walk_forward_backtest(cfg)
+
+
+class TestWalkForwardResult:
+    """Shape and content of the WalkForwardResult returned."""
+
+    @patch("backtest.engine.run_backtest")
+    def test_returns_both_portfolios(self, mock_run):
+        is_p = _make_portfolio_with_trades(3, 10.0)
+        oos_p = _make_portfolio_with_trades(2, 5.0)
+        mock_run.side_effect = [is_p, oos_p]
+
+        cfg = BacktestConfig(tickers=["AAPL"], start_date="2023-01-01", end_date="2023-12-31")
+        result = walk_forward_backtest(cfg)
+
+        assert isinstance(result, WalkForwardResult)
+        assert result.in_sample_portfolio is is_p
+        assert result.out_of_sample_portfolio is oos_p
+
+    @patch("backtest.engine.run_backtest")
+    def test_computes_metrics_for_both_periods(self, mock_run):
+        mock_run.side_effect = [
+            _make_portfolio_with_trades(5, 10.0),
+            _make_portfolio_with_trades(3, 5.0),
+        ]
+        cfg = BacktestConfig(tickers=["AAPL"], start_date="2023-01-01", end_date="2023-12-31")
+        result = walk_forward_backtest(cfg)
+
+        assert "total_return_pct" in result.in_sample_metrics
+        assert "total_return_pct" in result.out_of_sample_metrics
+        assert "sharpe_ratio" in result.in_sample_metrics
+        assert "sharpe_ratio" in result.out_of_sample_metrics
+        assert "win_rate_pct" in result.in_sample_metrics
+
+    @patch("backtest.engine.run_backtest")
+    def test_degradation_is_oos_minus_is(self, mock_run):
+        """Degradation = OOS - IS for each metric."""
+        mock_run.side_effect = [
+            _make_portfolio_with_trades(10, 10.0),   # IS: all winners, big return
+            _make_portfolio_with_trades(10, -5.0),   # OOS: all losers
+        ]
+        cfg = BacktestConfig(tickers=["AAPL"], start_date="2023-01-01", end_date="2023-12-31")
+        result = walk_forward_backtest(cfg)
+
+        # IS return > 0, OOS return < 0 → degradation negative
+        assert result.degradation["total_return_pct"] < 0
+        # Win rate IS=100%, OOS=0% → degradation ≈ -100
+        assert result.degradation["win_rate_pct"] < -50
+
+    @patch("backtest.engine.run_backtest")
+    def test_result_includes_period_dates(self, mock_run):
+        mock_run.side_effect = [
+            _make_portfolio_with_trades(1, 0.0),
+            _make_portfolio_with_trades(1, 0.0),
+        ]
+        cfg = BacktestConfig(tickers=["AAPL"], start_date="2023-01-01", end_date="2023-12-31")
+        result = walk_forward_backtest(cfg, train_ratio=0.6)
+
+        assert result.in_sample_start == date(2023, 1, 1)
+        assert result.out_of_sample_end == date(2023, 12, 31)
+        # split_date separates the two
+        assert result.in_sample_end < result.out_of_sample_start
+        assert result.split_date == result.out_of_sample_start
+
+    @patch("backtest.engine.run_backtest")
+    def test_no_degradation_when_metrics_identical(self, mock_run):
+        """Identical IS/OOS metrics should produce zero degradation."""
+        mock_run.side_effect = [
+            _make_portfolio_with_trades(5, 10.0),
+            _make_portfolio_with_trades(5, 10.0),
+        ]
+        cfg = BacktestConfig(tickers=["AAPL"], start_date="2023-01-01", end_date="2023-12-31")
+        result = walk_forward_backtest(cfg)
+
+        assert result.degradation["win_rate_pct"] == pytest.approx(0.0, abs=0.1)
+
+
+class TestWalkForwardConfigPassThrough:
+    """Walk-forward must preserve all other config options per period."""
+
+    @patch("backtest.engine.run_backtest")
+    def test_tickers_passed_through(self, mock_run):
+        mock_run.side_effect = [
+            _make_portfolio_with_trades(1, 0.0),
+            _make_portfolio_with_trades(1, 0.0),
+        ]
+        cfg = BacktestConfig(
+            tickers=["AAPL", "MSFT", "NVDA"],
+            start_date="2023-01-01", end_date="2023-12-31",
+        )
+        walk_forward_backtest(cfg)
+
+        for call in mock_run.call_args_list:
+            sub_cfg = call.args[0]
+            assert sub_cfg.tickers == ["AAPL", "MSFT", "NVDA"]
+
+    @patch("backtest.engine.run_backtest")
+    def test_initial_capital_resets_for_oos(self, mock_run):
+        """OOS should start with the same initial_capital, not IS's final value.
+        This is the whole point of out-of-sample — a fresh run."""
+        mock_run.side_effect = [
+            _make_portfolio_with_trades(5, 10.0),
+            _make_portfolio_with_trades(1, 0.0),
+        ]
+        cfg = BacktestConfig(
+            tickers=["AAPL"], initial_capital=100_000.0,
+            start_date="2023-01-01", end_date="2023-12-31",
+        )
+        walk_forward_backtest(cfg)
+
+        is_cfg = mock_run.call_args_list[0].args[0]
+        oos_cfg = mock_run.call_args_list[1].args[0]
+        assert is_cfg.initial_capital == 100_000.0
+        assert oos_cfg.initial_capital == 100_000.0
+
+    @patch("backtest.engine.run_backtest")
+    def test_slippage_and_commission_preserved(self, mock_run):
+        mock_run.side_effect = [
+            _make_portfolio_with_trades(1, 0.0),
+            _make_portfolio_with_trades(1, 0.0),
+        ]
+        cfg = BacktestConfig(
+            tickers=["AAPL"], start_date="2023-01-01", end_date="2023-12-31",
+            slippage_pct=0.25, commission=2.0,
+        )
+        walk_forward_backtest(cfg)
+        for call in mock_run.call_args_list:
+            sub_cfg = call.args[0]
+            assert sub_cfg.slippage_pct == 0.25
+            assert sub_cfg.commission == 2.0
+
+    @patch("backtest.engine.run_backtest")
+    def test_indicator_weights_preserved(self, mock_run):
+        mock_run.side_effect = [
+            _make_portfolio_with_trades(1, 0.0),
+            _make_portfolio_with_trades(1, 0.0),
+        ]
+        weights = {"RSI": 2.0, "MACD": 1.5}
+        cfg = BacktestConfig(
+            tickers=["AAPL"], start_date="2023-01-01", end_date="2023-12-31",
+            indicator_weights=weights,
+        )
+        walk_forward_backtest(cfg)
+        for call in mock_run.call_args_list:
+            assert call.args[0].indicator_weights == weights
+
+
+class TestWalkForwardOverfittingDetection:
+    """The whole point of walk-forward: detecting optimistic IS results."""
+
+    @patch("backtest.engine.run_backtest")
+    def test_overfit_scenario_shows_large_degradation(self, mock_run):
+        """IS wins everything, OOS loses everything → massive degradation."""
+        mock_run.side_effect = [
+            _make_portfolio_with_trades(20, 50.0),    # IS: great
+            _make_portfolio_with_trades(20, -30.0),   # OOS: terrible
+        ]
+        cfg = BacktestConfig(tickers=["AAPL"], start_date="2022-01-01", end_date="2024-01-01")
+        result = walk_forward_backtest(cfg)
+
+        # Win rate IS = 100%, OOS = 0%
+        assert result.in_sample_metrics["win_rate_pct"] == pytest.approx(100.0)
+        assert result.out_of_sample_metrics["win_rate_pct"] == pytest.approx(0.0)
+        # Massive return degradation
+        assert result.degradation["total_return_pct"] < -1.0
+
+    @patch("backtest.engine.run_backtest")
+    def test_robust_strategy_shows_small_degradation(self, mock_run):
+        """A strategy that works in both periods shows small degradation."""
+        mock_run.side_effect = [
+            _make_portfolio_with_trades(10, 5.0),
+            _make_portfolio_with_trades(10, 4.5),  # nearly the same
+        ]
+        cfg = BacktestConfig(tickers=["AAPL"], start_date="2023-01-01", end_date="2023-12-31")
+        result = walk_forward_backtest(cfg)
+
+        # Small degradation — strategy is robust
+        assert abs(result.degradation["win_rate_pct"]) < 5
+        assert abs(result.degradation["total_return_pct"]) < 1.0
