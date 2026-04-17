@@ -531,7 +531,7 @@ The AI analyst performs deep analysis on each screener candidate using a local L
 For each candidate, the analyst gathers:
 - **5-day price action**: Recent OHLCV data showing price movement
 - **Technical indicator values**: All computed indicator values from the screener
-- **News headlines**: Top 5 recent news articles via yfinance (free, no rate limits), falling back to Tavily API when yfinance returns nothing
+- **News headlines**: Top 5 recent news articles via Tavily API (primary), falling back to yfinance when Tavily errors, is unconfigured, or returns nothing
 - **Macro/political headlines**: Top 5 broad market political, regulatory, and macroeconomic headlines via Tavily (shared across all candidates, fetched once per scan cycle)
 - **Sector context**: Current sector performance
 
@@ -565,7 +565,7 @@ Zero. The AI runs locally via Ollama -- no cloud API fees. Each analysis takes ~
 
 ## Risk Management
 
-Every trade must pass through **all 14 risk checks** before execution (10 core checks + 4 discipline checks for new entries only). If any check fails, the trade is rejected and the reasons are logged.
+Every trade must pass through **all 15 risk checks** before execution (10 core checks + 5 discipline checks for new entries only). If any check fails, the trade is rejected and the reasons are logged.
 
 ### Risk Checks
 
@@ -584,8 +584,9 @@ Every trade must pass through **all 14 risk checks** before execution (10 core c
 | **Anti-Momentum** | Reject if price already moved >X% from signal entry (new entries only) | 8% |
 | **Trend Confirmation** | Moving averages must align with trade direction (new entries only) | MA5 > MA10 > MA20 |
 | **Analyst Consensus** | Block BUY when analysts rate sell/strong sell (new entries only) | Enabled |
+| **Correlation Cap** | Reject a new entry whose daily-return correlation with any open position exceeds threshold (new entries only) | 0.7 |
 
-> **Exit signals** (selling a held long, or buying back a held short) skip the discipline checks (risk/reward, anti-momentum, trend confirmation, analyst consensus) so positions can always be closed regardless of market conditions. This prevents the dangerous situation of being trapped in a losing position.
+> **Exit signals** (selling a held long, or buying back a held short) skip the discipline checks (risk/reward, anti-momentum, trend confirmation, analyst consensus, correlation cap) so positions can always be closed regardless of market conditions. This prevents the dangerous situation of being trapped in a losing position.
 
 > **Note**: These defaults are tuned for a small account ($500). For larger accounts, see [docs/RISK-TUNING.md](docs/RISK-TUNING.md) for recommended values at different account sizes.
 
@@ -632,6 +633,16 @@ The backtesting engine replays historical data through the **exact same** screen
 | Warmup period | 60 days | Days skipped for indicator stabilization |
 | Indicator weights | Equal (1.0) | Per-indicator weight multipliers for scoring |
 | Volatility scaling | Off | Scale position sizes inversely to realized volatility |
+
+### Walk-Forward Validation
+
+`walk_forward_backtest(config, train_ratio=0.6)` splits the date range into an **in-sample (IS)** training period and a non-overlapping **out-of-sample (OOS)** test period, runs a separate backtest on each with fresh capital, and reports per-period metrics plus a **degradation** dict (`OOS − IS` for each metric). Large negative degradation (e.g., IS win rate 70% but OOS win rate 45%) means the strategy memorized the IS window and will underperform in live trading. Returns a `WalkForwardResult` dataclass with both portfolios, both metric sets, the split date, and the degradation map.
+
+### Split and Dividend Adjustment
+
+YFinance downloads now pass `auto_adjust=True` explicitly, so the returned OHLC series is continuous through stock splits and dividends (a 4-for-1 split no longer appears as a -75% crash). Two helpers support post-hoc auditing when data comes from a non-adjusting source:
+- `detect_unadjusted_splits(df, threshold=0.3)` — flags days with close-to-close changes large enough to look like an unadjusted split, returning `{date, ratio, type}` entries
+- `adjust_for_splits(df, {date: ratio})` — retroactively scales pre-split OHLC and volume so the series becomes continuous
 
 ### Performance Metrics
 
@@ -788,16 +799,16 @@ pytest tests/ --cov=core --cov=backtest --cov=notifications
 | `conftest.py` | Shared fixtures: `make_signal()`, `make_position()` factories |
 | `test_models.py` | Data class construction, properties, P&L calculations |
 | `test_connection.py` | IBKR connection, reconnection, contract creation |
-| `test_data.py` | Historical data fetching, caching (including mutation safety), news API |
+| `test_data.py` | Historical data fetching, caching (including mutation safety), news API, yfinance auto-adjust verification, split detection and retroactive adjustment |
 | `test_portfolio.py` | Database CRUD operations, position lifecycle |
 | `test_universe.py` | Universe building, financial sector filtering, caching |
 | `test_screener.py` | Technical indicator calculations, scoring, signal generation |
 | `test_analyst.py` | LLM integration, response validation (including `trade_type`), cost tracking |
-| `test_risk.py` | All 14 risk checks, cumulative risk, sector concentration, circuit breaker, analyst consensus, volatility scaling, exit signal bypass, empty sector safety net |
+| `test_risk.py` | All 15 risk checks, cumulative risk, sector concentration, circuit breaker, analyst consensus, correlation cap, volatility scaling, exit signal bypass, empty sector safety net |
 | `test_executor.py` | Fill handling, exit handlers, bracket deduplication, day trade close with bracket cancellation, IBKR position import |
-| `test_scheduler.py` | Streaming pipeline, fill handler ordering, exit tracking |
+| `test_scheduler.py` | Streaming pipeline, fill handler ordering, exit tracking, nightly reconciliation (read-only drift detection with Telegram alerts) |
 | `test_telegram.py` | Status commands, portfolio display, risk notifications |
-| `test_backtest.py` | Backtest engine, MTM equity curve, realistic gap fills, short positions, look-ahead bias checks, anti-momentum current_price passthrough, simultaneous TP/SL resolution |
+| `test_backtest.py` | Backtest engine, MTM equity curve, realistic gap fills, short positions, look-ahead bias checks, anti-momentum current_price passthrough, simultaneous TP/SL resolution, walk-forward in-sample/out-of-sample splitting and degradation reporting |
 | `test_stale_orders.py` | Stale order detection, re-screening, cancellation |
 | `test_settings.py` | Configuration validation at startup |
 
@@ -901,15 +912,19 @@ This system is designed with multiple layers of safety:
 
 13. **Startup position sync** -- On every startup (and reconnect), the bot fully syncs its database with IBKR: positions closed at IBKR while offline are recorded as trades at the stop-loss price (best estimate of actual fill), positions held at IBKR but missing from the DB are imported (with stop-loss/take-profit extracted from open bracket orders), and exit handlers are reattached for all existing orders.
 
+13b. **Nightly reconciliation** -- Once per day, after all markets have closed, the scheduler runs a **read-only** reconciliation between the SQLite positions table and `ib.positions()`. Any orphaned positions (in DB but not at IBKR, or vice versa), quantity mismatches, or direction mismatches are reported via Telegram. Direction mismatches (DB long vs IBKR short) trigger a CRITICAL alert. Unlike startup reconciliation (which auto-closes orphans), the nightly check never modifies state — it purely detects silent drift during normal operation.
+
 13. **Circuit breaker** -- If the system takes 3 consecutive losing trades within 60 minutes (both configurable), all new trading is paused and a Telegram alert is sent. This catches regime changes, stale data, or systematic issues before the daily loss limit is hit.
 
 14. **3-tier sector fallback** -- Stock sector data is resolved through IBKR contract details, then yfinance, then Ollama LLM classification. Only stocks that fail all three are excluded.
 
-14. **News efficiency** -- Stock-specific news is fetched from yfinance first (free, no rate limits), falling back to Tavily only when yfinance returns nothing. Successful news is cached for 1 hour; failed fetches use a 60-second cache so retries happen sooner. This conserves Tavily API quota for macro/political headlines where it has no free alternative.
+14. **News resilience** -- Stock-specific news is fetched from Tavily first (richer results), falling back to yfinance when Tavily errors (e.g. rate limit), is unconfigured, or returns nothing. Each fetch logs which source succeeded so fallback behavior is visible in logs. Successful news is cached for 1 hour; failed fetches use a 60-second cache so retries happen sooner.
 
 15. **Macro/political awareness** -- The AI analyst evaluates broad market political, regulatory, and macroeconomic conditions (elections, trade wars, sanctions, Fed policy) as part of its 7-point checklist. Macro headlines are fetched once per scan cycle via Tavily and shared across all candidates.
 
 16. **Analyst consensus gate** -- Before buying, the bot fetches analyst consensus recommendations from yfinance. If the majority of analysts rate the stock as "sell" or "strong sell", the BUY signal is blocked. Stocks rated "buy", "strong buy", or "hold" pass through. If no analyst data is available (small-cap, newly listed), the buy is still allowed. Data is cached for 24 hours. Controlled by `CHECK_ANALYST_CONSENSUS` setting.
+
+17. **PDT (Pattern Day Trader) protection** -- IBKR restricts accounts with Liquid Net Worth below `PDT_PROTECTION_THRESHOLD_USD` (default $5,000) to closing-orders-only for 30 days once 2 day trades occur within a rolling 5-business-day window. When the portfolio is at or above the threshold, this check is a pass-through. Below it, the bot counts same-calendar-day round-trip trades in the last 5 business days and blocks any new entry or same-day exit that would push the count to `PDT_MAX_DAY_TRADES_PER_5_DAYS` (default 1 — one less than IBKR's trigger of 2). Exits of positions opened on a prior day are never blocked so swing positions can always be closed.
 
 ---
 

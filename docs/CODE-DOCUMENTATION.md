@@ -42,7 +42,7 @@ Think of it like a 3-person trading desk, automated:
 
 2. **The AI Analyst** — A local AI model (Qwen 2.5 7B running on Ollama) that takes those 15 candidates and does deep analysis. It looks at price trends, momentum, volume, news headlines, macro/political context, and a strict 7-point checklist. It's the senior analyst who says "of those 15, I'd actually buy these 3."
 
-3. **The Risk Manager** — A paranoid rule-checker that gates every trade with 14 different safety checks (10 core + 4 discipline checks for new entries only). Position too big? Rejected. Already lost too much today? Rejected. Chasing a stock that already moved 5%? Rejected. Three losses in a row? Circuit breaker pauses everything. Exit signals skip discipline checks so positions can always be closed. It's the compliance officer who makes sure we never blow up.
+3. **The Risk Manager** — A paranoid rule-checker that gates every trade with 15 different safety checks (11 core + 4 discipline checks for new entries only). Position too big? Rejected. Already lost too much today? Rejected. Chasing a stock that already moved 5%? Rejected. Three losses in a row? Circuit breaker pauses everything. Portfolio below the PDT threshold and already used a day trade? The next potential day trade is blocked. Exit signals skip discipline checks so positions can always be closed. It's the compliance officer who makes sure we never blow up.
 
 Only after all three agree does an order actually get placed.
 
@@ -256,6 +256,8 @@ MIN_RISK_REWARD_RATIO = 1.5         # Potential profit must be 1.5x potential lo
 ALLOW_SHORT_SELLING = False         # Block sells for stocks not held (no shorting)
 CIRCUIT_BREAKER_LOSSES = 3          # Pause after 3 consecutive losses
 CIRCUIT_BREAKER_WINDOW_MIN = 60     # Within this many minutes
+PDT_PROTECTION_THRESHOLD_USD = 5000 # Below this, limit day trades to avoid IBKR's 30-day lockout
+PDT_MAX_DAY_TRADES_PER_5_DAYS = 1   # Under threshold: allow at most 1 day trade per rolling 5 biz days
 ```
 
 These values are tuned for a small account ($500). For larger accounts, tighten them back — see [RISK-TUNING.md](RISK-TUNING.md) for a full comparison table and scaling guide.
@@ -308,11 +310,17 @@ This module fetches prices and news. It has two data sources and caching to avoi
 
 ### Fallback Source: YFinance
 
-**`get_historical_data_yfinance(ticker, period, interval)`** — Same data but from Yahoo Finance. Used only by the backtester (since you don't need an IBKR connection to backtest) and as a fallback if IBKR data fails.
+**`get_historical_data_yfinance(ticker, period, interval, auto_adjust=True)`** — Same data but from Yahoo Finance. Used only by the backtester (since you don't need an IBKR connection to backtest) and as a fallback if IBKR data fails. `auto_adjust=True` is the default and asks yfinance to return split- and dividend-adjusted OHLC so the series is continuous through corporate actions. Without this, a 4-for-1 split would appear as a -75% crash and poison every backtest.
+
+### Split & Dividend Adjustment Helpers
+
+**`detect_unadjusted_splits(df, threshold=0.3)`** — Scans a DataFrame for close-to-close changes large enough to look like an unadjusted split. Returns a list of `{date, ratio, type}` entries, where `type` is `"forward"` (price drop, ratio > 1 like 4.0 for 4-for-1) or `"reverse"` (price jump, ratio < 1 like 0.1 for 1-for-10). Intended for validating that a third-party data source actually delivered adjusted bars — if this returns anything, the series is suspect.
+
+**`adjust_for_splits(df, {date: ratio})`** — Retroactively fixes a split-poisoned series. For a forward split (ratio > 1), pre-split prices are divided by the ratio and volume is multiplied by it; for a reverse split (ratio < 1), the same arithmetic applies (which multiplies price and divides volume). On-and-after-split rows are left untouched. Multiple splits compose cumulatively, so earlier bars are scaled by the product of every ratio applied after them. Returns a new DataFrame (the input is never mutated).
 
 ### News
 
-**`get_news(ticker, market, max_results)`** — Fetches recent news headlines for AI context. Tries yfinance first (free, no rate limits); if yfinance returns nothing, falls back to Tavily API. This conserves Tavily quota for macro/political headlines.
+**`get_news(ticker, market, max_results)`** — Fetches recent news headlines for AI context. Tries Tavily first (richer results); if Tavily is unconfigured, errors (e.g. rate limit), or returns nothing, falls back to yfinance. Logs whichever source won, so you can see fallback behavior in the trader logs.
 
 **`get_macro_news(max_results)`** — Fetches broad market political/macro headlines via Tavily (no yfinance equivalent). Called once per scan cycle and shared across all candidates.
 
@@ -424,9 +432,11 @@ Step 5: Cache the result as a JSON file for the rest of the day
 3. **Ollama LLM** — asks the local AI model to classify by sector and country
 4. **Exclude** — unclassifiable stocks are dropped (can't safely filter financials)
 
-**Stock news priority** — yfinance-first to conserve Tavily quota:
-1. **yfinance** — `yf.Ticker().news` returns recent headlines for free (no rate limits)
-2. **Tavily API** — fallback when yfinance returns nothing
+**Stock news priority** — Tavily-first for richer results, yfinance as free fallback:
+1. **Tavily API** — primary source; richer headlines from a broader crawl
+2. **yfinance** — fallback when Tavily errors (e.g. rate limit), is unconfigured, or returns nothing. `yf.Ticker().news` is free and has no rate limits.
+
+Each call logs which source succeeded (`Tavily OK`, `yfinance OK`, or both-failed), so offline-review can confirm fallback worked.
 
 **Macro/political news** — Tavily only (no free alternative for broad market headlines):
 1. **Tavily API** — fetched once per scan cycle, shared across all candidates
@@ -644,7 +654,7 @@ The risk manager is the **last line of defense** before real money moves. Even i
 
 Like the screener, it's **pure functions** — takes portfolio state as input, returns approval/rejection. No data fetching, no side effects. Same code works in live trading and backtesting.
 
-### The 12 Safety Checks
+### The 15 Safety Checks
 
 Every signal must pass ALL of these. Fail one, the trade is rejected.
 
@@ -739,6 +749,20 @@ Rule: Before buying, fetch the analyst consensus recommendation from yfinance. I
 
 Why: The bot once bought a stock that was at its all-time high while IBKR's analyst consensus showed "sell". Even though it turned a profit, it was unnecessarily risky. This check acts as a sanity filter — if professional analysts are bearish, the bot shouldn't be buying. The data comes from yfinance (free, no IBKR subscription needed) and is cached for 24 hours since analyst ratings change infrequently. Controlled by `CHECK_ANALYST_CONSENSUS` setting (default: True).
 
+#### 14. Correlation Cap — `check_correlation()`
+"Is this new position really independent, or is it just another copy of something we already hold?"
+
+Rule: Compute Pearson correlation between the candidate's recent daily returns and each open position's daily returns. If the **maximum** correlation exceeds `CORRELATION_CAP_THRESHOLD` (default 0.7), reject the new entry. Callers pass a `returns_lookup: dict[str, pd.Series]`; if no data is provided for the candidate or for all existing positions, the check is skipped. Negative correlation (hedges) always passes. Setting the threshold to 1.0 or above disables the check.
+
+Why: If you already own NVDA and buy AMD, both semiconductor stocks move together. Tomorrow's chip-sector news hits both positions simultaneously — so two "independent" positions are really one big bet. Institutional risk systems measure and constrain correlation between holdings; this check brings a simple version of that discipline into the bot. Uses a default `min_periods=20` to avoid unreliable correlations on short series, and gracefully handles NaN values (produced by halted or missing bars) by skipping them.
+
+#### 15. PDT Restriction — `check_pdt_restriction()`
+"Are we about to trip IBKR's sub-$5K day-trade lockout?"
+
+Rule: When `portfolio_value >= PDT_PROTECTION_THRESHOLD_USD` (default $5,000), the check is a pass-through — unconstrained. Below the threshold, count same-calendar-day round-trip trades in the last 5 business days. If the count is already at `PDT_MAX_DAY_TRADES_PER_5_DAYS` (default 1), block any new entry (could become a day trade if the stop fires same-day) and any same-day exit (definitively completes a day trade). Exits of positions opened on a prior day are **always** allowed — they are not day trades by definition, and blocking them would trap the trader in a losing swing position. Setting `PDT_MAX_DAY_TRADES_PER_5_DAYS=0` disables the check.
+
+Why: IBKR flags accounts with Liquid Net Worth < $5,000 and restricts them to closing-orders-only for 30 days once 2 day trades occur within a rolling 5-business-day window. The bot reads the current portfolio value at evaluation time, so as soon as the account clears the threshold the brakes come off automatically — no manual config change needed. This is a pragmatic guard, not a perfect replica of IBKR's internal accounting: the bot counts from its own completed-trades table, which means positions filled while the bot was offline (auto-reconciled at startup) participate in the count once they're recorded.
+
 ### Exit Signal Bypass
 
 The `evaluate()` function detects whether a signal is an **exit** (closing an existing position) rather than a new entry. When a SELL signal targets a held long position, or a BUY signal targets a held short position, the following discipline checks are **skipped**:
@@ -747,6 +771,7 @@ The `evaluate()` function detects whether a signal is an **exit** (closing an ex
 - Trend Confirmation (`check_trend_confirmation`)
 - Risk/Reward Ratio (`check_risk_reward`)
 - Analyst Consensus (`check_analyst_consensus`)
+- Correlation Cap (`check_correlation`)
 
 Why: These checks gate on market conditions and only make sense for deciding whether to **enter** a new position. Applying them to exits creates a dangerous trap — if the market moves against you, the very conditions that make you want to exit (price dropped, trend reversed) are the same conditions these checks reject. Without this bypass, a losing position could never be closed because the anti-momentum check would say "price already dropped too far" and the trend check would say "trend is down, can't sell." Core safety checks (position size, daily loss, stop-loss, duplicates, etc.) still apply to all signals.
 
@@ -923,13 +948,30 @@ def start_scheduler(ib, markets, mode="paper"):
     # Handle Ctrl+C gracefully
     setup_signal_handlers()
 
+    last_reconcile_date = None
     while not shutting_down:
         if any market is open:
             run_scan_cycle(ib, markets, mode)
 
+        # Nightly reconciliation — once per day, after all markets close
+        today = now().date()
+        if last_reconcile_date != today and no markets open:
+            run_nightly_reconciliation(ib)
+            last_reconcile_date = today
+
         # Sleep using ib_insync's event loop (not time.sleep!)
         ib.sleep(SCAN_INTERVAL_MINUTES * 60)
 ```
+
+### Nightly Reconciliation — `run_nightly_reconciliation()`
+
+The startup/reconnect-time sync in `main.py` auto-closes positions that IBKR no longer holds, because the bot was offline and something happened (stop-loss hit, manual intervention). But during normal, continuous operation, drift can still creep in — a missed fill callback, a double insert, a manual trade someone made in TWS while the bot was running. Without a periodic check, that drift compounds silently until something breaks.
+
+`run_nightly_reconciliation(ib, db_path)` runs once per day after all markets close and performs a **read-only** check: it fetches `ib.positions()` and `ib.fills()`, calls `reconcile_positions` with `auto_fix=False`, and sends a Telegram alert via `notify_reconciliation_mismatch` on any discrepancy. It never modifies the database — because during normal operation, unexpected divergence is usually a bug or a human action, and the safe response is to tell the operator, not to silently "correct" it.
+
+The Telegram alert lists every orphaned ticker (DB-only and IBKR-only) and every quantity mismatch. **Sign mismatches** — where the DB says we're long and IBKR says we're short (or vice versa) — are escalated to a CRITICAL alert because they indicate the bot's understanding of its position is fundamentally wrong, and continuing to trade blind is dangerous.
+
+The scheduler uses a `last_reconcile_date` guard to ensure the job runs exactly once per calendar day (in the configured timezone), regardless of how many times the main loop iterates after markets close.
 
 ### Why `ib.sleep()` Instead of `time.sleep()`?
 
@@ -1181,6 +1223,16 @@ Short positions are handled correctly: opening a short credits cash (sale procee
 
 No SQLite needed — it's all in memory since it's just a simulation.
 
+### Walk-Forward Validation — `walk_forward_backtest()`
+
+A single backtest over one contiguous window tells you how a strategy performed in *that specific past*. It doesn't tell you whether the strategy actually works or whether you just got lucky (or — worse — whether you tuned parameters until the numbers looked good, a form of **overfitting**). Walk-forward validation is the standard way to pressure-test this.
+
+**How it works:** `walk_forward_backtest(config, train_ratio=0.6)` takes a standard `BacktestConfig` with bounded `start_date` and `end_date`, splits the range into an **in-sample (IS)** training period and a non-overlapping **out-of-sample (OOS)** test period (60/40 by default), and runs a fresh backtest on each. Both runs start with the same initial capital — OOS does **not** inherit IS positions or cash. All other config (tickers, slippage, commission, indicator weights, volatility scaling) is preserved for both runs.
+
+**What you get back:** a `WalkForwardResult` dataclass containing both `SimulatedPortfolio` objects, both full metric dicts, the split dates, and a **degradation** dict computed as `OOS_value − IS_value` for every numeric metric. If a robust strategy produces similar metrics on both halves, degradation will be near zero. If the strategy is overfit, degradation will be sharply negative (win rate and total return both drop). In practice this is the single cheapest check to run before trusting a backtest result.
+
+**Guards:** `train_ratio` must be strictly between 0 and 1, both dates must be set, and `end_date` must be after `start_date`. Violating any of those raises `ValueError` rather than silently running a useless backtest.
+
 ---
 
 ## 18. Backtest Reporting — `backtest/report.py`
@@ -1300,7 +1352,7 @@ This prevents accidentally trading with real money.
 
 The bot's internal state (SQLite) can drift from IBKR's actual state when the bot is offline while stop-loss or take-profit orders fill. Three mechanisms keep them in sync:
 
-1. **Auto-fix reconciliation** (`reconcile_positions(auto_fix=True)`): Compares DB positions against IBKR's live positions. Any DB position not found at IBKR is automatically closed at the position's stop-loss price (the best available estimate of the actual fill). This ensures that daily P&L, loss limits, and circuit breaker checks reflect the estimated loss rather than recording $0 P&L.
+1. **Auto-fix reconciliation** (`reconcile_positions(auto_fix=True, ibkr_fills=...)`): Compares DB positions against IBKR's live positions. Any DB position not found at IBKR is automatically closed. When `ibkr_fills` is provided (extracted from `ib.fills()` at connection sync), the most recent SLD fill after the position's entry_time is used as the exit price — giving accurate P&L for positions that filled while the bot was offline (including take-profit exits that would otherwise be mis-recorded as stop-outs). When no matching fill exists, falls back to the position's stop-loss price. This ensures daily P&L, loss limits, and circuit breaker checks reflect reality.
 
 2. **Import orphaned IBKR positions** (`import_ibkr_positions(ib, orphaned_tickers)`): Positions held at IBKR but missing from the DB are automatically imported. Entry price comes from IBKR's `avgCost`, and stop-loss/take-profit are extracted from open bracket child orders. This handles cases where the DB was cleared, positions were opened manually, or the bot missed a fill event.
 
@@ -1415,6 +1467,52 @@ pytest tests/test_risk.py::test_daily_loss_limit -v
 **The problem**: IBKR's sector data isn't always reliable. Sometimes a bank stock would have sector = "N/A" or a wrong sector, passing through the universe filter.
 
 **The solution**: **Double filtering**. The universe builder filters by sector at build time. Then the risk manager has its OWN `check_excluded_sector()` that catches any stragglers. Belt AND suspenders. Both use the same `FINANCIAL_KEYWORDS` and `DEFENSE_KEYWORDS` lists from `config/settings.py` to stay in sync. Also added an explicit exclusion list of ~40 specific tickers known to be problematic.
+
+**Follow-up (code audit round 3)**: `_is_excluded_sector("")` previously returned `False`, so a cached stock with a blank sector string (e.g. a cache entry written before enrichment fully populated the field) would bypass the filter entirely. Flipped the default to **fail-closed** — unknown sector = excluded. Safety defaults that fail to "reject" are safer than defaults that fail to "accept" for this kind of filter.
+
+### Challenge 9: DST and the Istanbul/ET Mismatch
+
+**The problem**: Market hours were stored as Istanbul wall-clock times (`16:30–23:00`). Istanbul (TRT) is a fixed UTC+3; NYSE is ET which observes DST. In EDT (summer), 09:30 ET = 16:30 TRT, so the config happened to line up. In EST (winter), 09:30 ET = 17:30 TRT — the bot would scan for an hour before the market actually opened and stop scanning an hour before the market actually closed.
+
+**The solution**: Store market hours in the exchange's native timezone (`America/New_York`) and compute `datetime.now(market_tz)` inside `is_market_open`. ZoneInfo handles the DST transitions so the bot tracks the actual session boundaries.
+
+**Related**: `check_pdt_restriction` used `datetime.now(timezone.utc).date()` for its "is this a day trade" comparison. IBKR's PDT rule tracks the US Eastern calendar day, not UTC. A trade opened at 23:00 ET Monday (03:00 UTC Tuesday) and exited at 10:00 ET Tuesday would be seen as same-UTC-day (day trade) when ET correctly classifies it as a swing trade. Fixed by routing both entry and exit through `astimezone(America/New_York).date()`.
+
+### Challenge 10: The Fast-Fill Race
+
+**The problem**: `place_order` polls IBKR for `permId` for up to 3 seconds after submitting the bracket. During that window, a market order on a liquid stock can already fill. Meanwhile, the fill handler is registered by the scheduler *after* `place_order` returns. ib_insync does not replay past events, so any fill that landed during the polling window was silently dropped — the position existed at IBKR but never got written to the DB, visible only at next reconciliation.
+
+**The solution**: `setup_fill_handler` now accepts the parent `Trade` object. After registering the event listener, it inspects `parent_trade.orderStatus.status`; if already `"Filled"`, it invokes the fill path synchronously. A `threading.Event` guards against double-firing if a late event also arrives.
+
+### Challenge 11: The Cancel/Close Race
+
+**The problem**: `close_all_day_trades` issued `ib.cancelOrder` for bracket children, then immediately placed market close orders. IBKR's cancel is asynchronous — the request returns instantly but the order can still fill before the broker processes the cancel. A filling SL child + our market order = doubled close (net flat → net short).
+
+**The solution**: After issuing cancels, poll `ib.openTrades()` in a short loop until the cancelled orders clear (or a 3-second timeout expires). Only then place the market closes.
+
+### Challenge 12: Reconciliation Biased Losses
+
+**The problem**: When the bot restarted and a DB position no longer existed at IBKR, auto-reconcile fell back to `stop_loss` as the exit price. This unconditionally recorded a loss regardless of whether the position was actually stopped-out or took-profit while the bot was offline — systematically biasing the trade journal and circuit-breaker history.
+
+**The solution**: Use the **midpoint** of SL and TP as the unbiased expected-value estimator when no fill data is available, and flag the reasoning field as "estimate" so downstream consumers (daily P&L, circuit breaker) know the exit price is inferred. Over many reconciliations the biases cancel; in any single trade the error is half of what it was.
+
+### Challenge 13: Backtest Gap Entries
+
+**The problem**: The screener's `signal.stop_loss` and `signal.take_profit` are absolute price levels computed from the signal's `entry_price` (yesterday's close). The backtest fills at the next bar's open (realistic execution). If today's open gaps, the stored SL/TP no longer match the intended risk/reward percentages — in the worst case a long's stop_loss sits above the fill price, triggering an immediate non-sensical exit.
+
+**The solution**: In `open_position`, preserve the original SL/TP percentages relative to `signal.entry_price` and recompute new absolute levels from the actual slippage-adjusted fill price. The R-multiple the risk check reasoned about is now what the position actually risks.
+
+### Challenge 14: TOCTOU on Position Insertion
+
+**The problem**: `add_position` did a SELECT for existing rows, then INSERTed if missing. Across two SQLite connections (fill handler thread + scheduler thread), both SELECTs could return empty before either INSERT committed, resulting in duplicate rows for the same ticker.
+
+**The solution**: Added a `UNIQUE` index on `positions(ticker)` and switched the INSERT to `INSERT OR IGNORE`. The DB engine now enforces uniqueness atomically. The loser of the race sees `cursor.rowcount == 0`, looks up the existing row, and returns its ID — no duplicates possible no matter how the threads interleave.
+
+### Challenge 15: yfinance MultiIndex Ambiguity
+
+**The problem**: `yf.download` returns columns as a `MultiIndex`. Across yfinance versions, the level order varies — some return `(field, ticker)`, others return `(ticker, field)`. Flattening with `get_level_values(0)` unconditionally worked only on one ordering; on the other it collapsed to repeated ticker names and the subsequent column selection raised `KeyError`.
+
+**The solution**: Detect which level contains the string `"Close"` and flatten using that level. Version-independent.
 
 ---
 
