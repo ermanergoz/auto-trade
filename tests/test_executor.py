@@ -388,6 +388,84 @@ class TestCloseAllDayTrades:
 
         mock_place.assert_not_called()
 
+    def test_waits_for_cancels_before_placing_market_close(self):
+        """Cancels must be confirmed before placing close orders.
+
+        IBKR cancel is asynchronous: the cancel request returns immediately
+        but the order may still fill before the broker processes it. If we
+        place the market close at the same time as the cancel request, a
+        filling SL child plus our market order can doubly-close the position
+        (net flat → net short). The code must poll openTrades until the
+        cancels clear (or the child fills) before transmitting the close.
+        """
+        from core.executor import close_all_day_trades
+
+        pos = _make_position(ticker="AAPL", quantity=10, trade_type=TradeType.DAY,
+                             entry_price=150.0, stop_loss=145.0, take_profit=160.0)
+
+        sl_child = _make_mock_trade("AAPL", order_id=101, parent_id=100, order_type="STP")
+        sl_child.orderStatus.status = "Submitted"
+        tp_child = _make_mock_trade("AAPL", order_id=102, parent_id=100, order_type="LMT")
+        tp_child.orderStatus.status = "Submitted"
+
+        ib = MagicMock()
+        # Track order of ib calls: cancelOrder, sleep, openTrades, place_market_order
+        call_log = []
+
+        # Snapshot openTrades — first call (pre-cancel) returns the children,
+        # second call (post-sleep) returns empty (cancels took effect)
+        trades_state = {"iter": 0}
+
+        def open_trades_side_effect():
+            trades_state["iter"] += 1
+            call_log.append(("openTrades", trades_state["iter"]))
+            if trades_state["iter"] == 1:
+                return [sl_child, tp_child]
+            return []
+
+        ib.openTrades.side_effect = open_trades_side_effect
+
+        def cancel_side_effect(order):
+            call_log.append(("cancelOrder", order.orderId))
+
+        ib.cancelOrder.side_effect = cancel_side_effect
+
+        def sleep_side_effect(_):
+            call_log.append(("sleep",))
+
+        ib.sleep.side_effect = sleep_side_effect
+
+        mock_close_trade = MagicMock()
+        mock_close_trade.orderStatus.status = "Filled"
+        mock_close_trade.orderStatus.filled = 10
+        mock_close_trade.orderStatus.remaining = 0
+        mock_close_trade.orderStatus.avgFillPrice = 155.0
+        mock_close_trade.order.orderId = 999
+
+        def place_side_effect(*a, **kw):
+            call_log.append(("place_market_order",))
+            return mock_close_trade
+
+        with patch("core.executor.place_market_order", side_effect=place_side_effect), \
+             patch("core.executor.db_close_position"):
+            close_all_day_trades(ib, [pos], dry_run=False)
+
+        # Reconstruct event order: every cancel must precede every place_market_order,
+        # and at least one sleep must intervene between last cancel and first place.
+        cancel_indices = [i for i, e in enumerate(call_log) if e[0] == "cancelOrder"]
+        place_indices = [i for i, e in enumerate(call_log) if e[0] == "place_market_order"]
+        sleep_indices = [i for i, e in enumerate(call_log) if e[0] == "sleep"]
+
+        assert cancel_indices, "expected cancels to be issued"
+        assert place_indices, "expected a market close to be placed"
+        last_cancel = cancel_indices[-1]
+        first_place = place_indices[0]
+        assert last_cancel < first_place, "market close must not be placed before cancels"
+        assert any(last_cancel < s < first_place for s in sleep_indices), (
+            "at least one ib.sleep() must occur between the cancel batch and "
+            "the first market-close order so IBKR has time to ack the cancels"
+        )
+
 
 def _make_mock_ibkr_position(ticker, quantity, avg_cost, exchange="NASDAQ"):
     """Build a mock ib_insync Position (from ib.positions())."""
@@ -513,3 +591,126 @@ class TestImportIbkrPositions:
         assert imported == ["TSLA"]
         pos = get_open_positions(db_path)[0]
         assert pos.quantity == -5
+
+
+class TestSetupFillHandlerRace:
+    """Fast fills can arrive before setup_fill_handler registers its listener.
+
+    place_order() polls IBKR up to 3 s for permId before returning; during that
+    window the order may already fill. ib_insync does not replay past events,
+    so if the handler is attached after the fill has already been recorded on
+    the Trade object, handle_fill is never called and the position is silently
+    orphaned on IBKR (detected only at next reconciliation).
+
+    The fix: on registration, inspect the parent trade's current status. If it
+    is already "Filled", invoke the fill path immediately.
+    """
+
+    def test_already_filled_trade_invokes_handler_immediately(self, db_path):
+        """A Trade that arrives already-Filled must still produce a position."""
+        from core.executor import setup_fill_handler
+
+        sig = _signal(Action.BUY)
+        ib = MagicMock()
+
+        parent_order = MagicMock()
+        parent_order.permId = 42
+        parent_order.parentId = 0
+        parent_order.action = "BUY"
+        parent_order.orderId = 100
+
+        parent_trade = MagicMock()
+        parent_trade.order = parent_order
+        parent_trade.contract.symbol = sig.ticker
+        parent_trade.orderStatus.status = "Filled"
+        parent_trade.orderStatus.avgFillPrice = 150.5
+        parent_trade.orderStatus.filled = 10
+
+        with patch("core.executor.handle_fill") as mock_handle:
+            setup_fill_handler(
+                ib, sig, quantity=10,
+                parent_order=parent_order,
+                parent_trade=parent_trade,
+            )
+
+        mock_handle.assert_called_once()
+        args = mock_handle.call_args.args
+        assert args[0] is sig
+        assert args[1] == 10
+        assert args[2] == 150.5
+
+    def test_unfilled_trade_does_not_fire_at_registration(self, db_path):
+        """A Submitted trade must wait for the event, not fire on registration."""
+        from core.executor import setup_fill_handler
+
+        sig = _signal(Action.BUY)
+        ib = MagicMock()
+
+        parent_order = MagicMock()
+        parent_order.permId = 43
+        parent_order.parentId = 0
+        parent_order.action = "BUY"
+
+        parent_trade = MagicMock()
+        parent_trade.order = parent_order
+        parent_trade.contract.symbol = sig.ticker
+        parent_trade.orderStatus.status = "Submitted"
+        parent_trade.orderStatus.avgFillPrice = 0.0
+        parent_trade.orderStatus.filled = 0
+
+        with patch("core.executor.handle_fill") as mock_handle:
+            setup_fill_handler(
+                ib, sig, quantity=10,
+                parent_order=parent_order,
+                parent_trade=parent_trade,
+            )
+
+        mock_handle.assert_not_called()
+
+    def test_already_filled_does_not_double_fire_on_event(self, db_path):
+        """If registration fires handle_fill, a subsequent event must not duplicate."""
+        from core.executor import setup_fill_handler
+
+        sig = _signal(Action.BUY)
+        ib = MagicMock()
+        # ib.orderStatusEvent must support += (handler registration)
+        events = []
+
+        class FakeEvent:
+            def __iadd__(self, h):
+                events.append(h)
+                return self
+            def __isub__(self, h):
+                if h in events:
+                    events.remove(h)
+                return self
+
+        ib.orderStatusEvent = FakeEvent()
+
+        parent_order = MagicMock()
+        parent_order.permId = 44
+        parent_order.parentId = 0
+        parent_order.action = "BUY"
+        parent_order.orderId = 101
+
+        parent_trade = MagicMock()
+        parent_trade.order = parent_order
+        parent_trade.contract.symbol = sig.ticker
+        parent_trade.orderStatus.status = "Filled"
+        parent_trade.orderStatus.avgFillPrice = 150.5
+        parent_trade.orderStatus.filled = 10
+
+        with patch("core.executor.handle_fill") as mock_handle:
+            setup_fill_handler(
+                ib, sig, quantity=10,
+                parent_order=parent_order,
+                parent_trade=parent_trade,
+            )
+            # Simulate the event firing after registration
+            for h in list(events):
+                h(parent_trade)
+
+        assert mock_handle.call_count == 1, (
+            "handle_fill must fire exactly once even if a late orderStatusEvent "
+            "arrives after the already-filled snapshot was handled at registration"
+        )

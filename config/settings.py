@@ -58,9 +58,12 @@ EXCLUDED_TICKERS = {
 MIN_DAILY_VOLUME = 100_000
 MIN_MARKET_CAP = 50_000_000  # $50M
 
-# Market hours in Europe/Istanbul timezone (TRT)
+# Market hours expressed in the market's native timezone — must be the
+# exchange's local time so DST transitions are handled correctly. NYSE is in
+# America/New_York which observes DST; Istanbul (TRT) is a fixed UTC+3 offset
+# and would drift one hour off NYSE every winter if hours were stored there.
 MARKET_HOURS = {
-    "US": {"open": "16:30", "close": "23:00"},
+    "US": {"open": "09:30", "close": "16:00", "tz": "America/New_York"},
 }
 
 # ---------------------------------------------------------------------------
