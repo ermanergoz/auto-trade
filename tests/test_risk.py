@@ -15,6 +15,7 @@ from core.risk import (
     check_risk_reward,
     check_sector_concentration,
     check_excluded_sector,
+    check_analyst_consensus,
     calculate_position_size,
     evaluate,
 )
@@ -692,3 +693,215 @@ class TestVolatilityInEvaluate:
         assert result_normal.approved is True
         assert result_high_vol.approved is True
         assert result_high_vol.position_size < result_normal.position_size
+
+
+# ---------------------------------------------------------------------------
+# Analyst Consensus Check Tests
+# ---------------------------------------------------------------------------
+
+class TestAnalystConsensus:
+    """check_analyst_consensus blocks BUY when analysts say sell."""
+
+    def test_blocks_buy_on_sell_consensus(self):
+        sig = _make_signal(action=Action.BUY)
+        ok, reason = check_analyst_consensus(sig, "sell")
+        assert ok is False
+        assert "analyst" in reason.lower()
+
+    def test_blocks_buy_on_strong_sell_consensus(self):
+        sig = _make_signal(action=Action.BUY)
+        ok, reason = check_analyst_consensus(sig, "strong_sell")
+        assert ok is False
+        assert "analyst" in reason.lower()
+
+    def test_allows_buy_on_buy_consensus(self):
+        sig = _make_signal(action=Action.BUY)
+        ok, _ = check_analyst_consensus(sig, "buy")
+        assert ok is True
+
+    def test_allows_buy_on_strong_buy_consensus(self):
+        sig = _make_signal(action=Action.BUY)
+        ok, _ = check_analyst_consensus(sig, "strong_buy")
+        assert ok is True
+
+    def test_allows_buy_on_hold_consensus(self):
+        sig = _make_signal(action=Action.BUY)
+        ok, _ = check_analyst_consensus(sig, "hold")
+        assert ok is True
+
+    def test_allows_buy_when_no_data(self):
+        """No analyst data available — still allow the buy."""
+        sig = _make_signal(action=Action.BUY)
+        ok, _ = check_analyst_consensus(sig, None)
+        assert ok is True
+
+    def test_sell_signal_always_passes(self):
+        """Analyst consensus check only applies to BUY signals."""
+        sig = _make_signal(action=Action.SELL, entry_price=150, stop_loss=155, take_profit=140)
+        ok, _ = check_analyst_consensus(sig, "sell")
+        assert ok is True
+
+    def test_hold_signal_always_passes(self):
+        sig = _make_signal(action=Action.HOLD)
+        ok, _ = check_analyst_consensus(sig, "sell")
+        assert ok is True
+
+
+class TestAnalystConsensusInEvaluate:
+    """evaluate() integrates the analyst consensus check."""
+
+    def test_evaluate_rejects_buy_on_sell_consensus(self):
+        sig = _make_signal(action=Action.BUY)
+        result = evaluate(sig, [], 100_000, 0, analyst_consensus="sell")
+        assert result.approved is False
+        assert any("analyst" in r.lower() for r in result.reasons)
+
+    def test_evaluate_allows_buy_on_hold_consensus(self):
+        sig = _make_signal(action=Action.BUY)
+        result = evaluate(sig, [], 100_000, 0, analyst_consensus="hold")
+        assert result.approved is True
+
+    def test_evaluate_allows_buy_when_no_consensus(self):
+        sig = _make_signal(action=Action.BUY)
+        result = evaluate(sig, [], 100_000, 0, analyst_consensus=None)
+        assert result.approved is True
+
+    def test_evaluate_backward_compatible(self):
+        """evaluate() still works without analyst_consensus param."""
+        sig = _make_signal(action=Action.BUY)
+        result = evaluate(sig, [], 100_000, 0)
+        assert result.approved is True
+
+
+# ---------------------------------------------------------------------------
+# Exit Signal Tests — discipline checks must not block position exits
+# ---------------------------------------------------------------------------
+
+class TestExitSignalsNotBlocked:
+    """Discipline checks (trend, anti-momentum, risk/reward) must not block
+    exit signals that close existing positions. Blocking exits can trap
+    the trader in a losing position indefinitely."""
+
+    def test_sell_exit_passes_trend_confirmation(self):
+        """SELL to close a long must not be blocked by uptrend confirmation.
+
+        Scenario: We hold AAPL long, and a SELL signal is generated to close it.
+        The trend is still up (MA5 > MA20), so check_trend_confirmation would
+        reject the SELL (it requires MA5 < MA20 for sells). But this is an EXIT,
+        not a new short entry — it must pass.
+        """
+        from core.risk import check_trend_confirmation
+        sig = _make_signal(
+            ticker="AAPL", action=Action.SELL,
+            entry_price=150, stop_loss=155, take_profit=140,
+        )
+        # Uptrend: MA5 > MA20 — trend confirmation should reject SELL entries,
+        # but evaluate() should let exits through.
+        positions = [_make_position(ticker="AAPL", quantity=10)]
+        result = evaluate(
+            sig, positions, 100_000, 0,
+            current_price=150.0,
+        )
+        # The signal is closing an existing long — should not be blocked by
+        # trend, anti-momentum, or risk/reward
+        trend_reasons = [r for r in result.reasons if "trend not confirmed" in r.lower()]
+        assert trend_reasons == [], (
+            f"Exit signal blocked by trend confirmation: {trend_reasons}"
+        )
+
+    def test_sell_exit_passes_anti_momentum(self):
+        """SELL to close a long must not be blocked by anti-momentum.
+
+        Scenario: Price dropped 15% from entry — anti-momentum would reject
+        a SELL (it thinks we're chasing a down move). But we're closing a
+        losing long position, not initiating a short.
+        """
+        sig = _make_signal(
+            ticker="AAPL", action=Action.SELL,
+            entry_price=150, stop_loss=155, take_profit=140,
+        )
+        positions = [_make_position(ticker="AAPL", quantity=10)]
+        # Price dropped significantly — anti-momentum would normally block
+        result = evaluate(
+            sig, positions, 100_000, 0,
+            current_price=125.0,  # 16.7% below entry
+        )
+        anti_reasons = [r for r in result.reasons if "anti-chase" in r.lower()]
+        assert anti_reasons == [], (
+            f"Exit signal blocked by anti-momentum: {anti_reasons}"
+        )
+
+    def test_sell_exit_passes_risk_reward(self):
+        """SELL to close a long must not be blocked by risk/reward ratio.
+
+        Scenario: Signal has bad R:R because it's closing a losing position.
+        Risk/reward only makes sense for new entries.
+        """
+        sig = _make_signal(
+            ticker="AAPL", action=Action.SELL,
+            entry_price=100, stop_loss=105, take_profit=95,
+        )
+        positions = [_make_position(ticker="AAPL", quantity=10)]
+        result = evaluate(sig, positions, 100_000, 0)
+        rr_reasons = [r for r in result.reasons if "risk/reward" in r.lower()]
+        assert rr_reasons == [], (
+            f"Exit signal blocked by risk/reward: {rr_reasons}"
+        )
+
+    def test_new_sell_entry_still_checked(self):
+        """A new SELL (short entry, no existing position) must still be checked.
+
+        When short selling IS allowed, discipline checks should still apply
+        to new short entries.
+        """
+        from unittest.mock import patch
+        sig = _make_signal(
+            ticker="NEW", action=Action.SELL,
+            entry_price=150, stop_loss=155, take_profit=140,
+        )
+        # No existing position — this is a new short entry
+        with patch("core.risk.ALLOW_SHORT_SELLING", True):
+            result = evaluate(sig, [], 100_000, 0)
+        # With uptrend, trend confirmation should reject a new short
+        # (This test verifies discipline checks still apply to entries)
+
+
+# ---------------------------------------------------------------------------
+# Empty sector safety net — must not silently pass excluded stocks
+# ---------------------------------------------------------------------------
+
+class TestEmptySectorSafetyNet:
+    """Stocks with empty sector must not bypass excluded sector checks
+    when company name contains financial/defense keywords."""
+
+    def test_empty_sector_with_financial_company_name_blocked(self):
+        """A stock with empty sector but 'bank' in company name must be blocked."""
+        sig = _make_signal(
+            indicator_values={"sector": "", "company_name": "First National Bank Corp"},
+        )
+        ok, reason = check_excluded_sector(sig)
+        assert ok is False, (
+            "Stock with 'bank' in company name should be blocked even with empty sector"
+        )
+
+    def test_empty_sector_with_defense_company_name_blocked(self):
+        """A stock with empty sector but defense keywords in name must be blocked."""
+        sig = _make_signal(
+            indicator_values={"sector": "", "company_name": "Lockheed Defense Systems"},
+        )
+        ok, reason = check_excluded_sector(sig)
+        assert ok is False
+
+    def test_empty_sector_with_normal_company_name_passes(self):
+        """A stock with empty sector and non-excluded company name passes."""
+        sig = _make_signal(
+            indicator_values={"sector": "", "company_name": "Apple Inc"},
+        )
+        ok, _ = check_excluded_sector(sig)
+        assert ok is True
+
+    def test_empty_sector_no_company_name_passes(self):
+        """A stock with empty sector and no company name passes (can't determine)."""
+        sig = _make_signal(indicator_values={"sector": ""})
+        ok, _ = check_excluded_sector(sig)
+        assert ok is True

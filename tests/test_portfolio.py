@@ -293,3 +293,33 @@ class TestReconcilePositions:
         assert trades[0].exit_price == 145.5
         # P&L should reflect the loss: (145.5 - 150.0) * 10 = -$45
         assert trades[0].pnl == pytest.approx(-45.0)
+
+    def test_auto_fix_uses_entry_price_when_no_stop_loss(self, db_path):
+        """When stop_loss is 0, fall back to entry_price as exit."""
+        from core.portfolio import reconcile_positions
+
+        pos = _make_position(
+            ticker="NOSTOP", entry_price=150.0, stop_loss=0.0,
+        )
+        add_position(pos, db_path)
+
+        report = reconcile_positions([], auto_fix=True, db_path=db_path)
+        trades = get_trades(db_path=db_path)
+        assert len(trades) == 1
+        # No stop_loss → falls back to entry_price
+        assert trades[0].exit_price == 150.0
+
+    def test_sign_mismatch_detected(self, db_path):
+        """Direction mismatch (DB long but IBKR short) must be flagged."""
+        from core.portfolio import reconcile_positions
+
+        pos = _make_position(ticker="AAPL", quantity=10)  # long in DB
+        add_position(pos, db_path)
+
+        # IBKR says short!
+        ibkr = [{"ticker": "AAPL", "quantity": -10}]
+        report = reconcile_positions(ibkr, db_path=db_path)
+
+        assert report["in_sync"] is False
+        assert "AAPL" in report["qty_mismatches"]
+        assert report["qty_mismatches"]["AAPL"]["type"] == "sign_mismatch"

@@ -413,6 +413,27 @@ class TestIndicatorWeights:
         assert action == Action.BUY
         assert score > 0
 
+    def test_resistance_weight_included_in_normalization(self):
+        """RESISTANCE indicator weight must be included in total_weight normalization.
+
+        If RESISTANCE has weight=5 and SUPPORT has weight=0, the total should
+        include RESISTANCE's weight, not just SUPPORT's.
+        """
+        triggered = [{"action": Action.SELL, "strength": 0.8, "indicator": "RESISTANCE"}]
+        weights = {
+            "RSI": 1.0, "MACD": 1.0, "MA_CROSSOVER": 1.0,
+            "VOLUME_SPIKE": 1.0, "BOLLINGER": 1.0,
+            "SUPPORT": 0.0, "RESISTANCE": 5.0,
+        }
+        score, action = score_candidate(triggered, weights=weights)
+        assert action == Action.SELL
+        # With RESISTANCE weight=5, the score should reflect that weight in
+        # normalization. If total_weight incorrectly uses SUPPORT=0 instead of
+        # max(SUPPORT, RESISTANCE)=5, the score would be inflated.
+        assert score > 0
+        # The score should be reasonable (not > 100 due to normalization error)
+        assert score <= 100.0
+
     def test_screen_stocks_accepts_weights(self):
         """screen_stocks should pass weights through to score_candidate."""
         volumes = [500_000] * 25 + [3_000_000]

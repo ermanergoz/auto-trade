@@ -134,3 +134,73 @@ def test_stock_info():
     )
     assert info.ticker == "AAPL"
     assert info.currency == "USD"
+
+
+# ---------------------------------------------------------------------------
+# CSV Logger Tests
+# ---------------------------------------------------------------------------
+
+class TestCSVLoggerAction:
+    """log_trade_to_csv must record the correct entry action, not always 'BUY'."""
+
+    def test_short_trade_records_sell_action(self):
+        """A short trade (negative quantity) should record action as SELL."""
+        import csv
+        import tempfile
+        from pathlib import Path
+        from unittest.mock import patch
+        from core.logger import log_trade_to_csv
+
+        trade = Trade(
+            ticker="TSLA",
+            exchange="SMART",
+            quantity=-10,  # short position
+            entry_price=200.0,
+            exit_price=180.0,
+            entry_time=datetime(2024, 1, 15, 10, 0),
+            exit_time=datetime(2024, 1, 15, 14, 0),
+            trade_type=TradeType.DAY,
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            csv_path = Path(tmpdir) / "trades_2024-01-15.csv"
+            with patch("core.logger._trades_csv_path", return_value=csv_path):
+                log_trade_to_csv(trade)
+
+            with open(csv_path) as f:
+                reader = csv.DictReader(f)
+                row = next(reader)
+                assert row["action"] == "SELL", (
+                    f"Short trade should record action as SELL, got '{row['action']}'"
+                )
+
+    def test_long_trade_records_buy_action(self):
+        """A long trade (positive quantity) should record action as BUY."""
+        import csv
+        import tempfile
+        from pathlib import Path
+        from unittest.mock import patch
+        from core.logger import log_trade_to_csv
+
+        trade = Trade(
+            ticker="AAPL",
+            exchange="SMART",
+            quantity=10,  # long position
+            entry_price=150.0,
+            exit_price=160.0,
+            entry_time=datetime(2024, 1, 15, 10, 0),
+            exit_time=datetime(2024, 1, 15, 14, 0),
+            trade_type=TradeType.DAY,
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            csv_path = Path(tmpdir) / "trades_2024-01-15.csv"
+            with patch("core.logger._trades_csv_path", return_value=csv_path):
+                log_trade_to_csv(trade)
+
+            with open(csv_path) as f:
+                reader = csv.DictReader(f)
+                row = next(reader)
+                assert row["action"] == "BUY", (
+                    f"Long trade should record action as BUY, got '{row['action']}'"
+                )

@@ -8,6 +8,7 @@ from core.data import (
     get_historical_data_yfinance,
     get_news,
     get_macro_news,
+    get_analyst_recommendation,
     clear_cache,
     _cache_set,
     _cache_get,
@@ -362,3 +363,141 @@ class TestNewsAnalystIntegration:
         # Both should have macro news
         assert "Fed holds rates" in aapl_prompt
         assert "Fed holds rates" in msft_prompt
+
+
+class TestCacheMutation:
+    """Cached dicts must not be corrupted by caller mutation."""
+
+    def test_mutating_cached_dict_does_not_corrupt_cache(self):
+        """If a caller mutates a returned dict, the cache should be unaffected."""
+        _cache_set("mut_test", {"key": "original"}, ttl=60)
+        result1 = _cache_get("mut_test")
+        result1["key"] = "mutated"  # caller mutates the result
+
+        result2 = _cache_get("mut_test")
+        assert result2["key"] == "original", (
+            "Cache was corrupted by caller mutation — dicts must be copied on read"
+        )
+
+    def test_mutating_cached_list_does_not_corrupt_cache(self):
+        """If a caller mutates a returned list, the cache should be unaffected."""
+        _cache_set("list_test", ["headline1", "headline2"], ttl=60)
+        result1 = _cache_get("list_test")
+        result1.append("injected")  # caller mutates the result
+
+        result2 = _cache_get("list_test")
+        assert len(result2) == 2, (
+            "Cache was corrupted by caller mutation — lists must be copied on read"
+        )
+
+    def test_dataframe_copy_still_works(self):
+        """DataFrame copy behavior should still work correctly."""
+        import pandas as pd
+        df = pd.DataFrame({"close": [100, 101, 102]})
+        _cache_set("df_test", df, ttl=60)
+        result1 = _cache_get("df_test")
+        result1["close"].iloc[0] = 999
+
+        result2 = _cache_get("df_test")
+        assert result2["close"].iloc[0] == 100, (
+            "DataFrame cache copy is broken"
+        )
+
+
+class TestAnalystRecommendation:
+    """Tests for get_analyst_recommendation() — yfinance analyst consensus."""
+
+    @patch("yfinance.Ticker")
+    def test_returns_consensus_buy(self, mock_ticker):
+        """When most analysts say buy, consensus should be 'buy'."""
+        mock_ticker.return_value.recommendations_summary = pd.DataFrame([{
+            "strongBuy": 5, "buy": 10, "hold": 3, "sell": 1, "strongSell": 0,
+        }])
+        result = get_analyst_recommendation("AAPL")
+        assert result is not None
+        assert result["consensus"] == "buy"
+
+    @patch("yfinance.Ticker")
+    def test_returns_consensus_sell(self, mock_ticker):
+        """When most analysts say sell, consensus should be 'sell'."""
+        mock_ticker.return_value.recommendations_summary = pd.DataFrame([{
+            "strongBuy": 0, "buy": 1, "hold": 2, "sell": 10, "strongSell": 3,
+        }])
+        result = get_analyst_recommendation("BAD_STOCK")
+        assert result is not None
+        assert result["consensus"] == "sell"
+
+    @patch("yfinance.Ticker")
+    def test_returns_consensus_strong_sell(self, mock_ticker):
+        """When most analysts say strong sell, consensus should be 'strong_sell'."""
+        mock_ticker.return_value.recommendations_summary = pd.DataFrame([{
+            "strongBuy": 0, "buy": 0, "hold": 1, "sell": 2, "strongSell": 15,
+        }])
+        result = get_analyst_recommendation("TERRIBLE")
+        assert result is not None
+        assert result["consensus"] == "strong_sell"
+
+    @patch("yfinance.Ticker")
+    def test_returns_consensus_hold(self, mock_ticker):
+        """When most analysts say hold, consensus should be 'hold'."""
+        mock_ticker.return_value.recommendations_summary = pd.DataFrame([{
+            "strongBuy": 1, "buy": 2, "hold": 15, "sell": 1, "strongSell": 0,
+        }])
+        result = get_analyst_recommendation("MEH")
+        assert result is not None
+        assert result["consensus"] == "hold"
+
+    @patch("yfinance.Ticker")
+    def test_returns_consensus_strong_buy(self, mock_ticker):
+        """When most analysts say strong buy, consensus should be 'strong_buy'."""
+        mock_ticker.return_value.recommendations_summary = pd.DataFrame([{
+            "strongBuy": 20, "buy": 3, "hold": 1, "sell": 0, "strongSell": 0,
+        }])
+        result = get_analyst_recommendation("HOT")
+        assert result is not None
+        assert result["consensus"] == "strong_buy"
+
+    @patch("yfinance.Ticker")
+    def test_returns_none_on_empty_data(self, mock_ticker):
+        """When yfinance returns empty DataFrame, return None."""
+        mock_ticker.return_value.recommendations_summary = pd.DataFrame()
+        result = get_analyst_recommendation("UNKNOWN")
+        assert result is None
+
+    @patch("yfinance.Ticker")
+    def test_returns_none_on_none_data(self, mock_ticker):
+        """When yfinance returns None, return None."""
+        mock_ticker.return_value.recommendations_summary = None
+        result = get_analyst_recommendation("UNKNOWN")
+        assert result is None
+
+    @patch("yfinance.Ticker")
+    def test_returns_none_on_exception(self, mock_ticker):
+        """When yfinance throws, return None gracefully."""
+        mock_ticker.side_effect = Exception("Network error")
+        result = get_analyst_recommendation("FAIL")
+        assert result is None
+
+    @patch("yfinance.Ticker")
+    def test_includes_detail_counts(self, mock_ticker):
+        """Result should include the raw analyst counts."""
+        mock_ticker.return_value.recommendations_summary = pd.DataFrame([{
+            "strongBuy": 5, "buy": 10, "hold": 3, "sell": 1, "strongSell": 0,
+        }])
+        result = get_analyst_recommendation("AAPL")
+        assert result["details"]["strong_buy"] == 5
+        assert result["details"]["buy"] == 10
+        assert result["details"]["hold"] == 3
+        assert result["details"]["sell"] == 1
+        assert result["details"]["strong_sell"] == 0
+
+    @patch("yfinance.Ticker")
+    def test_cached_on_second_call(self, mock_ticker):
+        """Second call for same ticker should use cache."""
+        mock_ticker.return_value.recommendations_summary = pd.DataFrame([{
+            "strongBuy": 5, "buy": 10, "hold": 3, "sell": 1, "strongSell": 0,
+        }])
+        get_analyst_recommendation("CACHED")
+        get_analyst_recommendation("CACHED")
+        # yfinance Ticker should only be called once
+        assert mock_ticker.call_count == 1

@@ -53,8 +53,10 @@ class TestIsStatusCommand:
 class TestBuildStatusResponse:
     """Test enhanced status response with portfolio data."""
 
-    def test_basic_status_without_portfolio_data(self):
+    @patch("core.portfolio.get_trades", return_value=[])
+    def test_basic_status_without_portfolio_data(self, _mock_trades):
         from notifications.telegram import _build_status_response, _system_status
+        import notifications.telegram as tg
 
         # Ensure no portfolio data is cached
         _system_status["account"] = None
@@ -62,14 +64,21 @@ class TestBuildStatusResponse:
         _system_status["daily_pnl"] = None
         _system_status["phase"] = "waiting"
         _system_status["mode"] = "paper"
+        old_ref = tg._ib_ref
+        tg._ib_ref = None
 
-        response = _build_status_response()
+        try:
+            response = _build_status_response()
+        finally:
+            tg._ib_ref = old_ref
         assert "Status" in response
         assert "paper" in response
         assert "Waiting for next scan cycle" in response
 
-    def test_status_includes_account_data(self):
+    @patch("core.portfolio.get_trades", return_value=[])
+    def test_status_includes_account_data(self, _mock_trades):
         from notifications.telegram import _build_status_response, _system_status
+        import notifications.telegram as tg
 
         _system_status["phase"] = "scan_complete"
         _system_status["mode"] = "paper"
@@ -79,18 +88,29 @@ class TestBuildStatusResponse:
             "GrossPositionValue": 40000.0,
             "UnrealizedPnL": 1500.0,
         }
-        _system_status["daily_pnl"] = 250.0
+        _system_status["daily_pnl"] = 1750.0  # 1500 unrealized + 250 realized
         _system_status["positions"] = None
+        old_ref = tg._ib_ref
+        tg._ib_ref = None
 
-        response = _build_status_response()
+        try:
+            response = _build_status_response()
+        finally:
+            tg._ib_ref = old_ref
         assert "$100,000.00" in response
         assert "$60,000.00" in response
         assert "$40,000.00" in response
+        assert "Unrealized" in response
         assert "+1,500.00" in response  # unrealized
-        assert "+250.00" in response  # daily pnl
+        assert "Realized" in response
+        assert "+250.00" in response  # realized = 1750 - 1500
+        assert "Total" in response
+        assert "+1,750.00" in response  # total daily
 
-    def test_status_includes_positions(self):
+    @patch("core.portfolio.get_trades", return_value=[])
+    def test_status_includes_positions(self, _mock_trades):
         from notifications.telegram import _build_status_response, _system_status
+        import notifications.telegram as tg
 
         positions = [
             _make_position(ticker="AAPL", quantity=50, entry_price=150.0),
@@ -101,8 +121,13 @@ class TestBuildStatusResponse:
         _system_status["account"] = None
         _system_status["daily_pnl"] = None
         _system_status["positions"] = positions
+        old_ref = tg._ib_ref
+        tg._ib_ref = None
 
-        response = _build_status_response()
+        try:
+            response = _build_status_response()
+        finally:
+            tg._ib_ref = old_ref
         assert "AAPL" in response
         assert "50" in response
         assert "150.00" in response
@@ -110,8 +135,10 @@ class TestBuildStatusResponse:
         assert "20" in response
         assert "Open Positions (2)" in response
 
-    def test_status_shows_ai_progress(self):
+    @patch("core.portfolio.get_trades", return_value=[])
+    def test_status_shows_ai_progress(self, _mock_trades):
         from notifications.telegram import _build_status_response, _system_status
+        import notifications.telegram as tg
 
         _system_status["phase"] = "ai_analysis"
         _system_status["mode"] = "paper"
@@ -119,22 +146,147 @@ class TestBuildStatusResponse:
         _system_status["account"] = None
         _system_status["positions"] = None
         _system_status["daily_pnl"] = None
+        old_ref = tg._ib_ref
+        tg._ib_ref = None
 
-        response = _build_status_response()
+        try:
+            response = _build_status_response()
+        finally:
+            tg._ib_ref = old_ref
         assert "AI analyzing candidates" in response
         assert "3/90 candidates for US" in response
 
-    def test_status_no_positions_section_when_empty(self):
+    @patch("core.portfolio.get_trades", return_value=[])
+    def test_status_no_positions_section_when_empty(self, _mock_trades):
         from notifications.telegram import _build_status_response, _system_status
+        import notifications.telegram as tg
 
         _system_status["phase"] = "waiting"
         _system_status["mode"] = "paper"
         _system_status["account"] = None
         _system_status["daily_pnl"] = None
         _system_status["positions"] = []
+        old_ref = tg._ib_ref
+        tg._ib_ref = None
 
-        response = _build_status_response()
+        try:
+            response = _build_status_response()
+        finally:
+            tg._ib_ref = old_ref
         assert "Open Positions" not in response
+
+    @patch("core.portfolio.get_trades", return_value=[])
+    def test_status_includes_open_orders(self, _mock_trades):
+        """Open orders from IBKR should appear in status response."""
+        from notifications.telegram import _build_status_response, _system_status
+        import notifications.telegram as tg
+
+        _system_status["phase"] = "waiting"
+        _system_status["mode"] = "live"
+        _system_status["account"] = None
+        _system_status["positions"] = None
+        _system_status["daily_pnl"] = None
+
+        # Mock IB with a LMT and a STP order
+        lmt_trade = MagicMock()
+        lmt_trade.contract.symbol = "AAPL"
+        lmt_trade.order.action = "BUY"
+        lmt_trade.order.totalQuantity = 10
+        lmt_trade.order.orderType = "LMT"
+        lmt_trade.order.lmtPrice = 155.50
+        lmt_trade.order.auxPrice = 0
+        lmt_trade.orderStatus.status = "PreSubmitted"
+
+        stp_trade = MagicMock()
+        stp_trade.contract.symbol = "AAPL"
+        stp_trade.order.action = "SELL"
+        stp_trade.order.totalQuantity = 10
+        stp_trade.order.orderType = "STP"
+        stp_trade.order.lmtPrice = 0
+        stp_trade.order.auxPrice = 145.00
+        stp_trade.orderStatus.status = "PreSubmitted"
+
+        mock_ib = MagicMock()
+        mock_ib.openTrades.return_value = [lmt_trade, stp_trade]
+
+        old_ref = tg._ib_ref
+        tg._ib_ref = mock_ib
+        try:
+            response = _build_status_response()
+        finally:
+            tg._ib_ref = old_ref
+
+        assert "Open Orders (2)" in response
+        assert "AAPL" in response
+        assert "BUY" in response
+        assert "$155.50" in response  # LMT price
+        assert "$145.00" in response  # STP price
+        assert "PreSubmitted" in response
+
+    @patch("core.portfolio.get_trades", return_value=[])
+    def test_status_positions_show_live_price_and_value(self, _mock_trades):
+        """Positions should show live IBKR prices and current market value."""
+        from notifications.telegram import _build_status_response, _system_status
+        import notifications.telegram as tg
+
+        positions = [_make_position(ticker="AAPL", quantity=10, entry_price=150.0)]
+        _system_status["phase"] = "waiting"
+        _system_status["mode"] = "live"
+        _system_status["account"] = None
+        _system_status["daily_pnl"] = None
+        _system_status["positions"] = positions
+
+        # Mock IBKR portfolio with live price
+        mock_pv = MagicMock()
+        mock_pv.contract.symbol = "AAPL"
+        mock_pv.marketPrice = 160.0
+
+        mock_ib = MagicMock()
+        mock_ib.positions.return_value = []
+        mock_ib.portfolio.return_value = [mock_pv]
+        mock_ib.openTrades.return_value = []
+
+        old_ref = tg._ib_ref
+        tg._ib_ref = mock_ib
+        try:
+            response = _build_status_response()
+        finally:
+            tg._ib_ref = old_ref
+
+        assert "AAPL" in response
+        assert "Now $160.00" in response
+        assert "Val $1,600.00" in response  # 10 * 160
+        assert "+6.7%" in response  # (160-150)/150 * 100
+
+
+# ---------------------------------------------------------------------------
+# TestNotifyStartup
+# ---------------------------------------------------------------------------
+
+class TestNotifyStartup:
+    """Test that startup notification uses port-based mode detection."""
+
+    @patch("notifications.telegram._send_sync", return_value=True)
+    @patch("notifications.telegram.is_paper_mode", return_value=False)
+    def test_startup_uses_port_based_mode(self, _mock_paper, mock_send):
+        from notifications.telegram import notify_startup, _system_status
+
+        notify_startup("paper", {"NetLiquidation": 50000.0, "TotalCashValue": 30000.0})
+
+        assert _system_status["mode"] == "live"
+        sent_text = mock_send.call_args[0][0]
+        assert "Mode: live" in sent_text
+
+    @patch("notifications.telegram._send_sync", return_value=True)
+    @patch("notifications.telegram.is_paper_mode", return_value=True)
+    def test_startup_paper_when_paper_port(self, _mock_paper, mock_send):
+        from notifications.telegram import notify_startup, _system_status
+
+        notify_startup("live", {"NetLiquidation": 50000.0, "TotalCashValue": 30000.0})
+
+        assert _system_status["mode"] == "paper"
+        sent_text = mock_send.call_args[0][0]
+        assert "Mode: paper" in sent_text
 
 
 # ---------------------------------------------------------------------------
@@ -280,6 +432,7 @@ class TestRefreshPositionsCache:
     @patch("core.portfolio.get_open_positions")
     def test_refreshes_from_db(self, mock_get_pos, mock_get_pnl):
         from notifications.telegram import refresh_positions_cache, _system_status
+        import notifications.telegram as tg
 
         fake_pos = [_make_position(ticker="INTC")]
         mock_get_pos.return_value = fake_pos
@@ -288,12 +441,42 @@ class TestRefreshPositionsCache:
         _system_status["positions"] = [_make_position(ticker="SYRE")]
         _system_status["account"] = {}
 
-        refresh_positions_cache()
+        # No IB ref — should still refresh positions from DB
+        old_ref = tg._ib_ref
+        tg._ib_ref = None
+        try:
+            refresh_positions_cache()
+        finally:
+            tg._ib_ref = old_ref
 
         assert _system_status["positions"] == fake_pos
         assert _system_status["positions"][0].ticker == "INTC"
         mock_get_pos.assert_called_once()
         mock_get_pnl.assert_called_once()
+
+    @patch("core.portfolio.get_daily_pnl", return_value=10.0)
+    @patch("core.portfolio.get_open_positions", return_value=[])
+    @patch("core.connection.get_account_summary")
+    def test_fetches_fresh_account_from_ibkr(self, mock_summary, mock_get_pos, mock_get_pnl):
+        from notifications.telegram import refresh_positions_cache, _system_status
+        import notifications.telegram as tg
+
+        fresh_account = {"NetLiquidation": 99000.0, "UnrealizedPnL": -500.0}
+        mock_summary.return_value = fresh_account
+
+        # Pre-populate with stale account data
+        _system_status["account"] = {"NetLiquidation": 80000.0, "UnrealizedPnL": 0.0}
+
+        mock_ib = MagicMock()
+        old_ref = tg._ib_ref
+        tg._ib_ref = mock_ib
+        try:
+            refresh_positions_cache()
+        finally:
+            tg._ib_ref = old_ref
+
+        mock_summary.assert_called_once_with(mock_ib)
+        assert _system_status["account"] == fresh_account
 
 
 class TestThreadSafety:
@@ -306,19 +489,23 @@ class TestThreadSafety:
             "_system_status must be protected by a _status_lock"
         )
 
-    def test_concurrent_update_and_read_no_torn_state(self):
+    @patch("core.portfolio.get_trades", return_value=[])
+    def test_concurrent_update_and_read_no_torn_state(self, _mock_trades):
         """Concurrent writes and reads must not produce inconsistent state.
 
         This verifies that update_portfolio_data and _build_status_response
         don't mix old and new values when called from different threads.
         """
         import threading
+        import notifications.telegram as tg
         from notifications.telegram import (
             update_portfolio_data, _build_status_response, _system_status,
         )
 
         _system_status["phase"] = "scan_complete"
         _system_status["mode"] = "paper"
+        old_ref = tg._ib_ref
+        tg._ib_ref = None
         errors = []
 
         account_a = {"NetLiquidation": 100_000.0, "TotalCashValue": 60_000.0,
@@ -340,13 +527,16 @@ class TestThreadSafety:
                 if "$200,000.00" in resp and "+100.00" in resp:
                     errors.append("Torn read: account_b NLV with account_a pnl")
 
-        threads = [
-            threading.Thread(target=writer),
-            threading.Thread(target=reader),
-        ]
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join()
+        try:
+            threads = [
+                threading.Thread(target=writer),
+                threading.Thread(target=reader),
+            ]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+        finally:
+            tg._ib_ref = old_ref
 
         assert errors == [], f"Torn reads detected: {errors[:5]}"
