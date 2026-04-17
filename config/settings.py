@@ -93,10 +93,19 @@ RISK_PER_TRADE_PCT = 5.0        # Risk per trade as % of portfolio (used in sizi
 ALLOW_SHORT_SELLING = False     # Block sell signals for stocks not currently held
 VOLATILITY_BASELINE = 0.20      # Baseline annualized volatility (20%) for position scaling
 CHECK_ANALYST_CONSENSUS = True  # Block BUY when analyst consensus is sell/strong sell
+CORRELATION_CAP_THRESHOLD = 0.7 # Reject candidate if return-correlation with any open position exceeds this (1.0 disables)
 
 # Circuit breaker — pause trading after consecutive losses
 CIRCUIT_BREAKER_LOSSES = 3      # Number of consecutive losses to trip
 CIRCUIT_BREAKER_WINDOW_MIN = 60 # Time window in minutes to look back
+
+# Pattern Day Trader (PDT) protection
+# IBKR restricts accounts with liquid net worth below the threshold if they
+# execute 2 day trades within a rolling 5-business-day window (30-day lockout).
+# When portfolio value is at or above the threshold, PDT rules don't apply
+# here and trading is unconstrained by this check.
+PDT_PROTECTION_THRESHOLD_USD = 5000.0
+PDT_MAX_DAY_TRADES_PER_5_DAYS = 1   # Block the trade that would take us to this count (IBKR trips at 2)
 
 # Stale order re-evaluation
 STALE_ORDER_MINUTES = 1440      # Re-screen unfilled orders after 24 hours
@@ -226,5 +235,11 @@ def validate_settings() -> list[str]:
 
     if CIRCUIT_BREAKER_WINDOW_MIN <= 0:
         errors.append(f"CIRCUIT_BREAKER_WINDOW_MIN must be positive, got {CIRCUIT_BREAKER_WINDOW_MIN}")
+
+    if PDT_PROTECTION_THRESHOLD_USD < 0:
+        errors.append(f"PDT_PROTECTION_THRESHOLD_USD must be non-negative, got {PDT_PROTECTION_THRESHOLD_USD}")
+
+    if PDT_MAX_DAY_TRADES_PER_5_DAYS < 0:
+        errors.append(f"PDT_MAX_DAY_TRADES_PER_5_DAYS must be non-negative, got {PDT_MAX_DAY_TRADES_PER_5_DAYS}")
 
     return errors

@@ -16,6 +16,7 @@ from core.risk import (
     check_sector_concentration,
     check_excluded_sector,
     check_analyst_consensus,
+    check_pdt_restriction,
     calculate_position_size,
     evaluate,
 )
@@ -929,3 +930,598 @@ class TestEmptySectorSafetyNet:
         sig = _make_signal(indicator_values={"sector": ""})
         ok, _ = check_excluded_sector(sig)
         assert ok is True
+
+
+# ---------------------------------------------------------------------------
+# Feature 5: Correlation cap
+# ---------------------------------------------------------------------------
+
+import pandas as pd  # noqa: E402
+import numpy as np  # noqa: E402
+
+from core.risk import check_correlation  # noqa: E402
+
+
+def _returns(*values: float) -> pd.Series:
+    """Build a return series from a list of values."""
+    return pd.Series(values)
+
+
+def _build_returns_from_closes(closes: list[float]) -> pd.Series:
+    """Convert a close-price list into a daily-returns Series."""
+    s = pd.Series(closes)
+    return s.pct_change().dropna()
+
+
+class TestCorrelationCheck:
+    """check_correlation(signal, open_positions, returns_lookup, threshold=0.7).
+
+    Reject a new BUY when its return series correlates above `threshold`
+    with any already-held position. Negative correlation or no-correlation
+    passes through. Exit signals and missing data always pass.
+    """
+
+    def test_passes_when_no_open_positions(self):
+        """No positions → no correlation risk."""
+        sig = _make_signal(ticker="AAPL")
+        ok, reason = check_correlation(sig, [], {})
+        assert ok is True
+
+    def test_passes_when_candidate_has_no_return_data(self):
+        """If candidate's returns are missing, don't block."""
+        sig = _make_signal(ticker="NEWCO")
+        positions = [_make_position(ticker="MSFT")]
+        returns = {"MSFT": _returns(0.01, 0.02, -0.01, 0.0, 0.01)}
+        ok, reason = check_correlation(sig, positions, returns)
+        assert ok is True
+
+    def test_passes_when_existing_position_has_no_return_data(self):
+        """Missing data for an existing position should just skip it."""
+        sig = _make_signal(ticker="AAPL")
+        positions = [_make_position(ticker="MSFT")]
+        # AAPL has data, but MSFT doesn't
+        returns = {"AAPL": _returns(0.01, 0.02, -0.01, 0.0, 0.01)}
+        ok, _ = check_correlation(sig, positions, returns)
+        assert ok is True
+
+    def test_rejects_highly_correlated_pair(self):
+        """Two series with correlation ≈ 1.0 must be rejected."""
+        sig = _make_signal(ticker="AMD")
+        positions = [_make_position(ticker="NVDA")]
+        # Perfectly correlated returns (≥ default min_periods=20)
+        identical = [0.01, 0.02, -0.01, 0.03, -0.02] * 5  # 25 points
+        returns = {
+            "NVDA": pd.Series(identical),
+            "AMD": pd.Series(identical),  # corr = 1.0
+        }
+        ok, reason = check_correlation(sig, positions, returns, threshold=0.7)
+        assert ok is False
+        assert "correlation" in reason.lower()
+        assert "NVDA" in reason
+
+    def test_passes_when_correlation_below_threshold(self):
+        """Uncorrelated returns (~0.0) should pass."""
+        sig = _make_signal(ticker="GOLD")
+        positions = [_make_position(ticker="SPY")]
+        rng = np.random.default_rng(42)
+        returns = {
+            "SPY": pd.Series(rng.standard_normal(100) * 0.01),
+            "GOLD": pd.Series(rng.standard_normal(100) * 0.01),  # independent
+        }
+        ok, _ = check_correlation(sig, positions, returns, threshold=0.7)
+        assert ok is True
+
+    def test_passes_on_negative_correlation(self):
+        """Hedges (negative correlation) should always pass — they reduce risk."""
+        sig = _make_signal(ticker="PUT")
+        positions = [_make_position(ticker="SPY")]
+        spy = [0.01, 0.02, -0.01, 0.03, -0.02, 0.015, 0.005, 0.02, -0.01, 0.01]
+        returns = {
+            "SPY": pd.Series(spy),
+            "PUT": pd.Series([-x for x in spy]),  # corr = -1.0
+        }
+        ok, _ = check_correlation(sig, positions, returns, threshold=0.7)
+        assert ok is True
+
+    def test_threshold_boundary_is_strict(self):
+        """A correlation exactly equal to threshold should PASS (not strictly above)."""
+        sig = _make_signal(ticker="AMD")
+        positions = [_make_position(ticker="NVDA")]
+        # Construct two series with exactly 0.7 correlation
+        rng = np.random.default_rng(0)
+        base = rng.standard_normal(200) * 0.01
+        noise = rng.standard_normal(200) * 0.01
+        # Linear combination tuned for corr ≈ 0.7
+        # (0.7 * base + sqrt(1-0.49) * noise) gives corr(base, combo) = 0.7
+        combo = 0.7 * base + (1 - 0.49) ** 0.5 * noise
+        returns = {"NVDA": pd.Series(base), "AMD": pd.Series(combo)}
+
+        # Compute actual correlation
+        actual_corr = pd.Series(base).corr(pd.Series(combo))
+        # Set threshold to just above the actual corr → should pass
+        ok, _ = check_correlation(
+            sig, positions, returns, threshold=actual_corr + 0.01,
+        )
+        assert ok is True
+
+        # Set threshold just below → should reject
+        ok, _ = check_correlation(
+            sig, positions, returns, threshold=actual_corr - 0.01,
+        )
+        assert ok is False
+
+    def test_rejects_on_max_correlation_across_multiple_positions(self):
+        """With 2 open positions: one uncorrelated, one highly correlated, reject."""
+        sig = _make_signal(ticker="AMD")
+        positions = [
+            _make_position(ticker="KO"),
+            _make_position(ticker="NVDA"),
+        ]
+        rng = np.random.default_rng(1)
+        returns = {
+            "KO": pd.Series(rng.standard_normal(50) * 0.01),
+            "NVDA": pd.Series([0.01, 0.02, -0.01, 0.03, -0.02] * 10),
+            "AMD": pd.Series([0.01, 0.02, -0.01, 0.03, -0.02] * 10),  # matches NVDA
+        }
+        ok, reason = check_correlation(sig, positions, returns, threshold=0.7)
+        assert ok is False
+        assert "NVDA" in reason  # rejection names the correlated ticker, not KO
+
+    def test_exit_signal_passes_even_if_correlated(self):
+        """A SELL closing an existing long should not be blocked by correlation."""
+        sig = _make_signal(ticker="NVDA", action=Action.SELL)
+        positions = [_make_position(ticker="NVDA", quantity=10)]  # existing long
+        # Same ticker as candidate — correlation is 1.0 — but this is an exit
+        identical = [0.01, 0.02, -0.01, 0.03, -0.02] * 5
+        returns = {"NVDA": pd.Series(identical)}
+        ok, _ = check_correlation(sig, positions, returns, threshold=0.7)
+        assert ok is True
+
+    def test_short_entry_not_treated_as_exit(self):
+        """A SELL on a stock we DON'T hold is a short entry, not an exit —
+        should still be checked for correlation with existing positions."""
+        sig = _make_signal(ticker="SHORT", action=Action.SELL)
+        positions = [_make_position(ticker="LONG", quantity=10)]
+        # SHORT's returns highly correlated to LONG's
+        identical = [0.01, 0.02, -0.01, 0.03, -0.02] * 5
+        returns = {
+            "LONG": pd.Series(identical),
+            "SHORT": pd.Series(identical),
+        }
+        # Shorting a stock that moves IDENTICALLY to an existing long would
+        # reduce risk (functions like a hedge). But since the signal is a new
+        # entry, the check still runs — the caller decides whether to apply
+        # to shorts. For simplicity we treat new entries uniformly.
+        ok, _ = check_correlation(sig, positions, returns, threshold=0.7)
+        # Implementation choice: check applies to any new entry.
+        # Here correlation is 1.0 so it should reject.
+        assert ok is False
+
+    def test_empty_returns_lookup_passes(self):
+        """Empty dict → no data available → don't block."""
+        sig = _make_signal(ticker="AAPL")
+        positions = [_make_position(ticker="MSFT")]
+        ok, _ = check_correlation(sig, positions, {})
+        assert ok is True
+
+    def test_short_series_passes(self):
+        """Series shorter than minimum length → pass (insufficient data)."""
+        sig = _make_signal(ticker="AMD")
+        positions = [_make_position(ticker="NVDA")]
+        # Only 3 data points — too short for a reliable correlation
+        returns = {
+            "NVDA": pd.Series([0.01, 0.02, -0.01]),
+            "AMD": pd.Series([0.01, 0.02, -0.01]),
+        }
+        ok, _ = check_correlation(sig, positions, returns, threshold=0.7, min_periods=20)
+        assert ok is True
+
+    def test_constant_returns_pass(self):
+        """Halted/constant-price stocks produce NaN correlation → pass."""
+        sig = _make_signal(ticker="HALT")
+        positions = [_make_position(ticker="NVDA")]
+        returns = {
+            "NVDA": pd.Series([0.01, 0.02, -0.01, 0.03, -0.02] * 10),
+            "HALT": pd.Series([0.0] * 50),  # no variance → undefined correlation
+        }
+        ok, _ = check_correlation(sig, positions, returns, threshold=0.7)
+        assert ok is True
+
+    def test_nan_returns_handled(self):
+        """Series containing NaN values must not crash."""
+        sig = _make_signal(ticker="AMD")
+        positions = [_make_position(ticker="NVDA")]
+        returns = {
+            "NVDA": pd.Series([0.01, np.nan, -0.01, 0.03, -0.02] * 10),
+            "AMD": pd.Series([0.01, 0.02, np.nan, 0.03, -0.02] * 10),
+        }
+        # Should not raise; the implementation should handle NaN gracefully
+        ok, _ = check_correlation(sig, positions, returns, threshold=0.7)
+        # Both have similar pattern; pairwise-NaN-dropped corr will be high
+        assert isinstance(ok, bool)
+
+    def test_returns_lookup_may_contain_extra_tickers(self):
+        """Extra tickers in returns_lookup that aren't open positions = ignored."""
+        sig = _make_signal(ticker="AAPL")
+        positions = [_make_position(ticker="MSFT")]
+        returns = {
+            "MSFT": pd.Series([0.01, -0.01, 0.02, -0.02, 0.0] * 10),
+            "AAPL": pd.Series([-0.01, 0.01, -0.02, 0.02, 0.0] * 10),  # opposite
+            "TSLA": pd.Series([0.99] * 50),  # irrelevant
+            "GOOG": pd.Series([0.99] * 50),
+        }
+        ok, _ = check_correlation(sig, positions, returns, threshold=0.7)
+        # AAPL is negatively correlated with MSFT → pass
+        assert ok is True
+
+    def test_same_ticker_as_existing_position_skipped(self):
+        """If candidate ticker matches an open position, skip self-correlation."""
+        sig = _make_signal(ticker="AAPL", action=Action.BUY)
+        positions = [_make_position(ticker="AAPL", quantity=10)]  # existing long
+        # The duplicate-check catches this first in evaluate(); here we just
+        # verify check_correlation doesn't flag self-correlation as a problem.
+        returns = {"AAPL": pd.Series([0.01, 0.02, -0.01, 0.03, -0.02] * 10)}
+        ok, _ = check_correlation(sig, positions, returns, threshold=0.7)
+        # AAPL vs AAPL = 1.0, but it's the same ticker so caller already handles it.
+        # check_correlation should not reject on self-comparison.
+        assert ok is True
+
+    def test_can_be_disabled_via_threshold_above_one(self):
+        """threshold=1.0 or above means 'never reject' (feature disabled)."""
+        sig = _make_signal(ticker="AMD")
+        positions = [_make_position(ticker="NVDA")]
+        identical = [0.01, 0.02, -0.01, 0.03, -0.02] * 10
+        returns = {
+            "NVDA": pd.Series(identical),
+            "AMD": pd.Series(identical),
+        }
+        ok, _ = check_correlation(sig, positions, returns, threshold=1.0)
+        # corr = 1.0 is not strictly greater than 1.0 → pass
+        assert ok is True
+        ok, _ = check_correlation(sig, positions, returns, threshold=1.5)
+        assert ok is True
+
+
+class TestCorrelationInEvaluate:
+    """The correlation check must be wired into evaluate() with a default
+    threshold from settings. Callers pass returns_lookup explicitly."""
+
+    def test_evaluate_rejects_correlated_candidate(self):
+        """With returns_lookup showing high correlation, evaluate() must reject."""
+        sig = _make_signal(ticker="AMD", entry_price=150.0, stop_loss=145.0, take_profit=160.0)
+        positions = [_make_position(ticker="NVDA", sector="Technology")]
+        identical = [0.01, 0.02, -0.01, 0.03, -0.02] * 10
+        returns_lookup = {
+            "NVDA": pd.Series(identical),
+            "AMD": pd.Series(identical),
+        }
+        # Give MA values so trend check passes
+        sig.indicator_values.update({"MA5": 150, "MA10": 148, "MA20": 145, "sector": "Technology"})
+
+        result = evaluate(
+            sig, positions, 100_000, 0.0, current_price=150.0,
+            returns_lookup=returns_lookup, correlation_threshold=0.7,
+        )
+        assert result.approved is False
+        assert any("correlation" in r.lower() for r in result.reasons)
+
+    def test_evaluate_passes_with_uncorrelated_candidate(self):
+        """Uncorrelated returns should not block an otherwise valid signal."""
+        sig = _make_signal(
+            ticker="UNCOR", entry_price=150.0, stop_loss=145.0, take_profit=160.0,
+        )
+        sig.indicator_values.update({"MA5": 152, "MA10": 150, "MA20": 148})
+        positions = []
+        rng = np.random.default_rng(0)
+        returns_lookup = {
+            "UNCOR": pd.Series(rng.standard_normal(100) * 0.01),
+        }
+        result = evaluate(
+            sig, positions, 100_000, 0.0, current_price=150.0,
+            returns_lookup=returns_lookup, correlation_threshold=0.7,
+        )
+        assert result.approved is True
+
+    def test_evaluate_without_returns_lookup_skips_correlation(self):
+        """If returns_lookup is None, correlation check is skipped entirely."""
+        sig = _make_signal(
+            ticker="AAPL", entry_price=150.0, stop_loss=145.0, take_profit=160.0,
+        )
+        sig.indicator_values.update({"MA5": 152, "MA10": 150, "MA20": 148})
+        positions = [_make_position(ticker="MSFT", sector="Technology")]
+
+        result = evaluate(
+            sig, positions, 100_000, 0.0, current_price=150.0,
+            # returns_lookup not provided
+        )
+        # Should not raise; correlation check simply skipped
+        # (Other checks apply; sig may still pass or fail based on those.)
+        assert isinstance(result.approved, bool)
+
+
+# ---------------------------------------------------------------------------
+# PDT (Pattern Day Trader) protection tests
+# ---------------------------------------------------------------------------
+
+class TestPDTRestriction:
+    """check_pdt_restriction(signal, positions, portfolio_value, recent_trades, ...)
+
+    IBKR restricts accounts with liquid net worth < PDT_PROTECTION_THRESHOLD_USD
+    when 2 day trades are performed within 5 business days. When portfolio is
+    at or above the threshold, the check is a pass-through.
+    """
+
+    def test_passes_when_above_threshold(self):
+        """Above the USD threshold, PDT rules do not apply here — go crazy."""
+        sig = _make_signal(ticker="QUBT", action=Action.BUY)
+        ok, _ = check_pdt_restriction(
+            sig, [], portfolio_value=10_000.0, recent_trades=[],
+            threshold_usd=5000.0, max_day_trades=1,
+        )
+        assert ok is True
+
+    def test_passes_exactly_at_threshold(self):
+        """At the threshold is safe — restriction only applies strictly below."""
+        sig = _make_signal(ticker="QUBT", action=Action.BUY)
+        ok, _ = check_pdt_restriction(
+            sig, [], portfolio_value=5000.0, recent_trades=[],
+            threshold_usd=5000.0, max_day_trades=1,
+        )
+        assert ok is True
+
+    def test_passes_under_threshold_with_no_day_trades(self):
+        """Under threshold, no prior day trades — still within budget."""
+        sig = _make_signal(ticker="QUBT", action=Action.BUY)
+        ok, _ = check_pdt_restriction(
+            sig, [], portfolio_value=3000.0, recent_trades=[],
+            threshold_usd=5000.0, max_day_trades=1,
+        )
+        assert ok is True
+
+    def test_blocks_new_entry_when_day_trade_already_used(self):
+        """Under threshold + 1 day trade in 5-day window — a new BUY could
+        become a 2nd day trade (if stop fires same day). Block conservatively.
+        """
+        now = datetime.now(timezone.utc)
+        day_trade = _make_trade(
+            ticker="PRIOR",
+            entry_time=now - timedelta(days=1, hours=2),
+            exit_time=now - timedelta(days=1),  # entered and exited same calendar day
+        )
+        sig = _make_signal(ticker="QUBT", action=Action.BUY)
+        ok, reason = check_pdt_restriction(
+            sig, [], portfolio_value=3000.0, recent_trades=[day_trade],
+            threshold_usd=5000.0, max_day_trades=1,
+        )
+        assert ok is False
+        assert "PDT" in reason or "day trade" in reason.lower()
+
+    def test_allows_exit_of_prior_day_position(self):
+        """A SELL of a position opened on a prior day is NOT a day trade —
+        must not be blocked even under threshold with day trades used.
+        Otherwise the trader is trapped in a losing swing position.
+        """
+        now = datetime.now(timezone.utc)
+        day_trade = _make_trade(
+            ticker="PRIOR",
+            entry_time=now - timedelta(days=1, hours=2),
+            exit_time=now - timedelta(days=1),
+        )
+        # Position opened yesterday → closing it today is NOT a day trade
+        pos = _make_position(
+            ticker="AAPL", quantity=10, entry_time=now - timedelta(days=2),
+        )
+        sig = _make_signal(ticker="AAPL", action=Action.SELL)
+        ok, _ = check_pdt_restriction(
+            sig, [pos], portfolio_value=3000.0, recent_trades=[day_trade],
+            threshold_usd=5000.0, max_day_trades=1,
+        )
+        assert ok is True
+
+    def test_blocks_same_day_exit_when_day_trade_used(self):
+        """SELL of a position opened today completes a day trade. If 1 day
+        trade already used, this would be the 2nd → block (IBKR trips at 2).
+        """
+        now = datetime.now(timezone.utc)
+        day_trade = _make_trade(
+            ticker="PRIOR",
+            entry_time=now - timedelta(days=1, hours=2),
+            exit_time=now - timedelta(days=1),
+        )
+        pos = _make_position(ticker="AAPL", quantity=10, entry_time=now)
+        sig = _make_signal(ticker="AAPL", action=Action.SELL)
+        ok, reason = check_pdt_restriction(
+            sig, [pos], portfolio_value=3000.0, recent_trades=[day_trade],
+            threshold_usd=5000.0, max_day_trades=1,
+        )
+        assert ok is False
+        assert "PDT" in reason or "day trade" in reason.lower()
+
+    def test_allows_same_day_exit_with_no_prior_day_trades(self):
+        """SELL of a same-day position is the 1st day trade — IBKR allows 1
+        before the 2-trade restriction. Must not be blocked.
+        """
+        now = datetime.now(timezone.utc)
+        pos = _make_position(ticker="AAPL", quantity=10, entry_time=now)
+        sig = _make_signal(ticker="AAPL", action=Action.SELL)
+        ok, _ = check_pdt_restriction(
+            sig, [pos], portfolio_value=3000.0, recent_trades=[],
+            threshold_usd=5000.0, max_day_trades=1,
+        )
+        assert ok is True
+
+    def test_ignores_day_trades_outside_window(self):
+        """Day trades older than 5 business days don't count toward the limit."""
+        now = datetime.now(timezone.utc)
+        old_day_trade = _make_trade(
+            ticker="OLD",
+            entry_time=now - timedelta(days=14, hours=2),
+            exit_time=now - timedelta(days=14),
+        )
+        sig = _make_signal(ticker="QUBT", action=Action.BUY)
+        ok, _ = check_pdt_restriction(
+            sig, [], portfolio_value=3000.0, recent_trades=[old_day_trade],
+            threshold_usd=5000.0, max_day_trades=1,
+        )
+        assert ok is True
+
+    def test_does_not_count_swing_trades(self):
+        """A trade held overnight (entry_date != exit_date) is not a day trade."""
+        now = datetime.now(timezone.utc)
+        swing = _make_trade(
+            ticker="SWING",
+            entry_time=now - timedelta(days=3),
+            exit_time=now - timedelta(days=1),
+        )
+        sig = _make_signal(ticker="QUBT", action=Action.BUY)
+        ok, _ = check_pdt_restriction(
+            sig, [], portfolio_value=3000.0, recent_trades=[swing],
+            threshold_usd=5000.0, max_day_trades=1,
+        )
+        assert ok is True
+
+    def test_max_day_trades_zero_disables_check(self):
+        """max_day_trades=0 means feature disabled — always pass."""
+        now = datetime.now(timezone.utc)
+        day_trade = _make_trade(
+            ticker="PRIOR",
+            entry_time=now - timedelta(days=1, hours=2),
+            exit_time=now - timedelta(days=1),
+        )
+        sig = _make_signal(ticker="QUBT", action=Action.BUY)
+        ok, _ = check_pdt_restriction(
+            sig, [], portfolio_value=3000.0, recent_trades=[day_trade],
+            threshold_usd=5000.0, max_day_trades=0,
+        )
+        assert ok is True
+
+    def test_day_trade_classification_uses_us_eastern_not_utc(self):
+        """PDT day-trade detection must compare ET dates, not UTC dates.
+
+        IBKR's PDT rule tracks the US Eastern calendar day. A trade opened at
+        02:00 UTC (= 21:00 prior-ET) and closed at 15:00 UTC (= 10:00 ET) is a
+        single-ET-day round trip (day trade). By UTC dates, entry was one day
+        and exit was the next — the old code would classify this as a swing
+        trade and miss it. The inverse case also matters: entry 23:00 UTC and
+        exit 01:00 UTC are UTC-same-day but ET-cross-midnight.
+        """
+        from zoneinfo import ZoneInfo
+        ET = ZoneInfo("America/New_York")
+
+        # Single ET trading day (Wednesday 2026-04-15), spans UTC midnight.
+        # Entry: 04:30 UTC Wed = 00:30 ET Wed (pre-market edge, same ET day)
+        # Exit:  18:00 UTC Wed = 14:00 ET Wed (regular session, same ET day)
+        # By UTC date both are Wed — counted as day trade (correct by chance).
+        #
+        # The failure mode: entry 23:00 UTC Tue = 19:00 ET Tue vs
+        #                   exit  14:00 UTC Wed = 10:00 ET Wed → different ET days
+        # but UTC dates also differ, so currently counted correctly as swing.
+        #
+        # The problematic case for UTC-based code: entry 04:30 UTC Wed
+        # = 00:30 ET Wed, exit 05:00 UTC Wed = 01:00 ET Wed — same ET AND UTC day.
+        # This one also works.
+        #
+        # The real PDT bug case: entry 03:00 UTC Tue = 23:00 ET Mon and
+        #                        exit  14:00 UTC Tue = 10:00 ET Tue.
+        # UTC: both Tue → classified as day trade.
+        # ET:  Mon → Tue → swing, should NOT count toward PDT.
+        now = datetime.now(timezone.utc)
+        # Anchor at a known ET date (avoid test flakiness from DST edges)
+        anchor_utc = datetime(2026, 4, 14, 12, 0, tzinfo=timezone.utc)  # Tue 08:00 ET
+
+        entry_utc = datetime(2026, 4, 14, 3, 0, tzinfo=timezone.utc)   # Mon 23:00 ET
+        exit_utc = datetime(2026, 4, 14, 14, 0, tzinfo=timezone.utc)   # Tue 10:00 ET
+
+        fake_swing = _make_trade(
+            ticker="PRIOR", entry_time=entry_utc, exit_time=exit_utc,
+        )
+        sig = _make_signal(ticker="QUBT", action=Action.BUY)
+
+        # Stub datetime.now in the risk module so "today" is a fixed ET Wednesday
+        # within the 5-day window of the fake trade's ET exit (Tuesday).
+        import core.risk as risk_mod
+        from unittest.mock import patch
+
+        fixed_now = datetime(2026, 4, 15, 14, 0, tzinfo=timezone.utc)  # Wed 10:00 ET
+
+        class FakeDT(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return fixed_now.astimezone(tz) if tz else fixed_now.replace(tzinfo=None)
+
+        with patch.object(risk_mod, "datetime", FakeDT):
+            ok, reason = check_pdt_restriction(
+                sig, [], portfolio_value=3000.0, recent_trades=[fake_swing],
+                threshold_usd=5000.0, max_day_trades=1,
+            )
+
+        # The fake_swing is Mon→Tue in ET (not a day trade). Old code saw it as
+        # a same-UTC-day round-trip (day trade) and would block the new entry.
+        # Correct ET-based classification leaves 0 day trades used, so new entry
+        # is allowed.
+        assert ok is True, (
+            f"Mon→Tue ET trade must not count as a PDT day trade (it crosses ET "
+            f"midnight). Got ok={ok}, reason={reason!r}"
+        )
+
+
+class TestPDTRestrictionInEvaluate:
+    """PDT check must be wired into the main evaluate() function."""
+
+    def test_evaluate_blocks_new_entry_under_threshold_with_prior_day_trade(self):
+        """evaluate() must reject a BUY when portfolio < $5K and a day trade
+        has been used in the rolling window."""
+        now = datetime.now(timezone.utc)
+        day_trade = _make_trade(
+            ticker="PRIOR",
+            entry_time=now - timedelta(days=1, hours=2),
+            exit_time=now - timedelta(days=1),
+        )
+        sig = _make_signal(
+            ticker="QUBT", action=Action.BUY,
+            entry_price=10.0, stop_loss=9.5, take_profit=11.0,
+        )
+        sig.indicator_values.update({"MA5": 10.5, "MA10": 10.2, "MA20": 10.0})
+        result = evaluate(
+            sig, [], portfolio_value=3000.0, daily_pnl=0.0,
+            current_price=10.0, recent_trades=[day_trade],
+        )
+        assert result.approved is False
+        assert any("pdt" in r.lower() or "day trade" in r.lower() for r in result.reasons)
+
+    def test_evaluate_allows_under_threshold_with_no_day_trades(self):
+        """evaluate() must not add PDT friction when there are no prior day trades."""
+        sig = _make_signal(
+            ticker="QUBT", action=Action.BUY,
+            entry_price=10.0, stop_loss=9.5, take_profit=11.0,
+        )
+        sig.indicator_values.update({"MA5": 10.5, "MA10": 10.2, "MA20": 10.0})
+        result = evaluate(
+            sig, [], portfolio_value=3000.0, daily_pnl=0.0,
+            current_price=10.0, recent_trades=[],
+        )
+        # May fail on other checks (position size), but not on PDT
+        assert not any("pdt" in r.lower() for r in result.reasons)
+
+    def test_evaluate_allows_above_threshold_regardless_of_day_trades(self):
+        """evaluate() must not add PDT friction above the threshold."""
+        now = datetime.now(timezone.utc)
+        day_trades = [
+            _make_trade(
+                ticker=f"DT{i}",
+                entry_time=now - timedelta(days=1, hours=2),
+                exit_time=now - timedelta(days=1),
+            )
+            for i in range(5)
+        ]
+        sig = _make_signal(
+            ticker="QUBT", action=Action.BUY,
+            entry_price=10.0, stop_loss=9.5, take_profit=11.0,
+        )
+        sig.indicator_values.update({"MA5": 10.5, "MA10": 10.2, "MA20": 10.0})
+        result = evaluate(
+            sig, [], portfolio_value=100_000.0, daily_pnl=0.0,
+            current_price=10.0, recent_trades=day_trades,
+        )
+        # Must not be rejected for PDT reasons above threshold
+        assert not any("pdt" in r.lower() for r in result.reasons)

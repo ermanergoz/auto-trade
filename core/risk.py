@@ -7,10 +7,16 @@ never fetch data themselves. This allows the backtester to reuse them.
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 from core.models import Signal, Position, Trade, Action
 import math
 from typing import Optional
+
+# US Eastern time — IBKR's PDT rule and NYSE trading days are both tracked
+# in this timezone. Using UTC dates would misclassify trades that span UTC
+# midnight but occur within a single ET session (or vice versa).
+_US_EASTERN = ZoneInfo("America/New_York")
 
 import numpy as np
 import pandas as pd
@@ -33,6 +39,9 @@ from config.settings import (
     CIRCUIT_BREAKER_WINDOW_MIN,
     VOLATILITY_BASELINE,
     CHECK_ANALYST_CONSENSUS,
+    CORRELATION_CAP_THRESHOLD,
+    PDT_PROTECTION_THRESHOLD_USD,
+    PDT_MAX_DAY_TRADES_PER_5_DAYS,
 )
 
 logger = logging.getLogger(__name__)
@@ -476,6 +485,160 @@ def check_circuit_breaker(
     return True, ""
 
 
+def check_correlation(
+    signal: Signal,
+    open_positions: list[Position],
+    returns_lookup: dict[str, pd.Series],
+    threshold: float = CORRELATION_CAP_THRESHOLD,
+    min_periods: int = 20,
+) -> tuple[bool, str]:
+    """Reject a new entry whose returns correlate above `threshold` with any held position.
+
+    Prevents building five correlated "independent" positions that really behave
+    as one concentrated bet. Uses Pearson correlation of daily returns.
+
+    Args:
+        returns_lookup: {ticker: pd.Series of daily returns}. Callers build this
+                        from recent close prices. Missing series are skipped.
+        threshold: max allowed max-correlation (strict >). 1.0 or above disables.
+        min_periods: minimum overlapping observations needed; below this, skip.
+
+    Pass-through when: no positions, no data for candidate, no data for any
+    existing position, or this is an exit on an existing position.
+    """
+    # Exit signals (closing an existing position) always pass.
+    for pos in open_positions:
+        if pos.ticker == signal.ticker and pos.quantity != 0:
+            if (signal.action == Action.SELL and pos.quantity > 0) or \
+               (signal.action == Action.BUY and pos.quantity < 0):
+                return True, ""
+
+    if not open_positions or threshold >= 1.0:
+        return True, ""
+
+    candidate_returns = returns_lookup.get(signal.ticker)
+    if candidate_returns is None or len(candidate_returns) < min_periods:
+        return True, ""
+
+    worst_ticker = None
+    worst_corr = -1.0
+    for pos in open_positions:
+        if pos.ticker == signal.ticker:
+            continue  # self — handled by duplicate check elsewhere
+        other = returns_lookup.get(pos.ticker)
+        if other is None or len(other) < min_periods:
+            continue
+        # Align on shared index — pandas .corr handles length mismatch via index alignment
+        aligned_candidate, aligned_other = candidate_returns.align(other, join="inner")
+        if len(aligned_candidate.dropna()) < min_periods:
+            continue
+        corr = aligned_candidate.corr(aligned_other)
+        if pd.isna(corr):
+            continue
+        if corr > worst_corr:
+            worst_corr = corr
+            worst_ticker = pos.ticker
+
+    if worst_ticker is not None and worst_corr > threshold:
+        return False, (
+            f"Correlation cap: {signal.ticker} returns are "
+            f"{worst_corr:.2f}-correlated with open position {worst_ticker} "
+            f"(limit {threshold:.2f}). Adding would concentrate risk."
+        )
+    return True, ""
+
+
+def check_pdt_restriction(
+    signal: Signal,
+    open_positions: list[Position],
+    portfolio_value: float,
+    recent_trades: list[Trade] | None = None,
+    threshold_usd: float = PDT_PROTECTION_THRESHOLD_USD,
+    max_day_trades: int = PDT_MAX_DAY_TRADES_PER_5_DAYS,
+) -> tuple[bool, str]:
+    """Block trades that would trigger IBKR's sub-threshold day-trade restriction.
+
+    IBKR flags accounts with Liquid Net Worth < threshold_usd and restricts
+    them to closing-orders-only for 30 days once 2 day trades occur within a
+    rolling 5-business-day window.
+
+    Logic:
+      - Portfolio >= threshold → pass (unconstrained).
+      - Otherwise count same-calendar-day round-trip trades in the last 5
+        business days (~7 calendar days).
+      - New entries (BUY without an existing long, SELL without existing
+        short) could become a day trade if closed same-day → block when
+        count would push total to max_day_trades.
+      - Same-day exits (closing a position opened today) definitively are
+        a day trade → block under the same threshold.
+      - Exits of positions opened on a prior day are NOT day trades — always
+        allow so the trader isn't trapped in a swing position.
+
+    Set max_day_trades=0 to disable.
+    """
+    if portfolio_value >= threshold_usd:
+        return True, ""
+    if max_day_trades <= 0:
+        return True, ""
+
+    def _ensure_utc(dt: datetime) -> datetime:
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+    def _et_date(dt: datetime):
+        """Return the US Eastern calendar date for a timestamp.
+
+        IBKR's PDT rule classifies day trades by ET calendar day. Comparing
+        UTC dates would mis-bucket trades that cross UTC midnight during a
+        single ET session (or vice versa).
+        """
+        return _ensure_utc(dt).astimezone(_US_EASTERN).date()
+
+    now_utc = datetime.now(timezone.utc)
+    window_start = now_utc - timedelta(days=7)  # 5 business days ≈ 7 calendar days
+
+    day_trade_count = 0
+    for trade in recent_trades or []:
+        if not getattr(trade, "exit_time", None) or not getattr(trade, "entry_time", None):
+            continue
+        exit_t = _ensure_utc(trade.exit_time)
+        if exit_t < window_start:
+            continue
+        if _et_date(trade.entry_time) == _et_date(trade.exit_time):
+            day_trade_count += 1
+
+    # Classify the signal: same-day exit, new entry, or prior-day exit
+    today_et = _et_date(now_utc)
+    is_exit_today = False
+    is_exit_prior_day = False
+    for pos in open_positions:
+        if pos.ticker != signal.ticker or pos.quantity == 0:
+            continue
+        is_closing = (signal.action == Action.SELL and pos.quantity > 0) or \
+                     (signal.action == Action.BUY and pos.quantity < 0)
+        if is_closing:
+            if _et_date(pos.entry_time) == today_et:
+                is_exit_today = True
+            else:
+                is_exit_prior_day = True
+        break
+
+    # Exit of a position opened on a prior day — not a day trade → allow
+    if is_exit_prior_day:
+        return True, ""
+
+    # Block if adding this potential day trade would hit the configured cap
+    if day_trade_count >= max_day_trades:
+        action_desc = "same-day exit" if is_exit_today else "new entry"
+        return False, (
+            f"PDT protection: portfolio ${portfolio_value:,.0f} < "
+            f"${threshold_usd:,.0f} threshold, and {day_trade_count} day "
+            f"trade(s) already used in the last 5 days (max {max_day_trades}). "
+            f"Blocking this {action_desc} to avoid triggering IBKR's 30-day "
+            "restriction."
+        )
+    return True, ""
+
+
 def check_analyst_consensus(
     signal: Signal,
     consensus: str | None,
@@ -591,6 +754,8 @@ def evaluate(
     recent_trades: list[Trade] | None = None,
     volatility: float | None = None,
     analyst_consensus: str | None = None,
+    returns_lookup: dict[str, pd.Series] | None = None,
+    correlation_threshold: float = CORRELATION_CAP_THRESHOLD,
 ) -> RiskResult:
     """Run all risk checks on a signal. Returns RiskResult.
 
@@ -601,6 +766,10 @@ def evaluate(
                     position sizes are scaled inversely (high vol → smaller).
         analyst_consensus: Analyst recommendation consensus string
                           ("buy", "sell", "hold", etc.) or None if unavailable.
+        returns_lookup: {ticker: pd.Series of daily returns} for correlation
+                        check. Pass None to disable the correlation cap.
+        correlation_threshold: Max tolerated correlation with any existing
+                               position. Default from settings.
     """
     reasons = []
 
@@ -641,6 +810,8 @@ def evaluate(
         check_no_duplicate(signal, open_positions),
         check_excluded_sector(signal),
         check_circuit_breaker(recent_trades or []),
+        check_pdt_restriction(signal, open_positions, portfolio_value,
+                              recent_trades=recent_trades),
     ]
 
     # Discipline checks only apply to new entries, not exits.
@@ -653,6 +824,10 @@ def evaluate(
             check_trend_confirmation(signal, indicator_values),
             check_analyst_consensus(signal, analyst_consensus),
         ])
+        if returns_lookup is not None:
+            checks.append(check_correlation(
+                signal, open_positions, returns_lookup, threshold=correlation_threshold,
+            ))
 
     for passed, reason in checks:
         if not passed:
