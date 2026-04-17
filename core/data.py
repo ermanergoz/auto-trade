@@ -125,9 +125,15 @@ def get_historical_data_yfinance(
     period: str = "6mo",
     interval: str = "1d",
     market: str = "US",
+    auto_adjust: bool = True,
 ) -> pd.DataFrame:
-    """Fetch historical data via YFinance. Fallback for backtest mode."""
-    cache_key = f"yf:{ticker}:{market}:{period}:{interval}"
+    """Fetch historical data via YFinance. Fallback for backtest mode.
+
+    auto_adjust=True (default) returns split- and dividend-adjusted OHLC so
+    the price series is continuous through corporate actions. Without this,
+    a 4-for-1 split shows as a 75% crash and poisons backtests.
+    """
+    cache_key = f"yf:{ticker}:{market}:{period}:{interval}:adj={auto_adjust}"
     cached = _cache_get(cache_key)
     if cached is not None:
         return cached
@@ -135,7 +141,10 @@ def get_historical_data_yfinance(
     yf_ticker = ticker
 
     try:
-        data = yf.download(yf_ticker, period=period, interval=interval, progress=False)
+        data = yf.download(
+            yf_ticker, period=period, interval=interval,
+            progress=False, auto_adjust=auto_adjust,
+        )
     except Exception as e:
         logger.error("YFinance download failed for %s: %s", yf_ticker, e)
         return pd.DataFrame()
@@ -144,9 +153,23 @@ def get_historical_data_yfinance(
         logger.warning("No YFinance data returned for %s", yf_ticker)
         return pd.DataFrame()
 
-    # Normalize column names (yfinance can return MultiIndex)
+    # Normalize column names. yfinance can return a MultiIndex whose level
+    # order varies across versions — (field, ticker) in some releases,
+    # (ticker, field) in others. Detect which level carries the OHLC field
+    # names by locating "Close" and flatten to that level.
     if isinstance(data.columns, pd.MultiIndex):
-        data.columns = data.columns.get_level_values(0)
+        field_level = None
+        for level in range(data.columns.nlevels):
+            if "Close" in data.columns.get_level_values(level):
+                field_level = level
+                break
+        if field_level is None:
+            logger.error(
+                "YFinance returned MultiIndex columns with no 'Close' level for %s: %s",
+                yf_ticker, data.columns.tolist(),
+            )
+            return pd.DataFrame()
+        data.columns = data.columns.get_level_values(field_level)
 
     df = data[["Open", "High", "Low", "Close", "Volume"]].copy()
     df.columns = ["open", "high", "low", "close", "volume"]
@@ -154,6 +177,89 @@ def get_historical_data_yfinance(
 
     _cache_set(cache_key, df, ttl=3600)  # cache longer for historical
     return df
+
+
+# ---------------------------------------------------------------------------
+# Split/dividend adjustment helpers
+# ---------------------------------------------------------------------------
+
+def detect_unadjusted_splits(
+    df: pd.DataFrame,
+    threshold: float = 0.3,
+) -> list[dict]:
+    """Find days where close-to-close change looks like an unadjusted split.
+
+    Returns a list of {'date', 'ratio', 'type'} dicts. A forward split
+    (e.g. 4-for-1) makes price drop sharply; ratio is the inferred divisor
+    (prev_close / curr_close). A reverse split makes price jump; ratio is
+    the same formula (gives a value < 1).
+
+    threshold: minimum absolute fractional change to flag (0.3 = 30%).
+    """
+    if df is None or df.empty or len(df) < 2:
+        return []
+
+    closes = df["close"].values
+    index = df.index
+    events: list[dict] = []
+
+    for i in range(1, len(closes)):
+        prev_close = closes[i - 1]
+        curr_close = closes[i]
+        if prev_close <= 0 or curr_close <= 0:
+            continue
+
+        pct_change = (curr_close - prev_close) / prev_close
+        if abs(pct_change) < threshold:
+            continue
+
+        ratio = prev_close / curr_close
+        events.append({
+            "date": index[i],
+            "ratio": ratio,
+            "type": "forward" if ratio > 1 else "reverse",
+        })
+
+    return events
+
+
+def adjust_for_splits(
+    df: pd.DataFrame,
+    splits: dict,
+) -> pd.DataFrame:
+    """Retroactively adjust OHLC and volume for split events.
+
+    Args:
+        df: DataFrame with OHLC + volume columns, indexed by date.
+        splits: {split_date: ratio} mapping.
+                ratio > 1  → forward split (e.g. 4.0 for 4-for-1):
+                             pre-split price /= ratio, volume *= ratio.
+                ratio < 1  → reverse split (e.g. 0.1 for 1-for-10):
+                             pre-split price /= ratio (i.e. multiplied),
+                             volume *= ratio (i.e. divided).
+                ratio == 1 → no-op.
+
+    Rows on and after split_date are unchanged. Multiple splits apply
+    cumulatively to all earlier rows. Returns a new DataFrame.
+    """
+    if df is None or df.empty or not splits:
+        return df.copy() if df is not None else df
+
+    out = df.copy()
+    price_cols = [c for c in ("open", "high", "low", "close") if c in out.columns]
+
+    for split_date, ratio in sorted(splits.items()):
+        if ratio == 1.0 or ratio <= 0:
+            continue
+        mask = out.index < split_date
+        if not mask.any():
+            continue
+        for col in price_cols:
+            out.loc[mask, col] = out.loc[mask, col] / ratio
+        if "volume" in out.columns:
+            out.loc[mask, "volume"] = out.loc[mask, "volume"] * ratio
+
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -264,7 +370,7 @@ def clear_realtime_subscriptions(ib: IB) -> None:
 
 
 # ---------------------------------------------------------------------------
-# News (yfinance primary, Tavily fallback)
+# News (Tavily primary, yfinance fallback)
 # ---------------------------------------------------------------------------
 
 _NEWS_TTL = 3600  # 1 hour — reduces Tavily API usage
@@ -274,7 +380,6 @@ _NEWS_FAILURE_TTL = 60  # Retry sooner when news fetch fails
 def _get_news_yfinance(ticker: str, max_results: int = 5) -> list[str]:
     """Fetch recent news headlines via yfinance (free, no API key)."""
     try:
-        import yfinance as yf
         news = yf.Ticker(ticker).news
         if not news:
             return []
@@ -291,42 +396,60 @@ def _get_news_yfinance(ticker: str, max_results: int = 5) -> list[str]:
         return []
 
 
+def _get_news_tavily(ticker: str, max_results: int = 5) -> Optional[list[str]]:
+    """Fetch news via Tavily. Returns None on failure (triggers fallback),
+    [] if Tavily is not configured, or a list of headlines on success."""
+    if not TAVILY_API_KEY:
+        return []
+    try:
+        from tavily import TavilyClient
+        client = TavilyClient(api_key=TAVILY_API_KEY)
+        query = f"{ticker} stock"
+        response = client.search(query, max_results=max_results, search_depth="basic")
+        return [r.get("title", "") for r in response.get("results", []) if r.get("title")]
+    except Exception as e:
+        logger.warning("Tavily failed for %s: %s — falling back to yfinance", ticker, e)
+        return None
+
+
 def get_news(ticker: str, market: str = "US", max_results: int = 5) -> list[str]:
     """Fetch recent news headlines for a ticker.
 
-    Tries yfinance first (free, no rate limits), falls back to Tavily
-    if yfinance returns nothing. This conserves Tavily API quota.
-    Returns a list of headline strings.
+    Tries Tavily first (richer results), falls back to yfinance when
+    Tavily is unconfigured, errors out (e.g. rate limit), or returns
+    no results. Returns a list of headline strings.
     """
     cache_key = f"news:{ticker}:{market}"
     cached = _cache_get(cache_key)
     if cached is not None:
+        logger.debug("News for %s: cache hit (%d headlines)", ticker, len(cached))
         return cached
 
-    # Try yfinance first (free, no rate limits)
-    headlines = _get_news_yfinance(ticker, max_results)
+    # Try Tavily first. None signals an error (rate limit, network, etc.);
+    # [] means Tavily unconfigured or returned no results. In both cases
+    # we fall back to yfinance so the AI still gets some signal.
+    headlines = _get_news_tavily(ticker, max_results)
     if headlines:
+        logger.info("News for %s: Tavily OK (%d headlines)", ticker, len(headlines))
         _cache_set(cache_key, headlines, ttl=_NEWS_TTL)
         return headlines
 
-    # Fallback to Tavily when yfinance returns nothing
-    if TAVILY_API_KEY:
-        try:
-            from tavily import TavilyClient
-            client = TavilyClient(api_key=TAVILY_API_KEY)
+    if headlines is None:
+        logger.info("News for %s: Tavily failed — trying yfinance fallback", ticker)
+    elif TAVILY_API_KEY:
+        logger.info("News for %s: Tavily empty — trying yfinance fallback", ticker)
+    else:
+        logger.debug("News for %s: Tavily unconfigured — using yfinance", ticker)
 
-            query = f"{ticker} stock"
-            response = client.search(query, max_results=max_results, search_depth="basic")
-            headlines = [r.get("title", "") for r in response.get("results", []) if r.get("title")]
+    yf_headlines = _get_news_yfinance(ticker, max_results)
+    if yf_headlines:
+        logger.info("News for %s: yfinance OK (%d headlines)", ticker, len(yf_headlines))
+        _cache_set(cache_key, yf_headlines, ttl=_NEWS_TTL)
+        return yf_headlines
 
-            _cache_set(cache_key, headlines, ttl=_NEWS_TTL)
-            return headlines
-
-        except Exception as e:
-            logger.warning("Tavily configured but failed for %s: %s", ticker, e)
-
-    _cache_set(cache_key, headlines, ttl=_NEWS_FAILURE_TTL)
-    return headlines
+    logger.warning("News for %s: no headlines from Tavily or yfinance", ticker)
+    _cache_set(cache_key, [], ttl=_NEWS_FAILURE_TTL)
+    return []
 
 
 def get_macro_news(max_results: int = 5) -> list[str]:
