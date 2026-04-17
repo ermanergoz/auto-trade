@@ -584,8 +584,6 @@ class TestNotifyReconciliationMismatch:
         assert "direction" in text.lower() or "critical" in text.lower() or "sign" in text.lower()
 
 
-
-
 class TestMarketHoursDST:
     """Verify NYSE market hours follow US DST, not the local display timezone.
 
