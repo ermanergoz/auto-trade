@@ -36,7 +36,7 @@ Financial sector stocks (banks, insurance, lending companies) and defense/milita
 - **US market focus**: Trades US (NYSE/NASDAQ) equities through IBKR with 10 different scanner types for broad market coverage
 - **Two-stage screening pipeline**: Technical screener (fast, free) filters hundreds of stocks, then AI analyst performs deep analysis on all qualifying candidates
 - **AI-powered analysis**: Local LLM via Ollama (Qwen 2.5 7B by default) -- no API keys, no cost, fully offline
-- **Comprehensive risk management**: Position sizing, daily loss limits, sector concentration limits, mandatory stop-losses, duplicate position prevention, defense/financial sector exclusion, and circuit breaker
+- **Comprehensive risk management**: 14 risk checks including position sizing, daily loss limits, sector concentration limits, mandatory stop-losses, duplicate position prevention, defense/financial sector exclusion, circuit breaker, and analyst consensus. Exit signals bypass discipline checks so positions can always be closed
 - **Bracket order execution**: Automatic stop-loss and take-profit orders attached to every trade via IBKR bracket orders
 - **Day and swing trading**: Automatic end-of-day position closing for day trades, trailing stops for swing trades
 - **Backtesting engine**: Replay historical data through the exact same strategy code with configurable slippage and commission modeling
@@ -119,7 +119,7 @@ Each scan cycle (every 15 minutes by default) executes the following pipeline:
 4. **Data fetching** -- Fetch historical OHLCV data for all stocks in the universe from IBKR (or YFinance fallback)
 5. **Technical screening** -- Run 6 technical indicators on every stock, score candidates, inject sector data from the universe into each candidate's indicator values (so risk checks can enforce sector limits), and pass all qualifying stocks (above min_score) to AI analysis
 6. **AI analysis** -- Send each candidate to the local LLM (via Ollama) with price action, indicators, and news context; receive structured trade recommendations with confidence scores
-7. **Risk evaluation** -- Pass every AI-approved signal through 12 risk checks (short selling block, position size, daily loss, max positions, stop-loss, sector concentration, no duplicates, excluded sector, risk/reward, anti-momentum, trend confirmation, circuit breaker)
+7. **Risk evaluation** -- Pass every AI-approved signal through 14 risk checks (short selling block, position size, daily loss, cumulative risk, max positions, stop-loss, sector concentration, no duplicates, excluded sector, circuit breaker, and for new entries only: risk/reward, anti-momentum, trend confirmation, analyst consensus). Exit signals (selling a held position) skip the discipline checks so positions can always be closed
 8. **Order execution** -- Place bracket orders (entry + stop-loss + take-profit) through IBKR for approved signals
 9. **Logging and notifications** -- Record everything to SQLite and CSV, send Telegram alerts, update terminal dashboard
 
@@ -565,7 +565,7 @@ Zero. The AI runs locally via Ollama -- no cloud API fees. Each analysis takes ~
 
 ## Risk Management
 
-Every trade must pass through **all 12 risk checks** before execution. If any check fails, the trade is rejected and the reasons are logged.
+Every trade must pass through **all 14 risk checks** before execution (10 core checks + 4 discipline checks for new entries only). If any check fails, the trade is rejected and the reasons are logged.
 
 ### Risk Checks
 
@@ -579,10 +579,13 @@ Every trade must pass through **all 12 risk checks** before execution. If any ch
 | **Sector Concentration** | No sector can exceed X% of total portfolio | 50% |
 | **No Duplicates** | Cannot open a second position in an already-held stock | Enforced |
 | **Excluded Sector** | Block financial sector, defense/military stocks, and explicitly excluded tickers | Enforced |
-| **Anti-Momentum** | Reject if price already moved >X% from signal entry (rejects invalid prices) | 8% |
-| **Trend Confirmation** | Moving averages must align with trade direction | MA5 > MA10 > MA20 |
-| **Risk/Reward Ratio** | Take-profit/stop-loss ratio must exceed minimum (rejects invalid prices) | 1.5:1 |
 | **Circuit Breaker** | Pause trading after N consecutive losses within a time window | 3 losses / 60 min |
+| **Risk/Reward Ratio** | Take-profit/stop-loss ratio must exceed minimum (new entries only) | 1.5:1 |
+| **Anti-Momentum** | Reject if price already moved >X% from signal entry (new entries only) | 8% |
+| **Trend Confirmation** | Moving averages must align with trade direction (new entries only) | MA5 > MA10 > MA20 |
+| **Analyst Consensus** | Block BUY when analysts rate sell/strong sell (new entries only) | Enabled |
+
+> **Exit signals** (selling a held long, or buying back a held short) skip the discipline checks (risk/reward, anti-momentum, trend confirmation, analyst consensus) so positions can always be closed regardless of market conditions. This prevents the dangerous situation of being trapped in a losing position.
 
 > **Note**: These defaults are tuned for a small account ($500). For larger accounts, see [docs/RISK-TUNING.md](docs/RISK-TUNING.md) for recommended values at different account sizes.
 
@@ -694,7 +697,7 @@ The Telegram bot sends real-time alerts for all trading activity.
 1. Create a Telegram bot via @BotFather (see [Prerequisites](#3-telegram-bot-for-notifications))
 2. Add `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` to your `.env` file
 3. Notifications are fire-and-forget -- Telegram failures will not crash the trading system
-4. **Interactive status**: Send "status" to the bot to get a detailed status update including portfolio value, cash, open positions, P&L, and current phase with AI analysis progress. The response always refreshes from the database first so you see the latest data, not a stale cache
+4. **Interactive status**: Send "status" to the bot to get a detailed status update. The response makes a fresh API call to IBKR and includes: account summary, P&L breakdown (unrealized/realized/total), today's trade stats (W/L), open positions with live prices and current market value, open orders with status, and current phase
 
 ---
 
@@ -785,16 +788,16 @@ pytest tests/ --cov=core --cov=backtest --cov=notifications
 | `conftest.py` | Shared fixtures: `make_signal()`, `make_position()` factories |
 | `test_models.py` | Data class construction, properties, P&L calculations |
 | `test_connection.py` | IBKR connection, reconnection, contract creation |
-| `test_data.py` | Historical data fetching, caching, news API |
+| `test_data.py` | Historical data fetching, caching (including mutation safety), news API |
 | `test_portfolio.py` | Database CRUD operations, position lifecycle |
 | `test_universe.py` | Universe building, financial sector filtering, caching |
 | `test_screener.py` | Technical indicator calculations, scoring, signal generation |
 | `test_analyst.py` | LLM integration, response validation (including `trade_type`), cost tracking |
-| `test_risk.py` | All 13 risk checks, cumulative risk, sector concentration, circuit breaker, volatility scaling |
+| `test_risk.py` | All 14 risk checks, cumulative risk, sector concentration, circuit breaker, analyst consensus, volatility scaling, exit signal bypass, empty sector safety net |
 | `test_executor.py` | Fill handling, exit handlers, bracket deduplication, day trade close with bracket cancellation, IBKR position import |
 | `test_scheduler.py` | Streaming pipeline, fill handler ordering, exit tracking |
 | `test_telegram.py` | Status commands, portfolio display, risk notifications |
-| `test_backtest.py` | Backtest engine, MTM equity curve, realistic gap fills, short positions, look-ahead bias checks |
+| `test_backtest.py` | Backtest engine, MTM equity curve, realistic gap fills, short positions, look-ahead bias checks, anti-momentum current_price passthrough, simultaneous TP/SL resolution |
 | `test_stale_orders.py` | Stale order detection, re-screening, cancellation |
 | `test_settings.py` | Configuration validation at startup |
 
@@ -905,6 +908,8 @@ This system is designed with multiple layers of safety:
 14. **News efficiency** -- Stock-specific news is fetched from yfinance first (free, no rate limits), falling back to Tavily only when yfinance returns nothing. Successful news is cached for 1 hour; failed fetches use a 60-second cache so retries happen sooner. This conserves Tavily API quota for macro/political headlines where it has no free alternative.
 
 15. **Macro/political awareness** -- The AI analyst evaluates broad market political, regulatory, and macroeconomic conditions (elections, trade wars, sanctions, Fed policy) as part of its 7-point checklist. Macro headlines are fetched once per scan cycle via Tavily and shared across all candidates.
+
+16. **Analyst consensus gate** -- Before buying, the bot fetches analyst consensus recommendations from yfinance. If the majority of analysts rate the stock as "sell" or "strong sell", the BUY signal is blocked. Stocks rated "buy", "strong buy", or "hold" pass through. If no analyst data is available (small-cap, newly listed), the buy is still allowed. Data is cached for 24 hours. Controlled by `CHECK_ANALYST_CONSENSUS` setting.
 
 ---
 

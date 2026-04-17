@@ -28,9 +28,13 @@ def _cache_get(key: str) -> Optional[object]:
         if key in _cache:
             expiry, value = _cache[key]
             if time.time() < expiry:
-                # Return a copy for DataFrames to prevent caller mutation
-                # from corrupting cached data
+                # Return copies to prevent caller mutation from corrupting
+                # cached data shared across multiple callers
                 if isinstance(value, pd.DataFrame):
+                    return value.copy()
+                if isinstance(value, dict):
+                    return value.copy()
+                if isinstance(value, list):
                     return value.copy()
                 return value
             del _cache[key]
@@ -352,3 +356,52 @@ def get_macro_news(max_results: int = 5) -> list[str]:
     headlines: list[str] = []
     _cache_set(cache_key, headlines, ttl=_NEWS_FAILURE_TTL)
     return headlines
+
+
+# ---------------------------------------------------------------------------
+# Analyst Recommendations (yfinance)
+# ---------------------------------------------------------------------------
+
+_ANALYST_TTL = 86400  # 24 hours — analyst ratings change infrequently
+
+
+def get_analyst_recommendation(ticker: str) -> dict | None:
+    """Fetch analyst consensus recommendation via yfinance.
+
+    Returns dict with keys:
+        consensus: "strong_buy" | "buy" | "hold" | "sell" | "strong_sell" | None
+        details: {strong_buy, buy, hold, sell, strong_sell} counts
+
+    Returns None if no data is available or on error.
+    """
+    cache_key = f"analyst:{ticker}"
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
+
+    try:
+        summary = yf.Ticker(ticker).recommendations_summary
+        if summary is None or summary.empty:
+            return None
+
+        row = summary.iloc[0]
+        counts = {
+            "strong_buy": int(row.get("strongBuy", 0)),
+            "buy": int(row.get("buy", 0)),
+            "hold": int(row.get("hold", 0)),
+            "sell": int(row.get("sell", 0)),
+            "strong_sell": int(row.get("strongSell", 0)),
+        }
+
+        # Consensus = rating with the most analysts
+        consensus_key = max(counts, key=counts.get)
+        result = {"consensus": consensus_key, "details": counts}
+        _cache_set(cache_key, result, ttl=_ANALYST_TTL)
+        logger.info(
+            "Analyst recommendation for %s: %s (%s)",
+            ticker, consensus_key, counts,
+        )
+        return result
+    except Exception as e:
+        logger.warning("Failed to fetch analyst recommendation for %s: %s", ticker, e)
+        return None

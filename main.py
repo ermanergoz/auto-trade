@@ -184,6 +184,27 @@ def run_watchdog_mode(args: argparse.Namespace, markets: list[str]) -> None:
         retryDelay=10,
     )
 
+    def _reconcile_and_reattach(_ib):
+        """Sync DB with IBKR and reattach exit handlers."""
+        from core.portfolio import reconcile_positions, get_open_positions, get_daily_pnl
+        from core.executor import reattach_exit_handlers, import_ibkr_positions
+        ibkr_positions = [
+            {"ticker": p.contract.symbol, "quantity": int(p.position)}
+            for p in _ib.positions()
+        ]
+        recon = reconcile_positions(ibkr_positions, auto_fix=True)
+        if recon["auto_closed"]:
+            logger.warning("Auto-closed orphaned positions: %s", recon["auto_closed"])
+        if recon["orphaned_ibkr"]:
+            import_ibkr_positions(_ib, recon["orphaned_ibkr"])
+        if recon["in_sync"] and not recon["auto_closed"]:
+            logger.info("Position reconciliation OK: %d in sync", recon["db_count"])
+        reattach_exit_handlers(_ib)
+        return recon
+
+    # The on_connected callback MUST return quickly so Watchdog.runAsync can
+    # proceed to register its disconnect/timeout handlers.  The scheduler
+    # runs in the main thread after the first connection.
     first_connect = [True]
 
     def on_connected(watchdog: Watchdog):
@@ -195,34 +216,16 @@ def run_watchdog_mode(args: argparse.Namespace, markets: list[str]) -> None:
             logger.info("Watchdog connected to IBKR")
             display_account_summary(summary)
 
-            # Sync DB with IBKR — close orphaned DB positions, import orphaned IBKR positions
-            from core.portfolio import reconcile_positions, get_open_positions, get_daily_pnl
-            from core.executor import reattach_exit_handlers, import_ibkr_positions
-            ibkr_positions = [
-                {"ticker": p.contract.symbol, "quantity": int(p.position)}
-                for p in _ib.positions()
-            ]
-            recon = reconcile_positions(ibkr_positions, auto_fix=True)
+            recon = _reconcile_and_reattach(_ib)
             if recon["auto_closed"]:
                 console.print(
                     f"[yellow]Auto-closed orphaned DB positions: {recon['auto_closed']} "
                     f"(filled at IBKR while bot was offline)[/yellow]"
                 )
-            if recon["orphaned_ibkr"]:
-                imported = import_ibkr_positions(_ib, recon["orphaned_ibkr"])
-                if imported:
-                    console.print(
-                        f"[green]Imported IBKR positions into DB: {imported}[/green]"
-                    )
-            if recon["in_sync"] and not recon["auto_closed"]:
-                logger.info("Position reconciliation OK: %d in sync", recon["db_count"])
 
-            # Reattach exit handlers for existing bracket orders
-            reattached = reattach_exit_handlers(_ib)
-            if reattached:
-                console.print(f"[green]Reattached {reattached} exit handler(s) for existing orders[/green]")
-
-            from notifications.telegram import notify_startup, start_listener, update_status, update_portfolio_data
+            from core.portfolio import get_open_positions, get_daily_pnl
+            from notifications.telegram import notify_startup, start_listener, update_status, update_portfolio_data, set_ib_instance
+            set_ib_instance(_ib)
             notify_startup(args.mode, summary)
             start_listener()
             update_status("startup_complete")
@@ -232,28 +235,13 @@ def run_watchdog_mode(args: argparse.Namespace, markets: list[str]) -> None:
             now = datetime.now(tz)
             console.print(f"\nLocal time ({TIMEZONE}): {now.strftime('%Y-%m-%d %H:%M:%S')}")
             console.print(f"Mode: [bold]{args.mode}[/bold] | Markets: [bold]{', '.join(markets)}[/bold]")
-
-            console.print("\n[cyan]Starting scheduler...[/cyan]")
-            from core.scheduler import start_scheduler
-            start_scheduler(_ib, markets, mode=args.mode, force=args.force, reconnect=False)
         else:
             logger.info("Watchdog reconnected to IBKR after gateway restart")
-            # Re-reconcile on reconnect — fills may have occurred during disconnect
-            from core.portfolio import reconcile_positions, get_open_positions, get_daily_pnl
-            from core.executor import reattach_exit_handlers, import_ibkr_positions
-            ibkr_positions = [
-                {"ticker": p.contract.symbol, "quantity": int(p.position)}
-                for p in _ib.positions()
-            ]
-            recon = reconcile_positions(ibkr_positions, auto_fix=True)
-            if recon["auto_closed"]:
-                logger.warning("Auto-closed orphaned positions on reconnect: %s", recon["auto_closed"])
-            if recon["orphaned_ibkr"]:
-                import_ibkr_positions(_ib, recon["orphaned_ibkr"])
+            _reconcile_and_reattach(_ib)
 
-            reattach_exit_handlers(_ib)
-
-            from notifications.telegram import update_status, update_portfolio_data
+            from core.portfolio import get_open_positions, get_daily_pnl
+            from notifications.telegram import update_status, update_portfolio_data, set_ib_instance
+            set_ib_instance(_ib)
             update_status("reconnected", "Gateway restarted — reconnected")
             update_portfolio_data(get_account_summary(_ib), get_open_positions(), get_daily_pnl())
 
@@ -262,9 +250,23 @@ def run_watchdog_mode(args: argparse.Namespace, markets: list[str]) -> None:
     console.print("[cyan]Starting IBC Watchdog — gateway will auto-start and reconnect...[/cyan]")
     watchdog.start()
 
+    # Wait for the first connection — the Watchdog starts the gateway and
+    # connects asynchronously.  We pump the event loop in short intervals
+    # so that the Watchdog's runAsync task can execute.
+    import asyncio
+    from ib_insync.util import run as ib_run
+    while not ib.isConnected():
+        ib_run(asyncio.sleep(1))
+
+    # Now the Watchdog is fully initialized (disconnect/timeout handlers
+    # registered).  Run the scheduler in the main thread.
+    console.print("\n[cyan]Starting scheduler...[/cyan]")
+    from core.scheduler import start_scheduler
     try:
-        IB.run()
+        start_scheduler(ib, markets, mode=args.mode, force=args.force, reconnect=False)
     except KeyboardInterrupt:
+        pass
+    finally:
         console.print("\n[yellow]Shutting down watchdog...[/yellow]")
         watchdog.stop()
 
@@ -356,7 +358,8 @@ def main() -> None:
             console.print(f"[green]Reattached {reattached} exit handler(s) for existing orders[/green]")
 
         # Start Telegram notifications + listener
-        from notifications.telegram import notify_startup, start_listener, update_status, update_portfolio_data
+        from notifications.telegram import notify_startup, start_listener, update_status, update_portfolio_data, set_ib_instance
+        set_ib_instance(ib)
         notify_startup(args.mode, summary)
         start_listener()
         update_status("startup_complete")

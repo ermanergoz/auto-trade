@@ -57,6 +57,13 @@ class SimulatedPortfolio:
 
     @property
     def daily_pnl(self) -> float:
+        """Daily P&L using entry-price valuation (no current prices).
+
+        WARNING: If the equity curve was recorded with MTM prices (via
+        record_equity(current_prices=...)), this compares entry-price-based
+        portfolio_value against MTM equity — an inconsistent comparison.
+        Prefer daily_pnl_mtm(current_prices) in the backtest loop.
+        """
         if not self.equity_curve:
             return 0.0
         return self.portfolio_value - self.equity_curve[-1][1]
@@ -159,24 +166,51 @@ def _check_exits(portfolio: SimulatedPortfolio, day_data: dict[str, pd.Series], 
         open_price = bar["open"]
 
         if pos.quantity > 0:  # Long position
-            # Stop-loss hit
-            if low <= pos.stop_loss:
+            sl_hit = low <= pos.stop_loss
+            tp_hit = high >= pos.take_profit
+
+            if sl_hit and tp_hit:
+                # Both could trigger on the same bar — use open to resolve.
+                # If open gaps past one level, that level triggered at open.
+                if open_price <= pos.stop_loss:
+                    # Gap-down through SL: SL triggered first at open
+                    to_close.append((pos.ticker, open_price, "stop-loss"))
+                elif open_price >= pos.take_profit:
+                    # Gap-up through TP: TP triggered first at TP price
+                    to_close.append((pos.ticker, pos.take_profit, "take-profit"))
+                else:
+                    # Open between SL and TP: indeterminate, assume SL (conservative)
+                    to_close.append((pos.ticker, pos.stop_loss, "stop-loss"))
+            elif sl_hit:
                 # Gap-down: open already below stop → fill at open (first available price)
                 # Intraday: open above stop but low dips below → fill at stop price
                 actual_exit = open_price if open_price <= pos.stop_loss else pos.stop_loss
                 to_close.append((pos.ticker, actual_exit, "stop-loss"))
-            # Take-profit hit — limit order fills at target price
-            elif high >= pos.take_profit:
+            elif tp_hit:
+                # Take-profit hit — limit order fills at target price
                 to_close.append((pos.ticker, pos.take_profit, "take-profit"))
         else:  # Short position
-            # Stop-loss hit
-            if high >= pos.stop_loss:
+            sl_hit = high >= pos.stop_loss
+            tp_hit = low <= pos.take_profit
+
+            if sl_hit and tp_hit:
+                # Both could trigger — use open to resolve
+                if open_price >= pos.stop_loss:
+                    # Gap-up through SL: SL triggered first at open
+                    to_close.append((pos.ticker, open_price, "stop-loss"))
+                elif open_price <= pos.take_profit:
+                    # Gap-down through TP: TP triggered first at TP price
+                    to_close.append((pos.ticker, pos.take_profit, "take-profit"))
+                else:
+                    # Indeterminate: assume SL (conservative)
+                    to_close.append((pos.ticker, pos.stop_loss, "stop-loss"))
+            elif sl_hit:
                 # Gap-up: open already above stop → fill at open
                 # Intraday: open below stop but high rises above → fill at stop price
                 actual_exit = open_price if open_price >= pos.stop_loss else pos.stop_loss
                 to_close.append((pos.ticker, actual_exit, "stop-loss"))
-            # Take-profit hit — limit order fills at target price
-            elif low <= pos.take_profit:
+            elif tp_hit:
+                # Take-profit hit — limit order fills at target price
                 to_close.append((pos.ticker, pos.take_profit, "take-profit"))
 
     for ticker, exit_price, reason in to_close:
@@ -300,6 +334,10 @@ def run_backtest(config: BacktestConfig) -> SimulatedPortfolio:
                 exchange = "SMART"
                 stock_data[ticker] = (exchange, hist)
 
+        # Build current prices for MTM from today's bars (available regardless
+        # of whether the screener finds candidates)
+        current_prices = {t: bar["close"] for t, bar in day_data.items()}
+
         # Step 3: Run screener (with optional indicator weights)
         candidates = screen_stocks(
             stock_data, min_score=config.min_screener_score,
@@ -307,7 +345,7 @@ def run_backtest(config: BacktestConfig) -> SimulatedPortfolio:
         )
 
         if not candidates:
-            portfolio.record_equity(current_date)
+            portfolio.record_equity(current_date, current_prices=current_prices)
             continue
 
         # Step 3b: Calculate realized volatility for position scaling
@@ -325,26 +363,26 @@ def run_backtest(config: BacktestConfig) -> SimulatedPortfolio:
 
         # Step 4: Risk check and execute
         # Use mark-to-market prices for accurate portfolio value and daily PnL
-        current_prices = {t: bar["close"] for t, bar in day_data.items()}
         mtm_value = portfolio.portfolio_value_mtm(current_prices)
         mtm_daily_pnl = portfolio.daily_pnl_mtm(current_prices)
         for signal in candidates:
-            result = evaluate(
-                signal,
-                portfolio.positions,
-                mtm_value,
-                mtm_daily_pnl,
-                volatility=market_volatility,
-            )
-            if not result.approved:
-                continue
-
             # Fill at today's open price (realistic: signal from yesterday's close,
             # execution at today's open)
             if signal.ticker in day_data:
                 fill_price = day_data[signal.ticker]["open"]
             else:
                 fill_price = signal.entry_price
+
+            result = evaluate(
+                signal,
+                portfolio.positions,
+                mtm_value,
+                mtm_daily_pnl,
+                current_price=fill_price,
+                volatility=market_volatility,
+            )
+            if not result.approved:
+                continue
 
             portfolio.open_position(signal, result.position_size, fill_price, current_dt)
 

@@ -49,7 +49,7 @@ def log_trade_to_csv(trade: Trade) -> None:
             "timestamp": trade.exit_time.isoformat(),
             "ticker": trade.ticker,
             "exchange": trade.exchange,
-            "action": "BUY",  # entry action
+            "action": "SELL" if trade.quantity < 0 else "BUY",
             "quantity": trade.quantity,
             "entry_price": f"{trade.entry_price:.2f}",
             "exit_price": f"{trade.exit_price:.2f}",

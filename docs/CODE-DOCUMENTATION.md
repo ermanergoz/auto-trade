@@ -42,7 +42,7 @@ Think of it like a 3-person trading desk, automated:
 
 2. **The AI Analyst** — A local AI model (Qwen 2.5 7B running on Ollama) that takes those 15 candidates and does deep analysis. It looks at price trends, momentum, volume, news headlines, macro/political context, and a strict 7-point checklist. It's the senior analyst who says "of those 15, I'd actually buy these 3."
 
-3. **The Risk Manager** — A paranoid rule-checker that gates every trade with 12 different safety checks. Position too big? Rejected. Already lost too much today? Rejected. Chasing a stock that already moved 5%? Rejected. Three losses in a row? Circuit breaker pauses everything. It's the compliance officer who makes sure we never blow up.
+3. **The Risk Manager** — A paranoid rule-checker that gates every trade with 14 different safety checks (10 core + 4 discipline checks for new entries only). Position too big? Rejected. Already lost too much today? Rejected. Chasing a stock that already moved 5%? Rejected. Three losses in a row? Circuit breaker pauses everything. Exit signals skip discipline checks so positions can always be closed. It's the compliance officer who makes sure we never blow up.
 
 Only after all three agree does an order actually get placed.
 
@@ -315,6 +315,8 @@ This module fetches prices and news. It has two data sources and caching to avoi
 **`get_news(ticker, market, max_results)`** — Fetches recent news headlines for AI context. Tries yfinance first (free, no rate limits); if yfinance returns nothing, falls back to Tavily API. This conserves Tavily quota for macro/political headlines.
 
 **`get_macro_news(max_results)`** — Fetches broad market political/macro headlines via Tavily (no yfinance equivalent). Called once per scan cycle and shared across all candidates.
+
+**`get_analyst_recommendation(ticker)`** — Fetches analyst consensus recommendation via yfinance's `recommendations_summary`. Returns a dict with `consensus` ("strong_buy", "buy", "hold", "sell", "strong_sell") and `details` (raw analyst counts). Cached for 24 hours. Returns None if no data available or on error. Used by the risk manager to block BUY signals when analysts recommend selling.
 
 ### Realtime Subscriptions
 
@@ -730,6 +732,24 @@ Rule: If the last 3 consecutive closed trades (within a 60-minute window) are al
 
 Why: The daily loss limit is reactive — it triggers after you've already bled money. The circuit breaker is proactive: 3 rapid losses in a row usually signals something systemic (market regime change, stale data feed, broken model). Better to pause and review than keep firing. Think of it as a smoke detector vs. a fire extinguisher.
 
+#### 13. Analyst Consensus — `check_analyst_consensus()`
+"Do Wall Street analysts recommend selling this stock?"
+
+Rule: Before buying, fetch the analyst consensus recommendation from yfinance. If the majority of analysts rate the stock as "sell" or "strong sell", block the BUY signal. If the consensus is "buy", "strong buy", or "hold" — proceed normally. If no analyst data is available (small-cap, newly listed), the buy is still allowed.
+
+Why: The bot once bought a stock that was at its all-time high while IBKR's analyst consensus showed "sell". Even though it turned a profit, it was unnecessarily risky. This check acts as a sanity filter — if professional analysts are bearish, the bot shouldn't be buying. The data comes from yfinance (free, no IBKR subscription needed) and is cached for 24 hours since analyst ratings change infrequently. Controlled by `CHECK_ANALYST_CONSENSUS` setting (default: True).
+
+### Exit Signal Bypass
+
+The `evaluate()` function detects whether a signal is an **exit** (closing an existing position) rather than a new entry. When a SELL signal targets a held long position, or a BUY signal targets a held short position, the following discipline checks are **skipped**:
+
+- Anti-Momentum (`check_anti_momentum`)
+- Trend Confirmation (`check_trend_confirmation`)
+- Risk/Reward Ratio (`check_risk_reward`)
+- Analyst Consensus (`check_analyst_consensus`)
+
+Why: These checks gate on market conditions and only make sense for deciding whether to **enter** a new position. Applying them to exits creates a dangerous trap — if the market moves against you, the very conditions that make you want to exit (price dropped, trend reversed) are the same conditions these checks reject. Without this bypass, a losing position could never be closed because the anti-momentum check would say "price already dropped too far" and the trend check would say "trend is down, can't sell." Core safety checks (position size, daily loss, stop-loss, duplicates, etc.) still apply to all signals.
+
 ### Position Sizing
 
 If all checks pass, the risk manager calculates HOW MANY shares to buy:
@@ -802,7 +822,7 @@ This is **atomic** — all three orders are placed as a unit. You never end up w
 
 **`handle_fill(signal, quantity, fill_price)`** — Records a filled order in the SQLite database. Returns `None` if the fill quantity is zero or negative, preventing phantom positions from being recorded. IBKR always reports filled quantity as a positive integer regardless of trade direction. For short entries (SELL side), the stored quantity is negated so that P&L math `(exit − entry) × qty`, position reconciliation, and close-side selection all work correctly without special-casing shorts.
 
-**`setup_fill_handler(ib, signal, quantity, on_fill)`** — Attaches an async callback to handle entry order fills. Only processes parent entry orders (`parentId == 0`) matching the signal's ticker — child orders (take-profit, stop-loss) are handled by `setup_exit_handler` instead. Uses a `fired` flag to ensure each handler instance fires at most once, preventing duplicate position recording when multiple signals for the same ticker are active. When the parent order status changes to "Filled", it records the position in the database, calls the optional `on_fill` callback, and deregisters itself from `ib.orderStatusEvent` to prevent handler accumulation across scan cycles. The post-fill logic (handle_fill, remove_pending_order, callback, unsubscribe) is wrapped in try/finally to ensure the event handler is always cleaned up even if a callback raises an exception. Also logs warnings for partial fills (when filled_qty < requested quantity). The scheduler attaches this handler BEFORE placing the order to avoid a race condition where fast fills fire before the handler is registered.
+**`setup_fill_handler(ib, signal, quantity, on_fill)`** — Attaches an async callback to handle entry order fills. Only processes parent entry orders (`parentId == 0`) matching the signal's ticker — child orders (take-profit, stop-loss) are handled by `setup_exit_handler` instead. Uses a `fired` flag to ensure each handler instance fires at most once, preventing duplicate position recording when multiple signals for the same ticker are active. When the parent order status changes to "Filled", it records the position in the database, calls the optional `on_fill` callback, and deregisters itself from `ib.orderStatusEvent` to prevent handler accumulation across scan cycles. The post-fill logic (handle_fill, remove_pending_order, callback, unsubscribe) is wrapped in try/finally to ensure the event handler is always cleaned up even if a callback raises an exception. Also logs warnings for partial fills (when filled_qty < requested quantity). The scheduler attaches fill and exit handlers BEFORE the rejection check sleep (not after) to close a race window where fast fills could fire before handlers are registered. Handlers only act on "Filled" status, so they are harmless no-ops for rejected orders.
 
 **`setup_exit_handler(ib, signal, on_exit)`** — Attaches a callback to handle exit order fills (take-profit and stop-loss). When a child order fills, it closes the position in the database via `portfolio.close_position()`, which also writes to the CSV trade journal. Logs a warning if the exit fill cannot be matched to a database position (e.g., position already closed or missing). Warns when `parent_order_id` is missing on the exit trade, as this risks cross-bracket interference (matching the wrong bracket's exit to a position). Calls the optional `on_exit` callback for Telegram notifications. Uses try/finally to ensure the event handler is always deregistered even if callback errors occur.
 
@@ -1062,15 +1082,17 @@ Sends alerts to your phone via Telegram. You create a Telegram bot (using @BotFa
 The system runs a background listener thread that polls for incoming Telegram messages. When you send **"status"** (or "/status") to the bot, it replies with:
 
 - Current phase (fetching data, AI analyzing with progress e.g. "3/90", waiting, etc.)
-- Mode (paper/live)
-- Account summary (portfolio value, cash available, invested amount, unrealized P&L)
-- Daily realized P&L
-- Open positions (ticker, quantity, entry price)
+- Mode (paper/live — derived from IBKR port, not CLI argument)
+- Account summary (portfolio value, cash available, invested amount)
+- P&L breakdown: unrealized, realized (today), and total daily P&L
+- Trade stats for the day (total trades, winners, losers)
+- Open positions with live IBKR prices, current market value, and P&L percentage
+- Open orders from IBKR (action, quantity, order type, status)
 - Last scan summary
 
 This runs on a daemon thread so it doesn't interfere with trading. The polling uses Telegram's long-polling with a 10-second timeout, so responses come within seconds.
 
-The status data is served from an in-memory cache (`_system_status`) updated at scan cycle start and on position changes. `refresh_positions_cache()` re-reads the DB and updates the cache immediately — called by exit handlers after stop-loss/take-profit fills so `/status` reflects reality without waiting for the next scan cycle.
+The status data is served from an in-memory cache (`_system_status`) updated at scan cycle start and on position changes. When a user sends `/status`, `refresh_positions_cache()` makes a fresh asynchronous call to IBKR via the stored IB connection reference (`_ib_ref`, set at startup by `set_ib_instance()`) to fetch live account values (NetLiquidation, cash, unrealized P&L), then re-reads positions from the DB. This ensures the response always reflects the current broker state, not stale scan-cycle data. If the IBKR connection is unavailable, it falls back to the last cached account values gracefully. The trading mode shown in status is derived from the IBKR port (`is_paper_mode()`) rather than the CLI argument, so it always reflects the actual connection type.
 
 ### Design
 
@@ -1104,10 +1126,15 @@ Day-by-day replay:
 For each trading day in the date range:
   1. CHECK EXITS — Do any open positions hit their stop-loss or take-profit?
      Look at today's open, high, and low:
-       - If high >= take_profit → close at take_profit (win!)
-       - If low <= stop_loss → close at stop_loss, using realistic fill:
+       - If BOTH SL and TP could trigger on the same bar (wide-range day),
+         use the open price to resolve which triggered first:
+         * Open gaps past SL → SL triggered first (fill at open)
+         * Open gaps past TP → TP triggered first (fill at TP)
+         * Open between SL and TP → assume SL (conservative)
+       - If only SL hit:
          * Gap scenario (open already past stop) → fill at open price
          * Intraday scenario (open above stop, low dips below) → fill at stop price
+       - If only TP hit → close at take_profit
 
   2. BUILD DATA — Gather all price history UP TO today (not including future!)
      This is critical: NO LOOK-AHEAD BIAS.
@@ -1115,9 +1142,12 @@ For each trading day in the date range:
 
   3. SCREEN — Run the same screener with same settings
 
-  4. RISK CHECK — Run the same risk manager
+  4. RISK CHECK — Run the same risk manager with today's open price as
+     current_price for anti-momentum checks (prevents bypass where
+     entry_price == current_price would always show 0% move)
 
-  5. SIMULATE FILL — "Buy" at today's close price + slippage
+  5. SIMULATE FILL — "Buy" at today's open price + slippage
+     (realistic: signal from yesterday's close, execution at today's open)
 
   6. RECORD EQUITY — Write down portfolio value at end of day (mark-to-market
      using current closing prices, not entry prices)

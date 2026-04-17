@@ -6,7 +6,7 @@ import threading
 from datetime import datetime
 from typing import Optional
 
-from config.settings import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, TIMEZONE
+from config.settings import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, TIMEZONE, is_paper_mode
 from core.models import Trade, DailySummary, Signal
 
 logger = logging.getLogger(__name__)
@@ -23,6 +23,9 @@ _system_status = {
     "positions": None,
     "daily_pnl": None,
 }
+
+# IB connection reference for live account queries
+_ib_ref = None
 
 
 def update_status(phase: str, detail: str = "") -> None:
@@ -90,17 +93,38 @@ def update_portfolio_data(account: dict, positions: list, daily_pnl: float) -> N
         _system_status["daily_pnl"] = daily_pnl
 
 
+def set_ib_instance(ib) -> None:
+    """Store the IB connection reference for live account queries."""
+    global _ib_ref
+    _ib_ref = ib
+
+
 def refresh_positions_cache() -> None:
-    """Re-read positions from DB and update the cache.
+    """Re-read positions and account data, fetching fresh values from IBKR.
 
     Call this after a position is opened/closed outside the scan cycle
     (e.g. async stop-loss fill) so /status reflects reality immediately.
     """
     from core.portfolio import get_open_positions, get_daily_pnl
+
     positions = get_open_positions()
+
+    # Fetch fresh account data from IBKR if connected
+    account = None
+    if _ib_ref is not None:
+        try:
+            from core.connection import get_account_summary
+            account = get_account_summary(_ib_ref)
+        except Exception as e:
+            logger.debug("Live account refresh failed: %s", e)
+
     with _status_lock:
+        if account is not None:
+            _system_status["account"] = account
         unrealized = (_system_status.get("account") or {}).get("UnrealizedPnL", 0.0)
+
     daily_pnl = get_daily_pnl(unrealized_pnl=unrealized)
+
     with _status_lock:
         _system_status["positions"] = positions
         _system_status["daily_pnl"] = daily_pnl
@@ -160,21 +184,87 @@ def _build_status_response() -> str:
         lines.append(f"Invested: ${invested:,.2f}")
         lines.append(f"Unrealized P&L: ${unrealized:+,.2f}")
 
+    # P&L section
     daily_pnl = status_snapshot.get("daily_pnl")
-    if daily_pnl is not None:
-        lines.append(f"Daily P&L (realized): ${daily_pnl:+,.2f}")
+    unrealized = (account or {}).get("UnrealizedPnL", 0)
+    realized_pnl = (daily_pnl - unrealized) if daily_pnl is not None else None
 
-    # Open positions
+    lines.append("")
+    lines.append("<b>P&L</b>")
+    if unrealized:
+        lines.append(f"Unrealized: ${unrealized:+,.2f}")
+    if realized_pnl is not None:
+        lines.append(f"Realized (today): ${realized_pnl:+,.2f}")
+    if daily_pnl is not None:
+        lines.append(f"Total (today): ${daily_pnl:+,.2f}")
+
+    # Trade stats
+    from core.portfolio import get_trades
+    from datetime import date as _date
+    today = _date.today()
+    today_trades = get_trades(start_date=today, end_date=today)
+    if today_trades:
+        winners = [t for t in today_trades if t.pnl > 0]
+        losers = [t for t in today_trades if t.pnl < 0]
+        lines.append(f"Trades today: {len(today_trades)} (W:{len(winners)} / L:{len(losers)})")
+
+    # Open positions with live prices from IBKR
     positions = status_snapshot.get("positions")
+    live_prices = {}
+    if positions and _ib_ref is not None:
+        try:
+            for ibkr_pos in _ib_ref.positions():
+                live_prices[ibkr_pos.contract.symbol] = ibkr_pos.avgCost  # fallback
+            for pv in _ib_ref.portfolio():
+                live_prices[pv.contract.symbol] = pv.marketPrice
+        except Exception as e:
+            logger.debug("Failed to fetch live prices: %s", e)
+
     if positions:
         lines.append("")
         lines.append(f"<b>Open Positions ({len(positions)})</b>")
         for pos in positions:
-            line = f"  {pos.ticker}: {pos.quantity} @ ${pos.entry_price:.2f}"
-            if pos.current_price is not None:
-                pnl = pos.unrealized_pnl
-                line += f" (now ${pos.current_price:.2f}, P&L ${pnl:+,.2f})"
-            lines.append(line)
+            price = live_prices.get(pos.ticker, pos.current_price)
+            if price is not None:
+                mkt_value = price * pos.quantity
+                pnl = (price - pos.entry_price) * pos.quantity
+                pct = ((price - pos.entry_price) / pos.entry_price * 100) if pos.entry_price else 0.0
+                lines.append(
+                    f"  {pos.ticker}: {pos.quantity} @ ${pos.entry_price:.2f}"
+                    f" | Now ${price:.2f} | Val ${mkt_value:,.2f} | {pct:+.1f}%"
+                )
+            else:
+                lines.append(f"  {pos.ticker}: {pos.quantity} @ ${pos.entry_price:.2f}")
+
+    # Open orders from IBKR
+    if _ib_ref is not None:
+        try:
+            open_trades = _ib_ref.openTrades()
+            orders = []
+            for t in open_trades:
+                o = t.order
+                c = t.contract
+                status = t.orderStatus.status
+                price_str = ""
+                if o.orderType == "LMT" and o.lmtPrice:
+                    price_str = f" ${o.lmtPrice:.2f}"
+                elif o.orderType == "STP" and o.auxPrice:
+                    price_str = f" ${o.auxPrice:.2f}"
+                elif o.orderType == "STP LMT":
+                    parts = []
+                    if o.auxPrice:
+                        parts.append(f"stop ${o.auxPrice:.2f}")
+                    if o.lmtPrice:
+                        parts.append(f"lmt ${o.lmtPrice:.2f}")
+                    if parts:
+                        price_str = f" {', '.join(parts)}"
+                orders.append(f"  {c.symbol}: {o.action} {o.totalQuantity} {o.orderType}{price_str} — {status}")
+            if orders:
+                lines.append("")
+                lines.append(f"<b>Open Orders ({len(orders)})</b>")
+                lines.extend(orders)
+        except Exception as e:
+            logger.debug("Failed to fetch open orders: %s", e)
 
     # Last scan summary
     last = status_snapshot.get("last_summary")
@@ -261,13 +351,14 @@ def send_message(text: str) -> bool:
 
 def notify_startup(mode: str, account_summary: dict) -> bool:
     """Send startup notification with account info."""
+    resolved_mode = "paper" if is_paper_mode() else "live"
     with _status_lock:
-        _system_status["mode"] = mode
+        _system_status["mode"] = resolved_mode
     nlv = account_summary.get("NetLiquidation", 0)
     cash = account_summary.get("TotalCashValue", 0)
     text = (
         f"<b>System Started</b>\n\n"
-        f"Mode: {mode}\n"
+        f"Mode: {resolved_mode}\n"
         f"Portfolio: ${nlv:,.2f}\n"
         f"Cash: ${cash:,.2f}"
     )

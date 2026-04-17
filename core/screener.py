@@ -321,9 +321,10 @@ ALL_CHECKS = [
 ]
 
 # Canonical indicator names used by each check for weight lookups.
-# support_resistance can emit either "SUPPORT" or "RESISTANCE" — we include
-# the max of the two weights when normalizing so the total stays stable.
-_INDICATOR_NAMES = ["RSI", "MACD", "MA_CROSSOVER", "VOLUME_SPIKE", "BOLLINGER", "SUPPORT"]
+# support_resistance can emit either "SUPPORT" or "RESISTANCE" — since they
+# are mutually exclusive (one check, one signal), use the max of the two
+# weights when normalizing so the total stays stable regardless of which fires.
+_INDICATOR_NAMES = ["RSI", "MACD", "MA_CROSSOVER", "VOLUME_SPIKE", "BOLLINGER"]
 
 
 def analyze_stock(df: pd.DataFrame) -> list[dict]:
@@ -389,9 +390,11 @@ def score_candidate(
     opposing_score = sell_score if dominant == Action.BUY else buy_score
     net_score = direction_score - opposing_score
     weighted_count = sum(_weight(t) for t in direction_signals)
-    # Total weight = sum of weights for all possible indicators (6 checks)
-    # Use the number of checks scaled by average weight for normalization
+    # Total weight = sum of weights for all possible indicators (6 checks).
+    # For support/resistance (mutually exclusive outputs from one check),
+    # use the max of the two weights so the total is stable.
     total_weight = sum(w.get(name, 1.0) for name in _INDICATOR_NAMES)
+    total_weight += max(w.get("SUPPORT", 1.0), w.get("RESISTANCE", 1.0))
     if total_weight == 0:
         return 0.0, Action.HOLD
     raw_score = (weighted_count / total_weight) * 50 + (max(net_score, 0) / total_weight) * 50

@@ -89,6 +89,7 @@ MIN_RISK_REWARD_RATIO = 1.5     # Minimum reward/risk ratio
 RISK_PER_TRADE_PCT = 5.0        # Risk per trade as % of portfolio (used in sizing + cumulative risk)
 ALLOW_SHORT_SELLING = False     # Block sell signals for stocks not currently held
 VOLATILITY_BASELINE = 0.20      # Baseline annualized volatility (20%) for position scaling
+CHECK_ANALYST_CONSENSUS = True  # Block BUY when analyst consensus is sell/strong sell
 
 # Circuit breaker — pause trading after consecutive losses
 CIRCUIT_BREAKER_LOSSES = 3      # Number of consecutive losses to trip
