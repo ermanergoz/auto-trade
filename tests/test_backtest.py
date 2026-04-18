@@ -533,6 +533,96 @@ class TestBacktestVolatility:
                     "evaluate() should receive volatility when use_volatility_scaling=True"
                 )
 
+    def test_volatility_is_per_candidate_not_first_ticker(self):
+        """Each signal must be sized by its OWN realized volatility.
+
+        Bug: the previous backtest engine computed `market_volatility` once
+        per bar, using the first ticker in all_data, and passed that single
+        value to `evaluate()` for every signal in that bar. A high-vol first
+        ticker (e.g. a meme stock at alphabetical position 0) would shrink
+        position sizes for every signal — including genuinely low-vol blue
+        chips — by the same factor. The correct behaviour is to pass each
+        candidate's own volatility so the scaling reflects the stock being
+        sized, not an unrelated proxy.
+        """
+        from unittest.mock import patch
+        import pandas as pd
+        from backtest.engine import run_backtest, BacktestConfig
+
+        # Two tickers, very different volatility regimes, both designed so
+        # the screener fires on the SAME bar (last row's sharp drop).
+        n = 90
+        low_closes = [100 + i * 0.5 for i in range(70)] + [135 - i * 3 for i in range(20)]
+        high_closes = [50.0 + (i % 2) * 20 for i in range(70)] + \
+                      [70 - i * 3 for i in range(20)]
+        dates = pd.date_range("2024-01-01", periods=n, freq="D")
+
+        def _mk(closes):
+            return pd.DataFrame({
+                "open": [c * 0.99 for c in closes],
+                "high": [c * 1.02 for c in closes],
+                "low": [c * 0.97 for c in closes],
+                "close": closes,
+                "volume": [1_000_000] * 70 + [3_000_000] * 20,
+            }, index=dates)
+
+        low_df = _mk(low_closes); low_df.index.name = "date"
+        high_df = _mk(high_closes); high_df.index.name = "date"
+
+        # Alphabetical order: AHIGH inserted first into all_data. With the
+        # bug, AHIGH's vol is passed for ZLOW's sizing too.
+        def _fake_yf(ticker, *args, **kwargs):
+            return {"AHIGH": high_df, "ZLOW": low_df}[ticker]
+
+        config = BacktestConfig(
+            tickers=["AHIGH", "ZLOW"],
+            use_volatility_scaling=True,
+            min_screener_score=5.0,
+        )
+
+        # Map (bar_date, ticker) -> volatility passed. Per-candidate vol
+        # means AHIGH and ZLOW receive different numbers on the same bar.
+        vols_by_bar_ticker: dict = {}
+        call_order: list[tuple] = []
+
+        def _capture(signal, positions, portfolio_value, daily_pnl, **kwargs):
+            vol = kwargs.get("volatility")
+            call_order.append((signal.ticker, vol))
+            return RiskResult(approved=False, reasons=["test"], position_size=0)
+
+        with patch("backtest.engine.get_historical_data_yfinance", side_effect=_fake_yf), \
+             patch("backtest.engine.evaluate", side_effect=_capture):
+            run_backtest(config)
+
+        # Group consecutive calls by their volatility — with per-candidate
+        # vol, two different tickers receive two different numbers. With
+        # the old "first ticker proxy" bug, every call in the same bar
+        # receives an identical number.
+        assert call_order, "evaluate() never called"
+        # Walk consecutive (AHIGH, ZLOW) pairs — these are the two signals
+        # fired on the SAME bar. With per-candidate vol they must differ
+        # (AHIGH is a high-vol oscillator, ZLOW is a smooth trend). With the
+        # old "first ticker proxy" bug they will be identical.
+        pair_diffs = 0
+        pair_same = 0
+        for i in range(len(call_order) - 1):
+            t1, v1 = call_order[i]
+            t2, v2 = call_order[i + 1]
+            if {t1, t2} == {"AHIGH", "ZLOW"} and v1 is not None and v2 is not None:
+                if v1 != v2:
+                    pair_diffs += 1
+                else:
+                    pair_same += 1
+        assert pair_diffs + pair_same > 0, (
+            "Expected at least one bar where both AHIGH and ZLOW fired"
+        )
+        assert pair_diffs > 0 and pair_same == 0, (
+            f"Same-bar signals for AHIGH vs ZLOW received identical vol "
+            f"({pair_same} same-vol pairs, {pair_diffs} differing). Confirms "
+            f"the backtest is passing a single global vol proxy instead of "
+            f"per-candidate volatility."
+        )
+
 
 # ---------------------------------------------------------------------------
 # AI Value-Add Tracking
