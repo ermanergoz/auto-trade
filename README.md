@@ -520,6 +520,10 @@ Indicator weights can be tuned per-indicator (e.g., `{"RSI": 2.0, "MACD": 0.5}`)
 
 Stop-loss and take-profit levels are calculated using ATR (Average True Range) for volatility-adjusted sizing.
 
+### Extension Guard
+
+Before scoring, the screener drops any ticker whose latest close sits more than `MAX_EXTENSION_OVER_MA20_PCT` (default 20%) above its 20-day simple moving average. This prevents parabolic breakouts (e.g. XNDU ripping $9 → $32 in a handful of sessions) from reaching the AI analyst, where confluent BUY indicators could otherwise override into a late entry. Set the config to `0` or negative to disable. The backtest exposes the same threshold as `BacktestConfig.max_extension_pct`; `scripts/sweep_extension_pct.py` runs a parameter sweep for tuning.
+
 ---
 
 ## AI Analyst
@@ -602,7 +606,7 @@ Position size is calculated using the more conservative of two methods:
 1. **Max position method**: `portfolio_value * MAX_POSITION_SIZE_PCT / entry_price`
 2. **Risk-based method**: `(portfolio_value * RISK_PER_TRADE_PCT%) / (entry_price - stop_loss)` -- limits risk to 5% of portfolio per trade using stop-loss distance (default; was 1% for larger accounts)
 
-When volatility scaling is enabled (`use_volatility_scaling` in backtest config, or passing `volatility` to `evaluate()`), position sizes are scaled inversely to realized market volatility. High volatility → smaller positions, low volatility → base size (never increases beyond base to avoid leverage). The baseline annualized volatility is configurable via `VOLATILITY_BASELINE` (default: 20%).
+When volatility scaling is enabled (`use_volatility_scaling` in backtest config, or passing `volatility` to `evaluate()`), position sizes are scaled inversely to realized volatility. High volatility → smaller positions, low volatility → base size (never increases beyond base to avoid leverage). In the backtest, volatility is computed per candidate from that ticker's own historical close series so each signal is sized by its own vol regime rather than a single market-wide proxy. The baseline annualized volatility is configurable via `VOLATILITY_BASELINE` (default: 20%).
 
 ---
 
@@ -623,6 +627,8 @@ The backtesting engine replays historical data through the **exact same** screen
 4. Closes all remaining positions at the last bar
 5. Calculates comprehensive performance metrics
 
+IBKR and yfinance use different share-class symbol formats (IBKR: `BRK B` with a space; yfinance: `BRK-B` with a hyphen). The data layer translates IBKR symbols at the yfinance boundary so share-class tickers survive the backtest download and the analyst-consensus lookup instead of silently falling out.
+
 ### Backtest Configuration
 
 | Parameter | Default | Description |
@@ -632,7 +638,8 @@ The backtesting engine replays historical data through the **exact same** screen
 | Initial capital | $100,000 | Starting portfolio value |
 | Warmup period | 60 days | Days skipped for indicator stabilization |
 | Indicator weights | Equal (1.0) | Per-indicator weight multipliers for scoring |
-| Volatility scaling | Off | Scale position sizes inversely to realized volatility |
+| Volatility scaling | Off | Scale position sizes inversely to realized volatility (per-candidate) |
+| Max extension | 20% | Drop candidates whose close is more than this % above MA20 (0 disables) |
 
 ### Walk-Forward Validation
 
@@ -924,7 +931,9 @@ This system is designed with multiple layers of safety:
 
 16. **Analyst consensus gate** -- Before buying, the bot fetches analyst consensus recommendations from yfinance. If the majority of analysts rate the stock as "sell" or "strong sell", the BUY signal is blocked. Stocks rated "buy", "strong buy", or "hold" pass through. If no analyst data is available (small-cap, newly listed), the buy is still allowed. Data is cached for 24 hours. Controlled by `CHECK_ANALYST_CONSENSUS` setting.
 
-17. **PDT (Pattern Day Trader) protection** -- IBKR restricts accounts with Liquid Net Worth below `PDT_PROTECTION_THRESHOLD_USD` (default $5,000) to closing-orders-only for 30 days once 2 day trades occur within a rolling 5-business-day window. When the portfolio is at or above the threshold, this check is a pass-through. Below it, the bot counts same-calendar-day round-trip trades in the last 5 business days and blocks any new entry or same-day exit that would push the count to `PDT_MAX_DAY_TRADES_PER_5_DAYS` (default 1 — one less than IBKR's trigger of 2). Exits of positions opened on a prior day are never blocked so swing positions can always be closed.
+17. **PDT (Pattern Day Trader) protection** -- IBKR restricts accounts with Liquid Net Worth below `PDT_PROTECTION_THRESHOLD_USD` (default $5,000) to closing-orders-only for 30 days once 2 day trades occur within a rolling 5-business-day window. When the portfolio is at or above the threshold, this check is a pass-through. Below it, the bot counts same-calendar-day round-trip trades in the last 5 business days and blocks any new entry or same-day exit that would push the count to `PDT_MAX_DAY_TRADES_PER_5_DAYS` (default 1 — one less than IBKR's trigger of 2). Exits of positions opened on a prior day are never blocked so swing positions can always be closed. The scheduler queries the full 7-calendar-day window when fetching trades so the rolling count reflects day trades from earlier in the week, not just today.
+
+18. **Parabolic breakout filter** -- Tickers whose latest close is more than `MAX_EXTENSION_OVER_MA20_PCT` (default 20%) above their 20-day moving average are dropped from the screener candidate pool before scoring. This prevents late entries into already-extended moves where confluent BUY indicators would otherwise convince the AI analyst to approve the trade.
 
 ---
 

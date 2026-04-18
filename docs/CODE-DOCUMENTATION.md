@@ -1514,6 +1514,30 @@ pytest tests/test_risk.py::test_daily_loss_limit -v
 
 **The solution**: Detect which level contains the string `"Close"` and flatten using that level. Version-independent.
 
+### Challenge 16: Parabolic Breakouts Reaching the AI Analyst
+
+**The problem**: On stocks that had just ripped vertically (e.g. XNDU from ~$9 to $32 in a handful of sessions), every BUY-side screener indicator fired at once — RSI overbought flipped into a "momentum confirmation" reading, volume spike, Bollinger breakout, MA crossover. The AI analyst, seeing a wall of confluent signals and positive news headlines, could override an otherwise-SELL ranked candidate into a BUY and hand the order to the executor. The stop-loss inevitably fired on the first pullback.
+
+**The solution**: Added an **extension guard** at the screener level. A ticker whose latest close sits more than `MAX_EXTENSION_OVER_MA20_PCT` (default 20%, tuned by a 6-month parameter sweep) above its 20-day SMA is dropped from the candidate pool *before* scoring and *before* the AI ever sees it. Filtering at the source is the only robust fix — any later layer (AI, risk manager) can be overridden by the same confluent-signal pattern that produced the problem in the first place.
+
+### Challenge 17: PDT Protection Silently Truncated to Today Only
+
+**The problem**: IBKR's Pattern Day Trader rule counts day trades over a rolling 5-business-day window and, on accounts below $25K (here gated by `PDT_PROTECTION_THRESHOLD_USD`, default $5K), locks the account into closing-transactions-only for 30 days once the count crosses 2. `check_pdt_restriction` implements the rolling count — but the scheduler was calling `get_trades(start_date=datetime.now(utc).date())`, which only returns trades with `exit_time` on today's UTC date. The 7-calendar-day filter inside `check_pdt_restriction` then iterated a list that was already narrowed to today, making the protection effectively a single-day counter.
+
+**The solution**: Scheduler now queries `get_trades(start_date=(now - timedelta(days=7)).date())` so the full rolling window is visible to the filter. Day trades from earlier in the week are no longer invisible to the count.
+
+### Challenge 18: Share-Class Tickers Silently Dropped from yfinance
+
+**The problem**: IBKR's symbol format for dual-class stocks uses a space (`BRK B`, `BF B`, `QRED U`). yfinance's canonical form is hyphenated (`BRK-B`). `yf.download("BRK B")`, `yf.Ticker("BRK B").news`, and `yf.Ticker("BRK B").recommendations_summary` all returned empty/None silently. Backtests quietly dropped these tickers from `all_data`; the analyst-consensus filter passed through as if no rating data existed (disabling the filter for the affected ticker); news fetches came back blank.
+
+**The solution**: Added a `_to_yfinance_ticker(ticker)` translation helper in `core/data.py` that replaces spaces with hyphens. Applied at all three yfinance entry points. The IBKR-side symbol remains unchanged — translation happens only at the yfinance boundary.
+
+### Challenge 19: Backtest Volatility Proxy Used One Arbitrary Ticker for All Signals
+
+**The problem**: When `use_volatility_scaling=True`, the backtest engine computed `market_volatility` once per bar by iterating `all_data.items()` and taking the first ticker's realized volatility. Dict iteration order follows insertion order, which follows `config.tickers` order — usually alphabetical. A high-vol first ticker (e.g. AMC at ~120% annualized) produced `vol_scale = 0.20 / 1.20 = 0.167`, and every signal in every bar was sized at 17% of base regardless of the candidate's own vol regime. The strategy looked dramatically weaker than a correctly-sized run.
+
+**The solution**: Compute volatility from the signal's own historical close series (`stock_data[signal.ticker]`, which already uses the look-ahead-safe `date < current_date` slice). Each signal now receives its own vol scaling factor. The screener and risk manager already support per-candidate volatility — the backtest was the only place passing a single global proxy.
+
 ---
 
 ## 22. Architecture Decisions & Why
