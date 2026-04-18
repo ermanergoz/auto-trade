@@ -14,6 +14,7 @@ import pandas as pd
 from config.settings import (
     BACKTEST_SLIPPAGE_PCT, BACKTEST_COMMISSION,
     DEFAULT_STOP_LOSS_PCT, DEFAULT_TAKE_PROFIT_PCT,
+    MAX_EXTENSION_OVER_MA20_PCT,
 )
 from core.models import Signal, Position, Trade, Action, TradeType
 from core.screener import screen_stocks
@@ -259,6 +260,7 @@ class BacktestConfig:
     min_screener_score: float = 15.0
     indicator_weights: dict[str, float] | None = None
     use_volatility_scaling: bool = False
+    max_extension_pct: float = MAX_EXTENSION_OVER_MA20_PCT
 
 
 def run_backtest(config: BacktestConfig) -> SimulatedPortfolio:
@@ -361,6 +363,7 @@ def run_backtest(config: BacktestConfig) -> SimulatedPortfolio:
         candidates = screen_stocks(
             stock_data, min_score=config.min_screener_score,
             indicator_weights=config.indicator_weights,
+            max_extension_pct=config.max_extension_pct,
         )
 
         if not candidates:
