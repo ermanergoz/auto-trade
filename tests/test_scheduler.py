@@ -652,3 +652,63 @@ class TestMarketHoursDST:
         """Saturday is closed regardless of time."""
         # 2026-01-17 is a Saturday
         assert self._run_at("2026-01-17T15:00:00") is False
+
+
+class TestPdtTradeWindow:
+    """The PDT rule counts day trades over a rolling 5-business-day window,
+    which is ~7 calendar days. The scheduler must query the DB with a
+    start_date 7 days back so `check_pdt_restriction` sees the full window.
+
+    Previously the scheduler queried `start_date=today`, which truncated the
+    trade history to today only. With that truncation the 7-day filter inside
+    check_pdt_restriction is a no-op and the rolling count is effectively 0,
+    which defeats the protection entirely and can trigger an IBKR 30-day
+    account lockout on sub-$5k accounts.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _patch_all(self):
+        patchers = {name.split(".")[-1]: patch(name) for name in _PATCHES}
+        self.m = {}
+        for key, p in patchers.items():
+            self.m[key] = p.start()
+        yield
+        for p in patchers.values():
+            p.stop()
+
+    def test_get_trades_queries_seven_days_back_for_pdt_window(self):
+        """scheduler._on_signal must query get_trades with start_date ~7 days ago.
+
+        Using `datetime.now().date()` as the start date truncates the PDT
+        trade history to today only, silently disabling PDT protection.
+        """
+        from datetime import date, timedelta, datetime as _dt, timezone as _tz
+
+        sig = _make_signal(ticker="PDTX")
+        _setup_mocks(self.m, [sig], risk_approved=[True])
+
+        captured = {}
+
+        def fake_get_trades(start_date=None, end_date=None, ticker=None, db_path=None):
+            # record only the first call that passes start_date (the PDT lookup).
+            if start_date is not None and "start_date" not in captured:
+                captured["start_date"] = start_date
+            return []
+
+        from core.scheduler import run_scan_cycle
+        ib = MagicMock()
+        with patch("core.scheduler._fetch_market_data") as mock_fetch, \
+             patch("core.connection.get_account_summary", return_value={"NetLiquidation": 100_000}), \
+             patch("core.scheduler.minutes_to_close", return_value=999), \
+             patch("core.scheduler.get_trades", side_effect=fake_get_trades):
+            mock_fetch.return_value = _make_stock_data(["PDTX"])
+            run_scan_cycle(ib, ["US"])
+
+        assert "start_date" in captured, "scheduler did not call get_trades with start_date"
+        today_utc = _dt.now(_tz.utc).date()
+        delta = (today_utc - captured["start_date"]).days
+        assert delta >= 5, (
+            f"PDT trade window too narrow: scheduler looked back {delta} days, "
+            f"need at least 5 business days (~7 calendar days) to honour IBKR's "
+            f"5-day rolling PDT rule."
+        )

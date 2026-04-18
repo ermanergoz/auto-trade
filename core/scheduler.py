@@ -273,11 +273,15 @@ def run_scan_cycle(
                     "Current price unavailable for %s — anti-momentum check will use entry_price",
                     signal.ticker,
                 )
-            # Use UTC date for trade lookup — exit_time is stored as UTC ISO string,
-            # so SQLite's date() extracts UTC calendar date. Using Istanbul date
-            # would miss trades closed before 03:00 Istanbul time.
-            from datetime import timezone as _utc_tz
-            recent_trades = get_trades(start_date=datetime.now(_utc_tz.utc).date())
+            # PDT rule counts day trades over a rolling 5-business-day window
+            # (~7 calendar days). Query the DB with that full window so
+            # check_pdt_restriction sees the true count, not just today's.
+            # Using `start_date=today` would truncate the history to today,
+            # silently disabling PDT protection on sub-$5k accounts and
+            # risking IBKR's 30-day closing-only lockout.
+            from datetime import timezone as _utc_tz, timedelta as _timedelta
+            _pdt_window_start = (datetime.now(_utc_tz.utc) - _timedelta(days=7)).date()
+            recent_trades = get_trades(start_date=_pdt_window_start)
 
             # Fetch analyst consensus to block buys on sell-rated stocks
             from core.data import get_analyst_recommendation
