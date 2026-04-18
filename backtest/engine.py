@@ -370,19 +370,6 @@ def run_backtest(config: BacktestConfig) -> SimulatedPortfolio:
             portfolio.record_equity(current_date, current_prices=current_prices)
             continue
 
-        # Step 3b: Calculate realized volatility for position scaling
-        market_volatility = None
-        if config.use_volatility_scaling:
-            # Use the first available stock's close series as a market proxy
-            for ticker, df in all_data.items():
-                if isinstance(df.index, pd.DatetimeIndex):
-                    hist = df[df.index.date < current_date]
-                else:
-                    hist = df[df.index < current_date]
-                if len(hist) >= 21:
-                    market_volatility = calculate_realized_volatility(hist["close"])
-                    break
-
         # Step 4: Risk check and execute
         # Use mark-to-market prices for accurate portfolio value and daily PnL
         mtm_value = portfolio.portfolio_value_mtm(current_prices)
@@ -395,13 +382,23 @@ def run_backtest(config: BacktestConfig) -> SimulatedPortfolio:
             else:
                 fill_price = signal.entry_price
 
+            # Per-candidate realized volatility. Previously this used the
+            # first ticker in all_data as a market proxy, which would shrink
+            # every position in the bar by that one ticker's vol regardless
+            # of the candidate being sized.
+            candidate_volatility = None
+            if config.use_volatility_scaling:
+                cand_df = stock_data.get(signal.ticker, (None, None))[1]
+                if cand_df is not None and len(cand_df) >= 21:
+                    candidate_volatility = calculate_realized_volatility(cand_df["close"])
+
             result = evaluate(
                 signal,
                 portfolio.positions,
                 mtm_value,
                 mtm_daily_pnl,
                 current_price=fill_price,
-                volatility=market_volatility,
+                volatility=candidate_volatility,
             )
             if not result.approved:
                 continue
