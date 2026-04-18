@@ -87,6 +87,7 @@ MAX_SECTOR_CONCENTRATION_PCT = 50.0
 
 # Discipline rules
 ANTI_MOMENTUM_PCT = 8.0         # Reject if price moved >8% from signal entry
+MAX_EXTENSION_OVER_MA20_PCT = 20.0  # Drop screener candidates whose close is more than this % above MA20 (anti-chase at the source). Tuned via 6-month sweep — 20% matched unfiltered return with better win rate.
 TREND_CONFIRMATION = True       # Require MA5 > MA10 > MA20 alignment for buys
 MIN_RISK_REWARD_RATIO = 1.5     # Minimum reward/risk ratio
 RISK_PER_TRADE_PCT = 5.0        # Risk per trade as % of portfolio (used in sizing + cumulative risk)

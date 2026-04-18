@@ -20,6 +20,7 @@ from config.settings import (
     SUPPORT_RESISTANCE_PCT,
     DEFAULT_STOP_LOSS_PCT, DEFAULT_TAKE_PROFIT_PCT,
     INDICATOR_WEIGHTS,
+    MAX_EXTENSION_OVER_MA20_PCT,
 )
 from core.models import Signal, Action, TradeType
 
@@ -474,6 +475,34 @@ def _compute_atr(df: pd.DataFrame, period: int = 14) -> Optional[float]:
 
 
 # ---------------------------------------------------------------------------
+# Extension guard — drop tickers that are already too extended above MA20
+# ---------------------------------------------------------------------------
+
+def _is_extended(df: pd.DataFrame, max_pct: float = MAX_EXTENSION_OVER_MA20_PCT) -> bool:
+    """True if the latest close sits more than `max_pct`% above MA20.
+
+    Blocks the "chase the top of a parabolic move" pattern (e.g. XNDU ripping
+    from $9 → $32 in a few days). At that point every BUY indicator fires and
+    the AI analyst can flip an otherwise-SELL candidate into a BUY, so the
+    only robust fix is to drop the ticker from the candidate pool before it
+    reaches the AI layer.
+
+    Returns False when MA20 is unavailable (too-short DataFrame) or non-positive.
+    """
+    if max_pct <= 0 or len(df) < MA_SLOW + 1:
+        return False
+    ma20 = ta.sma(df["close"], length=MA_SLOW)
+    if ma20 is None or ma20.empty:
+        return False
+    ma20_last = ma20.iloc[-1]
+    close_last = df["close"].iloc[-1]
+    if pd.isna(ma20_last) or pd.isna(close_last) or ma20_last <= 0:
+        return False
+    extension_pct = ((close_last - ma20_last) / ma20_last) * 100
+    return extension_pct > max_pct
+
+
+# ---------------------------------------------------------------------------
 # Main screening entry point (pure function)
 # ---------------------------------------------------------------------------
 
@@ -481,6 +510,7 @@ def screen_stocks(
     stock_data: dict[str, tuple[str, pd.DataFrame]],
     min_score: float = 15.0,
     indicator_weights: dict[str, float] | None = None,
+    max_extension_pct: float = MAX_EXTENSION_OVER_MA20_PCT,
 ) -> list[Signal]:
     """Screen multiple stocks and return all candidates above min_score.
 
@@ -492,17 +522,29 @@ def screen_stocks(
         min_score: Minimum screener score to include (0-100).
         indicator_weights: Optional dict of indicator name -> weight.
                            Defaults to INDICATOR_WEIGHTS from settings.
+        max_extension_pct: Drop tickers whose close is more than this % above
+                           MA20. Prevents chasing parabolic breakouts. Set to
+                           0 or negative to disable.
 
     Returns:
         List of Signal objects sorted by score descending.
     """
     candidates: list[tuple[float, Signal]] = []
+    extended_skipped = 0
 
     for ticker, (exchange, df) in stock_data.items():
         if df.empty or len(df) < MA_SLOW + 1:
             continue
 
         try:
+            if _is_extended(df, max_pct=max_extension_pct):
+                extended_skipped += 1
+                logger.debug(
+                    "Skipping %s: close $%.2f is >%.0f%% above MA20 (parabolic extension)",
+                    ticker, df["close"].iloc[-1], max_extension_pct,
+                )
+                continue
+
             triggered = analyze_stock(df)
             if not triggered:
                 continue
@@ -521,7 +563,8 @@ def screen_stocks(
     result = [signal for _, signal in candidates]
 
     logger.info(
-        "Screener found %d candidates (from %d stocks, min_score=%.0f)",
-        len(result), len(stock_data), min_score,
+        "Screener found %d candidates (from %d stocks, min_score=%.0f, "
+        "dropped %d extended)",
+        len(result), len(stock_data), min_score, extended_skipped,
     )
     return result
