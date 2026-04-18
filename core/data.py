@@ -120,6 +120,17 @@ def get_historical_data(
 # YFinance Fallback (backtest mode only)
 # ---------------------------------------------------------------------------
 
+def _to_yfinance_ticker(ticker: str) -> str:
+    """Translate an IBKR-style symbol to the format yfinance expects.
+
+    IBKR uses a space to separate the share class on dual-class stocks
+    (e.g. "BRK B", "BF B"). yfinance expects a hyphen ("BRK-B"). Without
+    this translation yf.download silently returns empty and the ticker
+    vanishes from both backtests and analyst lookups.
+    """
+    return ticker.replace(" ", "-")
+
+
 def get_historical_data_yfinance(
     ticker: str,
     period: str = "6mo",
@@ -138,7 +149,7 @@ def get_historical_data_yfinance(
     if cached is not None:
         return cached
 
-    yf_ticker = ticker
+    yf_ticker = _to_yfinance_ticker(ticker)
 
     try:
         data = yf.download(
@@ -380,7 +391,7 @@ _NEWS_FAILURE_TTL = 60  # Retry sooner when news fetch fails
 def _get_news_yfinance(ticker: str, max_results: int = 5) -> list[str]:
     """Fetch recent news headlines via yfinance (free, no API key)."""
     try:
-        news = yf.Ticker(ticker).news
+        news = yf.Ticker(_to_yfinance_ticker(ticker)).news
         if not news:
             return []
         headlines = []
@@ -503,7 +514,7 @@ def get_analyst_recommendation(ticker: str) -> dict | None:
         return cached
 
     try:
-        summary = yf.Ticker(ticker).recommendations_summary
+        summary = yf.Ticker(_to_yfinance_ticker(ticker)).recommendations_summary
         if summary is None or summary.empty:
             return None
 

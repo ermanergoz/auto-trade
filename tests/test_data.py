@@ -71,6 +71,32 @@ class TestYFinanceFallback:
         assert isinstance(df, pd.DataFrame)
         # Should return empty or minimal data without crashing
 
+    @patch("core.data.yf")
+    def test_dual_class_ticker_normalized_for_yfinance(self, mock_yf):
+        """IBKR emits space-separated share-class tickers ("BRK B") but
+        yfinance requires hyphens ("BRK-B"). Without normalization yf.download
+        returns empty for every share-class ticker and those stocks silently
+        disappear from the backtest universe.
+        """
+        dates = pd.date_range("2024-01-10", periods=3, freq="D")
+        mock_df = pd.DataFrame({
+            "Open": [400.0] * 3, "High": [405.0] * 3,
+            "Low": [395.0] * 3, "Close": [402.0] * 3,
+            "Volume": [500_000] * 3,
+        }, index=dates)
+        mock_df.index.name = "Date"
+        mock_yf.download.return_value = mock_df
+
+        # IBKR-style input with space; yfinance must be called with hyphen.
+        get_historical_data_yfinance("BRK B", period="3d", interval="1d")
+
+        called_ticker = mock_yf.download.call_args[0][0] if mock_yf.download.call_args[0] \
+            else mock_yf.download.call_args[1].get("tickers")
+        assert "-" in called_ticker and " " not in called_ticker, (
+            f"Expected IBKR 'BRK B' to be normalized to 'BRK-B' for yfinance, "
+            f"got {called_ticker!r}"
+        )
+
 
 class TestNews:
     def test_no_api_key_returns_empty(self):
@@ -528,6 +554,22 @@ class TestAnalystRecommendation:
         get_analyst_recommendation("CACHED")
         # yfinance Ticker should only be called once
         assert mock_ticker.call_count == 1
+
+    @patch("yfinance.Ticker")
+    def test_dual_class_ticker_normalized_for_analyst_lookup(self, mock_ticker):
+        """Analyst lookup must also translate IBKR 'BRK B' to yfinance 'BRK-B'.
+        Otherwise check_analyst_consensus silently receives None for every
+        share-class ticker and the filter is effectively disabled.
+        """
+        mock_ticker.return_value.recommendations_summary = pd.DataFrame([{
+            "strongBuy": 20, "buy": 3, "hold": 1, "sell": 0, "strongSell": 0,
+        }])
+        get_analyst_recommendation("BRK B")
+        called_ticker = mock_ticker.call_args[0][0]
+        assert "-" in called_ticker and " " not in called_ticker, (
+            f"Expected analyst lookup to normalize 'BRK B' -> 'BRK-B', "
+            f"got {called_ticker!r}"
+        )
 
 
 # ---------------------------------------------------------------------------
