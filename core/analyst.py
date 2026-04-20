@@ -9,7 +9,13 @@ from typing import Optional
 
 import pandas as pd
 
-from config.settings import AI_MODEL, AI_CONFIDENCE_THRESHOLD, OLLAMA_HOST, MIN_RISK_REWARD_RATIO
+from config.settings import (
+    AI_MODEL,
+    AI_CONFIDENCE_THRESHOLD,
+    ALLOW_SHORT_SELLING,
+    OLLAMA_HOST,
+    MIN_RISK_REWARD_RATIO,
+)
 from core.models import Signal, Action, TradeType
 
 logger = logging.getLogger(__name__)
@@ -59,7 +65,7 @@ ANALYSIS_PROMPT = """You are a disciplined stock trader making real money decisi
 
 ## Response Format
 Return a JSON object with these exact fields:
-- "action": "buy", "sell", or "hold"
+- "action": {actions}
 - "confidence": integer 0-100
 - "entry_price": specific entry price (float)
 - "stop_loss": stop-loss price (float) — place below recent support for buys, above resistance for sells
@@ -72,7 +78,14 @@ Return a JSON object with these exact fields:
 - Never chase: if the stock already ran >5% toward the signal, say "hold"
 - Confidence above 65 only when trend + momentum + volume all align and macro environment is not hostile
 - Be honest about uncertainty — a confident "hold" is better than a shaky "buy"
-- Set stop-loss at a technical level (support/resistance), not an arbitrary percentage"""
+- Set stop-loss at a technical level (support/resistance), not an arbitrary percentage{short_rule}"""
+
+
+_ACTIONS_WITH_SHORTS = '"buy", "sell", or "hold"'
+_ACTIONS_NO_SHORTS = '"buy" or "hold"'
+_SHORT_RULE_DISABLED = (
+    "\n- This system does not short stocks. Never recommend 'sell' — only 'buy' or 'hold'."
+)
 
 
 def _build_prompt(
@@ -116,6 +129,9 @@ def _build_prompt(
     else:
         macro_text = "  No macro/political headlines available"
 
+    actions = _ACTIONS_WITH_SHORTS if ALLOW_SHORT_SELLING else _ACTIONS_NO_SHORTS
+    short_rule = "" if ALLOW_SHORT_SELLING else _SHORT_RULE_DISABLED
+
     return ANALYSIS_PROMPT.format(
         ticker=ticker,
         exchange=exchange,
@@ -123,6 +139,8 @@ def _build_prompt(
         indicators=indicators,
         news=news_text,
         macro_news=macro_text,
+        actions=actions,
+        short_rule=short_rule,
     )
 
 
@@ -200,6 +218,9 @@ def _validate_response(data: dict) -> bool:
 
     if data["action"] not in ("buy", "sell", "hold"):
         logger.warning("LLM response invalid action: %r", data["action"])
+        return False
+    if data["action"] == "sell" and not ALLOW_SHORT_SELLING:
+        logger.warning("LLM returned SELL but shorts disabled — rejecting")
         return False
     if data.get("trade_type") not in ("day", "swing"):
         logger.warning("LLM response invalid trade_type: %r", data.get("trade_type"))

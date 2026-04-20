@@ -137,6 +137,95 @@ class TestValidation:
         assert _validate_response(data) is False
 
 
+class TestShortSellingGate:
+    """The ANALYSIS_PROMPT and validator must gate on ALLOW_SHORT_SELLING.
+
+    When shorts are disabled, the LLM should only be offered 'buy' or 'hold',
+    and any SELL that slips through is rejected without a retry.
+    """
+
+    def _valid_sell(self):
+        """A well-formed sell response (direction-correct for a short)."""
+        return {
+            "action": "sell",
+            "confidence": 80,
+            "entry_price": 100.0,
+            "stop_loss": 105.0,   # above entry for short
+            "take_profit": 90.0,  # below entry for short
+            "trade_type": "day",
+            "reasoning": "Bearish setup",
+        }
+
+    def _valid_buy(self):
+        return {
+            "action": "buy",
+            "confidence": 80,
+            "entry_price": 100.0,
+            "stop_loss": 95.0,
+            "take_profit": 110.0,
+            "trade_type": "day",
+            "reasoning": "Bullish setup",
+        }
+
+    def _valid_hold(self):
+        return {
+            "action": "hold",
+            "confidence": 70,
+            "entry_price": 100.0,
+            "stop_loss": 95.0,
+            "take_profit": 110.0,
+            "trade_type": "day",
+            "reasoning": "Wait",
+        }
+
+    # ---- Prompt gating ----
+
+    @patch("core.analyst.ALLOW_SHORT_SELLING", False)
+    def test_prompt_excludes_sell_when_shorts_disabled(self):
+        df = _make_df()
+        prompt = _build_prompt("AAPL", "SMART", df, {"RSI": 50}, ["news"])
+        # Dropped "sell" from the action list
+        assert '"sell"' not in prompt
+        assert '"buy"' in prompt and '"hold"' in prompt
+        # Discipline rule makes the constraint explicit
+        assert "does not short stocks" in prompt.lower() or "no shorts" in prompt.lower() \
+            or "never recommend 'sell'" in prompt.lower()
+
+    @patch("core.analyst.ALLOW_SHORT_SELLING", True)
+    def test_prompt_includes_sell_when_shorts_enabled(self):
+        df = _make_df()
+        prompt = _build_prompt("AAPL", "SMART", df, {"RSI": 50}, ["news"])
+        assert '"buy"' in prompt
+        assert '"sell"' in prompt
+        assert '"hold"' in prompt
+
+    # ---- Validator gating ----
+
+    @patch("core.analyst.ALLOW_SHORT_SELLING", False)
+    def test_validator_rejects_sell_when_shorts_disabled(self):
+        assert _validate_response(self._valid_sell()) is False
+
+    @patch("core.analyst.ALLOW_SHORT_SELLING", True)
+    def test_validator_accepts_sell_when_shorts_enabled(self):
+        assert _validate_response(self._valid_sell()) is True
+
+    @patch("core.analyst.ALLOW_SHORT_SELLING", False)
+    def test_validator_accepts_buy_when_shorts_disabled(self):
+        assert _validate_response(self._valid_buy()) is True
+
+    @patch("core.analyst.ALLOW_SHORT_SELLING", True)
+    def test_validator_accepts_buy_when_shorts_enabled(self):
+        assert _validate_response(self._valid_buy()) is True
+
+    @patch("core.analyst.ALLOW_SHORT_SELLING", False)
+    def test_validator_accepts_hold_when_shorts_disabled(self):
+        assert _validate_response(self._valid_hold()) is True
+
+    @patch("core.analyst.ALLOW_SHORT_SELLING", True)
+    def test_validator_accepts_hold_when_shorts_enabled(self):
+        assert _validate_response(self._valid_hold()) is True
+
+
 class TestAnalyzeCandidate:
     @patch("core.analyst._call_llm")
     def test_returns_signal_on_high_confidence(self, mock_llm):
@@ -258,6 +347,7 @@ class TestPriceRelationshipValidation:
         }
         assert _validate_response(data) is True
 
+    @patch("core.analyst.ALLOW_SHORT_SELLING", True)
     def test_valid_sell_passes(self):
         data = {
             "action": "sell", "confidence": 80,

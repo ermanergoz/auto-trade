@@ -239,7 +239,7 @@ Why exclude financials? Banks and insurance companies behave very differently fr
 SCAN_INTERVAL_MINUTES = 15         # Run the full pipeline every 15 min
 AI_CONFIDENCE_THRESHOLD = 65       # AI must be 65%+ confident
 AI_MAX_CANDIDATES = 0              # Max stocks sent to AI per cycle (0 = no limit)
-AI_MODEL = "qwen2.5:7b"           # The local AI model
+AI_MODEL = "qwen3:8b"             # The local AI model
 OLLAMA_HOST = "http://localhost:11434"  # Where Ollama runs
 ```
 
@@ -320,7 +320,7 @@ This module fetches prices and news. It has two data sources and caching to avoi
 
 ### News
 
-**`get_news(ticker, market, max_results)`** — Fetches recent news headlines for AI context. Tries Tavily first (richer results); if Tavily is unconfigured, errors (e.g. rate limit), or returns nothing, falls back to yfinance. Logs whichever source won, so you can see fallback behavior in the trader logs.
+**`get_news(ticker, market, max_results)`** — Fetches recent news headlines for AI context. Tries Tavily first (richer results); if Tavily is unconfigured, errors (e.g. rate limit), or returns nothing, falls back to yfinance. Logs whichever source won, so you can see fallback behavior in the trader logs. When Tavily signals plan/rate-limit exhaustion, a module-level `_tavily_exhausted` flag short-circuits subsequent calls for the rest of the process (flag resets on restart). Returns `[]` when both sources fail — the scheduler uses that to **skip the candidate entirely** before the LLM call, since no news = no external signal for the analyst to reason over.
 
 **`get_macro_news(max_results)`** — Fetches broad market political/macro headlines via Tavily (no yfinance equivalent). Called once per scan cycle and shared across all candidates.
 
@@ -663,7 +663,9 @@ Every signal must pass ALL of these. Fail one, the trade is rejected.
 
 Rule: If `ALLOW_SHORT_SELLING` is False (the default), reject any SELL signal where we don't already hold the stock.
 
-Why: Short selling (selling borrowed shares hoping the price drops) carries unlimited downside risk — a stock can rise infinitely. With a 7B local AI model, the risk of a bad short call is too high. This check is configurable via `ALLOW_SHORT_SELLING` in settings for advanced users who understand the risks.
+Why: Short selling (selling borrowed shares hoping the price drops) carries unlimited downside risk — a stock can rise infinitely. With a local AI model, the risk of a bad short call is too high. This check is configurable via `ALLOW_SHORT_SELLING` in settings for advanced users who understand the risks.
+
+Defense-in-depth: the analyst (`core/analyst.py`) also gates on `ALLOW_SHORT_SELLING`. When `False`, the LLM prompt's Response Format offers only `"buy" or "hold"` (dropping `"sell"`) and the Discipline Rules include an explicit "do not short" line; `_validate_response` rejects any SELL that slips through without retry. This prevents the LLM from wasting 200+s of compute on shorts the risk manager would reject anyway.
 
 #### 2. Position Size Check — `check_position_size()`
 "Is this trade too big relative to our portfolio?"

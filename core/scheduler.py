@@ -236,6 +236,9 @@ def run_scan_cycle(
                 continue
 
             news = get_news(ticker, market)
+            if not news:
+                logger.info("Skipping %s: no news from Tavily or yfinance", ticker)
+                continue
             ai_input.append({
                 "ticker": ticker,
                 "exchange": exchange,

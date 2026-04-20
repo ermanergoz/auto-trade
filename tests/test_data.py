@@ -30,6 +30,20 @@ def clean_cache():
     clear_cache()
 
 
+@pytest.fixture(autouse=True)
+def reset_tavily_exhausted_flag():
+    """Reset the Tavily short-circuit flag between tests.
+
+    Some tests hit the real Tavily API (when TAVILY_API_KEY is live in the env);
+    if the plan is exhausted, the flag latches on and leaks into later tests.
+    Always reset both before and after.
+    """
+    import core.data
+    core.data._tavily_exhausted = False
+    yield
+    core.data._tavily_exhausted = False
+
+
 class TestCache:
     def test_set_and_get(self):
         _cache_set("test_key", {"value": 42}, ttl=60)
@@ -178,6 +192,97 @@ class TestNewsPriority:
         headlines = get_news("MSFT")
         mock_yf.assert_called_once()
         assert headlines == ["MSFT earnings strong"]
+
+
+class TestTavilyExhaustion:
+    """After a plan-limit error, Tavily should short-circuit for the rest of the process.
+
+    Rationale: user's Tavily plan is exhausted. Every one of 48 candidates hit
+    the Tavily API and failed, adding latency and noise. Set a process-lifetime
+    flag on first exhaustion error; subsequent calls skip Tavily and go straight
+    to the yfinance fallback. Non-exhaustion errors (transient network) still retry.
+    """
+
+    @pytest.fixture(autouse=True)
+    def reset_tavily_flag(self):
+        import core.data
+        core.data._tavily_exhausted = False
+        yield
+        core.data._tavily_exhausted = False
+
+    @patch("core.data.TAVILY_API_KEY", "fake-key")
+    @patch("core.data._get_news_yfinance")
+    def test_short_circuits_after_plan_exhaustion_error(self, mock_yf):
+        mock_yf.return_value = ["yfinance fallback"]
+        mock_client = MagicMock()
+        mock_client.search.side_effect = Exception(
+            "This request exceeds your plan's set usage limit. Please upgrade."
+        )
+        mock_tavily_module = MagicMock()
+        mock_tavily_module.TavilyClient.return_value = mock_client
+        import sys
+        with patch.dict(sys.modules, {"tavily": mock_tavily_module}):
+            get_news("FIRST")
+            get_news("SECOND")
+
+        assert mock_client.search.call_count == 1, (
+            f"Tavily called {mock_client.search.call_count}x; "
+            "expected 1 (should short-circuit after plan exhaustion)"
+        )
+        # yfinance called for both tickers (fallback path)
+        assert mock_yf.call_count == 2
+
+    @patch("core.data.TAVILY_API_KEY", "fake-key")
+    @patch("core.data._get_news_yfinance")
+    def test_short_circuits_after_rate_limit_error(self, mock_yf):
+        """Rate limit message should also trigger short-circuit."""
+        mock_yf.return_value = ["yf"]
+        mock_client = MagicMock()
+        mock_client.search.side_effect = Exception("429 rate limit exceeded")
+        mock_tavily_module = MagicMock()
+        mock_tavily_module.TavilyClient.return_value = mock_client
+        import sys
+        with patch.dict(sys.modules, {"tavily": mock_tavily_module}):
+            get_news("A")
+            get_news("B")
+
+        assert mock_client.search.call_count == 1
+
+    @patch("core.data.TAVILY_API_KEY", "fake-key")
+    @patch("core.data._get_news_yfinance")
+    def test_does_not_short_circuit_on_transient_error(self, mock_yf):
+        """Non-exhaustion errors (network, timeout) should still retry Tavily next call."""
+        mock_yf.return_value = ["yf"]
+        mock_client = MagicMock()
+        mock_client.search.side_effect = Exception("Connection timeout")
+        mock_tavily_module = MagicMock()
+        mock_tavily_module.TavilyClient.return_value = mock_client
+        import sys
+        with patch.dict(sys.modules, {"tavily": mock_tavily_module}):
+            get_news("A")
+            get_news("B")
+
+        # Both calls should hit Tavily (transient error — retry)
+        assert mock_client.search.call_count == 2
+
+    @patch("core.data.TAVILY_API_KEY", "fake-key")
+    @patch("core.data._get_news_yfinance")
+    def test_flag_is_process_lifetime_not_persistent(self, mock_yf):
+        """Resetting the flag (simulating process restart) re-enables Tavily."""
+        mock_yf.return_value = ["yf"]
+        mock_client = MagicMock()
+        mock_client.search.side_effect = Exception("exceeds your plan")
+        mock_tavily_module = MagicMock()
+        mock_tavily_module.TavilyClient.return_value = mock_client
+        import sys
+        with patch.dict(sys.modules, {"tavily": mock_tavily_module}):
+            get_news("A")
+            # Simulate process restart
+            import core.data
+            core.data._tavily_exhausted = False
+            get_news("B")
+
+        assert mock_client.search.call_count == 2
 
 
 class TestNewsCacheTTL:

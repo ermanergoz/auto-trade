@@ -387,6 +387,17 @@ def clear_realtime_subscriptions(ib: IB) -> None:
 _NEWS_TTL = 3600  # 1 hour — reduces Tavily API usage
 _NEWS_FAILURE_TTL = 60  # Retry sooner when news fetch fails
 
+# Process-lifetime flag: once Tavily signals plan/rate-limit exhaustion,
+# skip it for the rest of the process and go straight to yfinance.
+# Resets on process restart — covers "user upgraded plan and restarted".
+_tavily_exhausted = False
+_TAVILY_EXHAUSTION_MARKERS = (
+    "exceeds your plan",
+    "usage limit",
+    "rate limit",
+    "quota",
+)
+
 
 def _get_news_yfinance(ticker: str, max_results: int = 5) -> list[str]:
     """Fetch recent news headlines via yfinance (free, no API key)."""
@@ -410,8 +421,11 @@ def _get_news_yfinance(ticker: str, max_results: int = 5) -> list[str]:
 def _get_news_tavily(ticker: str, max_results: int = 5) -> Optional[list[str]]:
     """Fetch news via Tavily. Returns None on failure (triggers fallback),
     [] if Tavily is not configured, or a list of headlines on success."""
+    global _tavily_exhausted
     if not TAVILY_API_KEY:
         return []
+    if _tavily_exhausted:
+        return None
     try:
         from tavily import TavilyClient
         client = TavilyClient(api_key=TAVILY_API_KEY)
@@ -419,7 +433,14 @@ def _get_news_tavily(ticker: str, max_results: int = 5) -> Optional[list[str]]:
         response = client.search(query, max_results=max_results, search_depth="basic")
         return [r.get("title", "") for r in response.get("results", []) if r.get("title")]
     except Exception as e:
-        logger.warning("Tavily failed for %s: %s — falling back to yfinance", ticker, e)
+        msg = str(e).lower()
+        if any(marker in msg for marker in _TAVILY_EXHAUSTION_MARKERS):
+            _tavily_exhausted = True
+            logger.warning(
+                "Tavily plan exhausted (%s) — short-circuiting for rest of process", e,
+            )
+        else:
+            logger.warning("Tavily failed for %s: %s — falling back to yfinance", ticker, e)
         return None
 
 

@@ -254,7 +254,7 @@ The AI analyst runs locally via Ollama -- no cloud API keys needed.
 curl -fsSL https://ollama.com/install.sh | sh
 
 # Pull the default model
-ollama pull qwen2.5:7b
+ollama pull qwen3:8b
 ```
 
 Ollama must be running whenever the trading system is active. It starts automatically as a system service after installation.
@@ -315,7 +315,7 @@ IBKR_PORT=7497                    # 7497 = paper trading, 7496 = live
 IBKR_CLIENT_ID=1
 
 # AI Model (Ollama local - no API key needed)
-AI_MODEL=qwen2.5:7b
+AI_MODEL=qwen3:8b
 OLLAMA_HOST=http://localhost:11434
 
 # Telegram Notifications
@@ -362,7 +362,7 @@ All trading parameters are configured in `config/settings.py`. Key settings:
 | `SCAN_INTERVAL_MINUTES` | `15` | Minutes between scan cycles |
 | `AI_CONFIDENCE_THRESHOLD` | `65` | Minimum AI confidence to act (0-100) |
 | `AI_MAX_CANDIDATES` | `0` | Max candidates sent to AI per cycle (0 = unlimited) |
-| `AI_MODEL` | `qwen2.5:7b` | Ollama model for analysis |
+| `AI_MODEL` | `qwen3:8b` | Ollama model for analysis |
 
 #### Risk Settings
 | Parameter | Default | Description |
@@ -535,7 +535,7 @@ The AI analyst performs deep analysis on each screener candidate using a local L
 For each candidate, the analyst gathers:
 - **5-day price action**: Recent OHLCV data showing price movement
 - **Technical indicator values**: All computed indicator values from the screener
-- **News headlines**: Top 5 recent news articles via Tavily API (primary), falling back to yfinance when Tavily errors, is unconfigured, or returns nothing
+- **News headlines**: Top 5 recent news articles via Tavily API (primary), falling back to yfinance when Tavily errors, is unconfigured, or returns nothing. Candidates with zero headlines from both sources are dropped before the LLM call to avoid wasted compute on tickers with no external signal
 - **Macro/political headlines**: Top 5 broad market political, regulatory, and macroeconomic headlines via Tavily (shared across all candidates, fetched once per scan cycle)
 - **Sector context**: Current sector performance
 
@@ -925,7 +925,7 @@ This system is designed with multiple layers of safety:
 
 14. **3-tier sector fallback** -- Stock sector data is resolved through IBKR contract details, then yfinance, then Ollama LLM classification. Only stocks that fail all three are excluded.
 
-14. **News resilience** -- Stock-specific news is fetched from Tavily first (richer results), falling back to yfinance when Tavily errors (e.g. rate limit), is unconfigured, or returns nothing. Each fetch logs which source succeeded so fallback behavior is visible in logs. Successful news is cached for 1 hour; failed fetches use a 60-second cache so retries happen sooner.
+14. **News resilience** -- Stock-specific news is fetched from Tavily first (richer results), falling back to yfinance when Tavily errors (e.g. rate limit), is unconfigured, or returns nothing. Each fetch logs which source succeeded so fallback behavior is visible in logs. Successful news is cached for 1 hour; failed fetches use a 60-second cache so retries happen sooner. When Tavily signals plan/rate-limit exhaustion, a process-lifetime flag short-circuits subsequent calls directly to the yfinance fallback until the process restarts — avoids burning dozens of Tavily requests per cycle once the quota is hit. Candidates with zero headlines from both sources are dropped before the AI analyst call so the LLM only sees tickers with at least one external news signal.
 
 15. **Macro/political awareness** -- The AI analyst evaluates broad market political, regulatory, and macroeconomic conditions (elections, trade wars, sanctions, Fed policy) as part of its 7-point checklist. Macro headlines are fetched once per scan cycle via Tavily and shared across all candidates.
 
@@ -964,7 +964,7 @@ This system is designed with multiple layers of safety:
 
 **"LLM call failed" or connection refused**
 - Make sure Ollama is running: `ollama serve` (or it runs as a system service)
-- Verify the model is downloaded: `ollama list` should show `qwen2.5:7b`
+- Verify the model is downloaded: `ollama list` should show `qwen3:8b`
 - Check `OLLAMA_HOST` in `.env` matches the Ollama address (default: `http://localhost:11434`)
 
 **Slow analysis**

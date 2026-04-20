@@ -268,6 +268,69 @@ class TestStreamingPipeline:
         assert evaluated_signal.indicator_values.get("sector") == "Technology"
 
 
+class TestNewsSkip:
+    """Candidates with zero headlines should be dropped before the LLM call.
+
+    Rationale: Yahoo/yfinance doesn't index news for the micro-caps the
+    screener surfaces (SPAC units, tiny ETFs). When both Tavily and yfinance
+    return empty, the LLM has no external signal — burning 200+s per call
+    is wasted compute. Skip instead.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _patch_all(self):
+        patchers = {name.split(".")[-1]: patch(name) for name in _PATCHES}
+        self.m = {}
+        for key, p in patchers.items():
+            self.m[key] = p.start()
+        yield
+        for p in patchers.values():
+            p.stop()
+
+    def test_candidate_with_empty_news_is_dropped_from_ai_input(self):
+        sig = _make_signal(ticker="NONEWS")
+        _setup_mocks(self.m, [sig])
+        self.m["get_news"].return_value = []
+
+        _run_cycle(self.m)
+
+        self.m["analyze_batch"].assert_called_once()
+        ai_input = self.m["analyze_batch"].call_args[0][0]
+        assert ai_input == [], (
+            f"Expected empty ai_input when get_news returns [], got {ai_input}"
+        )
+
+    def test_candidate_with_headlines_is_kept_in_ai_input(self):
+        sig = _make_signal(ticker="HASNEWS")
+        _setup_mocks(self.m, [sig])
+        self.m["get_news"].return_value = ["headline 1"]
+
+        _run_cycle(self.m)
+
+        self.m["analyze_batch"].assert_called_once()
+        ai_input = self.m["analyze_batch"].call_args[0][0]
+        assert len(ai_input) == 1
+        assert ai_input[0]["ticker"] == "HASNEWS"
+        assert ai_input[0]["news"] == ["headline 1"]
+
+    def test_mixed_news_drops_only_empty_candidates(self):
+        """With two candidates — one with news, one without — only the newsless is dropped."""
+        sig_news = _make_signal(ticker="HAS")
+        sig_nonews = _make_signal(ticker="NONE")
+        _setup_mocks(self.m, [sig_news, sig_nonews])
+
+        # Return news for HAS, empty for NONE
+        def news_by_ticker(ticker, market=None):
+            return ["good headline"] if ticker == "HAS" else []
+        self.m["get_news"].side_effect = news_by_ticker
+
+        _run_cycle(self.m)
+
+        ai_input = self.m["analyze_batch"].call_args[0][0]
+        tickers_in_input = [item["ticker"] for item in ai_input]
+        assert tickers_in_input == ["HAS"]
+
+
 # ---------------------------------------------------------------------------
 # Feature 3: Nightly reconciliation
 # ---------------------------------------------------------------------------
