@@ -1542,6 +1542,72 @@ pytest tests/test_risk.py::test_daily_loss_limit -v
 
 ---
 
+### Challenge 20: Daily-Loss Limit Denominator Drifted with MTM
+
+**The problem**: `check_daily_loss_limit` computed its dollar cap as `portfolio_value * limit_pct`. That denominator was the current MTM equity — which shrinks as losses accumulate within the session, making the cap itself shrink. After a 5% drawdown the 2% limit effectively enforces ~1.9%. Worse, the cap becomes path-dependent — trading during a choppy day hits a different threshold than trading during a straight-down day with identical terminal P&L.
+
+**The solution**: Snapshot start-of-day NetLiquidation on each ET-date rollover in `core/state.py`, pass `start_of_day_equity` to `check_daily_loss_limit`, and compute the cap off that stable baseline. In the backtest, yesterday's end-of-day equity from `equity_curve[-1][1]` serves the same purpose.
+
+We also rewired how `daily_pnl` itself is computed. The old code summed today's realized P&L plus IBKR's `UnrealizedPnL`, but `UnrealizedPnL` is cumulative since entry — a swing position opened a week ago would inflate today's reported P&L by the whole week's gain. With a start-of-day snapshot in hand, today's P&L is just `current NetLiquidation − start_of_day_equity`, which is self-consistent with the cap denominator.
+
+---
+
+### Challenge 21: Stale Open-Positions View Between Rapid AI Approvals
+
+**The problem**: The streaming AI pipeline calls `_on_signal` for each approved candidate. The callback placed the order, slept 0.5 s, and refreshed `open_positions` from the DB. But the bracket entry is a limit order — it almost never fills within 500 ms, so the DB still showed the PRIOR set of positions when the NEXT AI approval arrived. Two rapid signals therefore evaluated `max_positions`, `check_sector_concentration`, and `check_cumulative_risk` against the same stale snapshot, and both could pass a gate that should have tripped on the second.
+
+**The solution**: `run_scan_cycle` now maintains a `pending_this_cycle: list[Position]` of virtual positions for brackets placed this cycle but not yet filled. Each subsequent `_on_signal` invocation merges DB positions with these virtuals (de-duplicated by ticker) and passes the merged list to `evaluate`. `entry_time` on the virtuals is UTC, matching every other code path.
+
+---
+
+### Challenge 22: Concurrent `close_position` Duplicated Trade Rows
+
+**The problem**: `close_position` does SELECT → INSERT INTO trades → DELETE from positions. With default SQLite isolation, two threads (the exit-fill event handler and `close_all_day_trades` on the scheduler) could both SELECT the same row, both INSERT a Trade, then both attempt DELETE (second is a no-op). Result: one position, two Trade rows, two "position closed" Telegram notifications.
+
+**The solution**: `_db_connection` gained an `immediate=True` mode that issues `BEGIN IMMEDIATE` at transaction start, acquiring the SQLite write lock upfront. `close_position` uses it, so the critical section is serialized. `busy_timeout=30000` lets the second writer wait for the first to commit rather than failing with "database is locked." The UNIQUE index on `positions.ticker` already handled the dual-INSERT case for opens; this closes the matching gap on closes.
+
+---
+
+### Challenge 23: Exit Handler Matching Children By Ticker Alone
+
+**The problem**: `setup_exit_handler` fell back to ticker-only matching when `parent_order` was missing (the reattach path could end up calling it this way). If a day-trade closed INTC in the morning and the bot re-entered INTC later that same session, the old exit handler was never deregistered from `ib.orderStatusEvent`. When the new bracket's stop-loss fired, the old handler matched on ticker and fired `db_close_position` on the fresh position — corrupting the P&L record and emitting a second spurious Telegram notification.
+
+**The solution**: Refuse to register an exit handler without a non-zero `parent_order.orderId`. The handler now requires precise `parentId` matching, so cross-bracket fires are structurally impossible. Reattach logs a clear warning when it can't resolve the parent rather than silently attaching a brittle handler.
+
+---
+
+### Challenge 24: Market-Close Boundary Crossed Mid-Scan
+
+**The problem**: `run_scan_cycle` checked `minutes_to_close` once per market when the scan started. AI analysis can take several minutes per candidate. A scan that started with 20 minutes to close could reach `place_order` for the last signal at 10 minutes to close — inside the `CLOSE_MINUTES_BEFORE=15` window. Then the `finally` block's `close_all_day_trades` immediately flattens the fresh position at uncertain market-on-close pricing, churning a round-trip for nothing.
+
+**The solution**: `_on_signal` re-checks `minutes_to_close(market)` right before `place_order`. If wall-clock time crossed the threshold, the callback logs and skips. The initial `run_scan_cycle` check remains as the coarse gate for starting the scan; this second check is the fine gate for placing each individual order.
+
+---
+
+### Challenge 25: Liquidity Filter Was a No-Op on the IBKR Scanner Path
+
+**The problem**: `universe._filter_universe` only applied `MIN_DAILY_VOLUME` and `MIN_MARKET_CAP` when the corresponding field was positive — and the IBKR scanner path stored `avg_volume=0.0, market_cap=0.0` because the scanner doesn't return them. So every ticker the scanner surfaced bypassed the liquidity gate entirely. Illiquid names (low-volume SPAC units, niche ETFs) could reach the AI analyst and waste a ~3-minute LLM call per candidate.
+
+**The solution**: Added a screener-level liquidity gate. `screen_stocks` computes the trailing 20-day mean of `volume` from the OHLCV DataFrame and skips the ticker when it's below `MIN_DAILY_VOLUME`. The DataFrame is the authoritative source — we already have it, and it reflects actual trading activity rather than scanner metadata.
+
+---
+
+### Challenge 26: Flat Per-Trade Backtest Commission Hid Friction
+
+**The problem**: `BACKTEST_COMMISSION = 1.0` charged a flat $1 regardless of share count. For a 1000-share position IBKR actually charges ~$5 per leg under tiered pricing. Backtests of sized-up strategies (50 % of a $100 k account) undercounted round-trip friction by 5–10 %, inflating reported Sharpe and profit factor.
+
+**The solution**: Added `BACKTEST_COMMISSION_PER_SHARE = 0.005` to settings. `SimulatedPortfolio` now computes `max(min_commission, per_share * qty)` per leg — matching IBKR's tiered structure. Tests that set `commission=0` to isolate other mechanics also zero `commission_per_share` in `__post_init__` so they remain friction-free.
+
+---
+
+### Challenge 27: Shutdown and Tavily Flags Were Bare Booleans
+
+**The problem**: `state.shutting_down` and `data._tavily_exhausted` were plain module-level bools. CPython's GIL makes assignment atomic on a single attribute, but there is no documented visibility guarantee across threads — and CPython is not the only possible runtime. More practically, the reads and writes happened across the ib_insync asyncio thread, the signal-handler thread, the scheduler main thread, and the Telegram listener thread. Bare-bool patterns like `if _tavily_exhausted: ...` imply a memory model we don't actually have.
+
+**The solution**: Both flags are now `threading.Event` instances. `.set()` / `.clear()` / `.is_set()` have explicit cross-thread atomicity and visibility semantics. Callers were updated in `core/scheduler.py`, `core/executor.py`, and both places where the Tavily flag is reset in the test suite.
+
+---
+
 ## 22. Architecture Decisions & Why
 
 ### "Pure Functions" for Screener and Risk Manager
