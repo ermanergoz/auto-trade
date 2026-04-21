@@ -1,8 +1,14 @@
-"""AI Analyst — LLM-powered deep analysis of screener candidates via Ollama."""
+"""AI Analyst — LLM-powered deep analysis of screener candidates.
+
+Routing: Gemini (primary) -> Ollama (fallback). See _call_llm for the router
+and _gemini_exhausted for the process-lifetime short-circuit that mirrors the
+Tavily->YFinance exhaustion pattern in core/data.py.
+"""
 
 import json
 import logging
 import threading
+import urllib.error
 import urllib.request
 from datetime import datetime
 from typing import Optional
@@ -11,8 +17,12 @@ import pandas as pd
 
 from config.settings import (
     AI_MODEL,
+    AI_PROVIDER,
     AI_CONFIDENCE_THRESHOLD,
     ALLOW_SHORT_SELLING,
+    GEMINI_API_KEY,
+    GEMINI_HOST,
+    GEMINI_MODEL,
     OLLAMA_HOST,
     MIN_RISK_REWARD_RATIO,
 )
@@ -20,17 +30,55 @@ from core.models import Signal, Action, TradeType
 
 logger = logging.getLogger(__name__)
 
-# Token usage tracking (guarded by _token_lock for thread safety)
-_daily_token_usage = {"input": 0, "output": 0, "date": None}
+# Per-provider token usage (guarded by _token_lock). Shape changed from flat
+# {input,output,date} on 2026-04-21 when Gemini became primary — no external
+# callers depended on the old shape (repo-wide grep of get_daily_token_usage).
+_daily_token_usage = {
+    "gemini": {"input": 0, "output": 0},
+    "ollama": {"input": 0, "output": 0},
+    "date": None,
+}
 _token_lock = threading.Lock()
+
+# Process-lifetime flag — once Gemini signals plan/quota exhaustion or an
+# unrecoverable auth failure, skip it for the rest of the process and go
+# straight to Ollama. Mirrors _tavily_exhausted in core/data.py. Resets on
+# process restart (covers "user topped up credits and restarted").
+_gemini_exhausted = threading.Event()
+
+# Substring markers (case-insensitive) that classify a Gemini error body as
+# PERMANENT exhaustion. Tighter than the Tavily list because Gemini emits
+# "Quota exceeded per minute" for transient per-minute rate limits — a bare
+# "quota" marker would latch the flag on recoverable conditions.
+_GEMINI_EXHAUSTION_MARKERS = (
+    "prepayment credits are depleted",
+    "usage limit",
+    "limit: 0",
+    "free tier limit",
+    "quota metric exceeded",
+)
+
+
+def _is_permanent_gemini_exhaustion(body_text: str) -> bool:
+    lowered = (body_text or "").lower()
+    return any(marker in lowered for marker in _GEMINI_EXHAUSTION_MARKERS)
 
 
 def _reset_daily_usage_if_needed() -> None:
     today = datetime.now().date().isoformat()
     if _daily_token_usage["date"] != today:
-        _daily_token_usage["input"] = 0
-        _daily_token_usage["output"] = 0
+        for provider in ("gemini", "ollama"):
+            _daily_token_usage[provider]["input"] = 0
+            _daily_token_usage[provider]["output"] = 0
         _daily_token_usage["date"] = today
+
+
+def _record_tokens(provider: str, input_tokens: int, output_tokens: int) -> None:
+    """Thread-safe per-provider token accounting."""
+    with _token_lock:
+        _reset_daily_usage_if_needed()
+        _daily_token_usage[provider]["input"] += int(input_tokens or 0)
+        _daily_token_usage[provider]["output"] += int(output_tokens or 0)
 
 
 # ---------------------------------------------------------------------------
@@ -173,13 +221,11 @@ def _call_ollama(prompt: str) -> Optional[dict]:
         logger.warning("Ollama error: %s", result["error"])
         return None
 
-    # Track usage only on successful responses
-    with _token_lock:
-        _reset_daily_usage_if_needed()
-        if "prompt_eval_count" in result:
-            _daily_token_usage["input"] += result["prompt_eval_count"]
-        if "eval_count" in result:
-            _daily_token_usage["output"] += result["eval_count"]
+    _record_tokens(
+        "ollama",
+        result.get("prompt_eval_count", 0),
+        result.get("eval_count", 0),
+    )
 
     duration = result.get("total_duration", 0) / 1e9
     logger.info("Ollama response in %.1fs (%s)", duration, AI_MODEL)
@@ -191,19 +237,134 @@ def _call_ollama(prompt: str) -> Optional[dict]:
         return None
 
 
+# ---------------------------------------------------------------------------
+# Gemini LLM call
+# ---------------------------------------------------------------------------
+
+class _GeminiTransportError(Exception):
+    """Raised by _call_gemini on HTTP / network failures so the router can
+    fall back to Ollama immediately without wasting Gemini retries. Content-level
+    failures (malformed envelope, invalid structured JSON) return None instead,
+    letting the router retry Gemini up to max_retries for the content issue."""
+
+
+def _call_gemini(prompt: str) -> Optional[dict]:
+    """Call Gemini generateContent. Returns parsed JSON dict.
+
+    Exhaustion signals that latch _gemini_exhausted for the rest of the process:
+      - HTTP 401/403 (invalid key / permissions)
+      - HTTP 429 whose body matches _GEMINI_EXHAUSTION_MARKERS (credits depleted, etc.)
+
+    Any transport failure (5xx, transient 429, network error, exhausted auth)
+    raises _GeminiTransportError so the router can fall straight through to
+    Ollama. Content issues (bad envelope, unparseable inner JSON) return None
+    so the router can retry the provider.
+    """
+    if not GEMINI_API_KEY or _gemini_exhausted.is_set():
+        raise _GeminiTransportError("gemini unavailable (no key or exhausted)")
+
+    url = f"{GEMINI_HOST}/v1beta/models/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
+    payload = json.dumps({
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {
+            "responseMimeType": "application/json",
+            "maxOutputTokens": 1024,
+            # thinkingBudget:0 disables thinking for 2.5-series models (avoids
+            # latency blowup); ignored by 2.0 models.
+            "thinkingConfig": {"thinkingBudget": 0},
+        },
+    }).encode()
+
+    req = urllib.request.Request(
+        url, data=payload, headers={"Content-Type": "application/json"},
+    )
+
+    try:
+        response = urllib.request.urlopen(req, timeout=120)
+        raw = response.read()
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", errors="replace") if hasattr(e, "read") else ""
+        if e.code in (401, 403):
+            logger.warning("Gemini auth failed (%d) — latching exhausted flag: %s", e.code, body[:200])
+            _gemini_exhausted.set()
+            raise _GeminiTransportError(f"auth {e.code}") from e
+        if e.code == 429 and _is_permanent_gemini_exhaustion(body):
+            logger.warning("Gemini plan exhausted — short-circuiting for process lifetime: %s", body[:200])
+            _gemini_exhausted.set()
+            raise _GeminiTransportError("429 exhausted") from e
+        logger.warning("Gemini transient HTTP %d: %s", e.code, body[:200])
+        raise _GeminiTransportError(f"http {e.code}") from e
+    except urllib.error.URLError as e:
+        logger.warning("Gemini network error: %s", e)
+        raise _GeminiTransportError(f"network: {e}") from e
+
+    try:
+        envelope = json.loads(raw)
+        text = envelope["candidates"][0]["content"]["parts"][0]["text"]
+        parsed = json.loads(text)
+    except (KeyError, IndexError, TypeError, json.JSONDecodeError) as e:
+        logger.warning("Gemini response malformed: %s", e)
+        return None
+
+    usage = envelope.get("usageMetadata") or {}
+    _record_tokens(
+        "gemini",
+        usage.get("promptTokenCount", 0),
+        usage.get("candidatesTokenCount", 0),
+    )
+    logger.info("Gemini response OK (%s)", GEMINI_MODEL)
+    return parsed
+
+
+# ---------------------------------------------------------------------------
+# Provider router
+# ---------------------------------------------------------------------------
+
 def _call_llm(prompt: str, max_retries: int = 3) -> Optional[dict]:
-    """Call Ollama with retry logic."""
+    """Route to Gemini first, fall back to Ollama.
+
+    Gemini is attempted only when AI_PROVIDER == "gemini", a key is set, and the
+    exhaustion flag has not been latched. Failure handling within the Gemini
+    leg splits by cause:
+
+      * Transport failure (5xx, network, auth, credits depleted)
+        -> _GeminiTransportError -> immediate fallback to Ollama; matches
+           user intent ("returns an error -> fallback") and avoids burning
+           3x the timeout on a stateless server error.
+      * Content failure (unparseable envelope, validator rejects the JSON)
+        -> None -> retry Gemini up to max_retries, because a re-prompt can
+           yield a different, parseable response.
+
+    Ollama keeps its legacy 3-attempt retry loop.
+    """
+    use_gemini = (
+        AI_PROVIDER == "gemini"
+        and bool(GEMINI_API_KEY)
+        and not _gemini_exhausted.is_set()
+    )
+
+    if use_gemini:
+        for attempt in range(1, max_retries + 1):
+            try:
+                result = _call_gemini(prompt)
+            except _GeminiTransportError as e:
+                logger.warning("Gemini transport failure — falling back to Ollama: %s", e)
+                break
+            except Exception as e:
+                logger.warning("Gemini unexpected error — falling back to Ollama: %s", e)
+                break
+            if result and _validate_response(result):
+                return result
+            logger.warning("Gemini invalid response on attempt %d/%d", attempt, max_retries)
+
     for attempt in range(1, max_retries + 1):
         try:
             result = _call_ollama(prompt)
-
             if result and _validate_response(result):
                 return result
-            else:
-                logger.warning("Invalid LLM response on attempt %d: %s", attempt, result)
-
+            logger.warning("Ollama invalid response on attempt %d: %s", attempt, result)
         except Exception as e:
-            logger.warning("LLM call failed (attempt %d/%d): %s", attempt, max_retries, e)
+            logger.warning("Ollama call failed (attempt %d/%d): %s", attempt, max_retries, e)
 
     return None
 
@@ -387,7 +548,14 @@ def analyze_batch(
 
 
 def get_daily_token_usage() -> dict:
-    """Return today's token usage stats."""
+    """Return today's per-provider token usage stats.
+
+    Shape: {"gemini": {"input": N, "output": N}, "ollama": {"input": N, "output": N}, "date": "YYYY-MM-DD"}.
+    """
     with _token_lock:
         _reset_daily_usage_if_needed()
-        return dict(_daily_token_usage)
+        return {
+            "gemini": dict(_daily_token_usage["gemini"]),
+            "ollama": dict(_daily_token_usage["ollama"]),
+            "date": _daily_token_usage["date"],
+        }
