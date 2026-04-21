@@ -500,6 +500,21 @@ def setup_exit_handler(ib: IB, signal: Signal, on_exit=None, parent_order=None) 
     _fired = threading.Event()
     _parent_order_id = getattr(parent_order, "orderId", 0) if parent_order else 0
 
+    # Without a parent orderId we cannot safely distinguish this bracket's
+    # children from a later bracket's children for the same ticker. Matching
+    # by ticker alone means the handler can fire on a FRESH re-entry's fill
+    # and close the new position via db_close_position — a silent data loss.
+    # Decline to register; the caller (reattach_exit_handlers) already logs
+    # the warning when it can't locate a parent.
+    if not _parent_order_id:
+        logger.warning(
+            "Refusing to attach exit handler for %s: no parent_order_id "
+            "provided. Matching by ticker alone would risk firing on a "
+            "later bracket's fills when the ticker is re-entered.",
+            signal.ticker,
+        )
+        return
+
     def on_order_status(trade: IBTrade):
         if _fired.is_set():
             return
@@ -518,16 +533,10 @@ def setup_exit_handler(ib: IB, signal: Signal, on_exit=None, parent_order=None) 
         if not is_child:
             return  # This is the parent entry order, handled by setup_fill_handler
 
-        # Always match children by parent order ID to prevent cross-bracket
-        # interference when a ticker is re-entered in the same session
-        if _parent_order_id and trade.order.parentId != _parent_order_id:
+        # Match by parent order ID to prevent cross-bracket interference
+        # when a ticker is re-entered in the same session.
+        if trade.order.parentId != _parent_order_id:
             return
-        if not _parent_order_id:
-            logger.warning(
-                "Exit handler for %s has no parent_order_id — "
-                "matching by ticker only (risk of cross-bracket fire)",
-                signal.ticker,
-            )
 
         exit_type = "stop-loss" if is_stop else "take-profit"
         if _fired.is_set():

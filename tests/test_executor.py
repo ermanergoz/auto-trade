@@ -714,3 +714,89 @@ class TestSetupFillHandlerRace:
             "handle_fill must fire exactly once even if a late orderStatusEvent "
             "arrives after the already-filled snapshot was handled at registration"
         )
+
+
+class TestExitHandlerParentMatching:
+    """Exit handlers without a known parent_order_id must not fire on arbitrary
+    child orders — doing so risks cross-bracket interference when a ticker is
+    re-entered in the same session and a stale handler observes a fresh fill.
+    """
+
+    def _fake_event(self):
+        handlers = []
+
+        class FakeEvent:
+            def __iadd__(self, h):
+                handlers.append(h)
+                return self
+            def __isub__(self, h):
+                if h in handlers:
+                    handlers.remove(h)
+                return self
+        return FakeEvent(), handlers
+
+    def test_no_parent_order_refuses_to_fire(self, db_path):
+        """When parent_order is None (reattach couldn't resolve it), the handler
+        must NOT fire on a child-order fill that happens to match by ticker.
+        Otherwise a stale handler attached during startup can close a fresh
+        position if the same ticker is later re-entered.
+        """
+        from core.executor import setup_exit_handler
+
+        sig = _signal(Action.BUY)
+        ib = MagicMock()
+        event, handlers = self._fake_event()
+        ib.orderStatusEvent = event
+
+        # A child-order fill for the same ticker, from a different bracket
+        stray_child = MagicMock()
+        stray_child.order.orderType = "STP"
+        stray_child.order.parentId = 999  # some parent we don't know about
+        stray_child.order.action = "SELL"
+        stray_child.orderStatus.status = "Filled"
+        stray_child.orderStatus.avgFillPrice = 148.0
+        stray_child.contract.symbol = sig.ticker
+
+        with patch("core.executor.db_close_position") as mock_close:
+            mock_close.return_value = MagicMock(pnl=0.0, pnl_pct=0.0)
+
+            # Attach with parent_order=None (the buggy reattach path)
+            setup_exit_handler(ib, sig, on_exit=None, parent_order=None)
+
+            # Fire the event
+            for h in list(handlers):
+                h(stray_child)
+
+            assert mock_close.call_count == 0, (
+                "Exit handler without parent_order must not trigger db close "
+                "on a child-order fill — otherwise a stale handler from a "
+                "previous bracket can close a fresh re-entry of the same ticker"
+            )
+
+    def test_with_parent_order_fires_on_matching_child(self, db_path):
+        """Sanity: with a valid parent_order, the handler DOES fire on its child."""
+        from core.executor import setup_exit_handler
+
+        sig = _signal(Action.BUY)
+        ib = MagicMock()
+        event, handlers = self._fake_event()
+        ib.orderStatusEvent = event
+
+        parent = MagicMock()
+        parent.orderId = 100
+
+        child = MagicMock()
+        child.order.orderType = "STP"
+        child.order.parentId = 100  # matches parent.orderId
+        child.order.action = "SELL"
+        child.orderStatus.status = "Filled"
+        child.orderStatus.avgFillPrice = 145.0
+        child.contract.symbol = sig.ticker
+
+        with patch("core.executor.db_close_position") as mock_close:
+            mock_close.return_value = MagicMock(pnl=0.0, pnl_pct=0.0)
+            setup_exit_handler(ib, sig, on_exit=None, parent_order=parent)
+            for h in list(handlers):
+                h(child)
+
+            assert mock_close.call_count == 1
