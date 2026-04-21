@@ -195,6 +195,68 @@ class TestStreamingPipeline:
         assert len(second_call_positions) == 1
         assert second_call_positions[0].ticker == "AAPL"
 
+    def test_skips_place_order_when_inside_close_window(self):
+        """A scan that started before the close window must not place orders
+        once wall-clock time has crossed into the close window — otherwise
+        close_all_day_trades would immediately flatten the new position.
+        """
+        sig = _make_signal(ticker="LATE")
+        _setup_mocks(self.m, [sig], risk_approved=[True])
+
+        # When the scan-cycle starts, minutes_to_close = 20 (> CLOSE_MINUTES_BEFORE=15)
+        # so the scan proceeds. When _on_signal runs for this signal, time has
+        # advanced into the window (10 minutes to close). The callback must
+        # see this and skip place_order.
+        from core.scheduler import run_scan_cycle
+
+        ib = MagicMock()
+        from core.models import StockInfo
+
+        # Build candidate list
+        self.m["get_tickers_for_market"].return_value = [
+            StockInfo("LATE", "SMART", "Technology", 0.0, 0.0),
+        ]
+
+        # Sequence: [scan_start=20, _on_signal=10, ...]
+        close_sequence = iter([20, 10, 10, 10, 10, 10])
+        with patch("core.scheduler._fetch_market_data") as mock_fetch, \
+             patch("core.connection.get_account_summary", return_value={"NetLiquidation": 100_000}), \
+             patch("core.scheduler.minutes_to_close", side_effect=lambda m: next(close_sequence)), \
+             patch("core.scheduler.get_trades", return_value=[]):
+            mock_fetch.return_value = _make_stock_data(["LATE"])
+            run_scan_cycle(ib, ["US"])
+
+        # place_order must not be called because the signal arrived inside the close window
+        self.m["place_order"].assert_not_called()
+
+    def test_pending_signal_included_in_next_risk_check(self):
+        """A signal just approved + placed must appear in the next risk check's
+        position list, even if the DB refresh (get_open_positions) hasn't seen
+        the fill yet. Without this, two rapid-fire AI approvals can both pass
+        the max-positions/sector-concentration gates against a stale view."""
+        sig1 = _make_signal(ticker="AAPL")
+        sig2 = _make_signal(ticker="MSFT")
+        # Simulate slow fill: neither fill has been recorded in DB before the
+        # second risk check runs. get_open_positions returns empty both times.
+        _setup_mocks(
+            self.m,
+            [sig1, sig2],
+            risk_approved=[True, True],
+            positions_sequence=[[], [], []],
+        )
+
+        _run_cycle(self.m)
+
+        assert self.m["evaluate"].call_count == 2
+        # Second evaluate must see AAPL as a pending/virtual position,
+        # even though get_open_positions returned empty.
+        second_call_positions = self.m["evaluate"].call_args_list[1][0][1]
+        tickers = {p.ticker for p in second_call_positions}
+        assert "AAPL" in tickers, (
+            "Second risk check must see the just-placed AAPL order as a "
+            "pending position; DB refresh can lag the fill by seconds."
+        )
+
     def test_summary_counts_correct(self):
         sig1 = _make_signal(ticker="A")
         sig2 = _make_signal(ticker="B")

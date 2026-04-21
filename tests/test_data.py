@@ -39,9 +39,9 @@ def reset_tavily_exhausted_flag():
     Always reset both before and after.
     """
     import core.data
-    core.data._tavily_exhausted = False
+    core.data._tavily_exhausted.clear()
     yield
-    core.data._tavily_exhausted = False
+    core.data._tavily_exhausted.clear()
 
 
 class TestCache:
@@ -206,9 +206,9 @@ class TestTavilyExhaustion:
     @pytest.fixture(autouse=True)
     def reset_tavily_flag(self):
         import core.data
-        core.data._tavily_exhausted = False
+        core.data._tavily_exhausted.clear()
         yield
-        core.data._tavily_exhausted = False
+        core.data._tavily_exhausted.clear()
 
     @patch("core.data.TAVILY_API_KEY", "fake-key")
     @patch("core.data._get_news_yfinance")
@@ -279,7 +279,7 @@ class TestTavilyExhaustion:
             get_news("A")
             # Simulate process restart
             import core.data
-            core.data._tavily_exhausted = False
+            core.data._tavily_exhausted.clear()
             get_news("B")
 
         assert mock_client.search.call_count == 2

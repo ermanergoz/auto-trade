@@ -390,7 +390,10 @@ _NEWS_FAILURE_TTL = 60  # Retry sooner when news fetch fails
 # Process-lifetime flag: once Tavily signals plan/rate-limit exhaustion,
 # skip it for the rest of the process and go straight to yfinance.
 # Resets on process restart — covers "user upgraded plan and restarted".
-_tavily_exhausted = False
+# threading.Event guarantees atomic set/is_set visibility across threads
+# (scan loop, Telegram listener, any future parallelization), which a bare
+# bool would rely on CPython GIL happenstance to provide.
+_tavily_exhausted = threading.Event()
 _TAVILY_EXHAUSTION_MARKERS = (
     "exceeds your plan",
     "usage limit",
@@ -421,10 +424,9 @@ def _get_news_yfinance(ticker: str, max_results: int = 5) -> list[str]:
 def _get_news_tavily(ticker: str, max_results: int = 5) -> Optional[list[str]]:
     """Fetch news via Tavily. Returns None on failure (triggers fallback),
     [] if Tavily is not configured, or a list of headlines on success."""
-    global _tavily_exhausted
     if not TAVILY_API_KEY:
         return []
-    if _tavily_exhausted:
+    if _tavily_exhausted.is_set():
         return None
     try:
         from tavily import TavilyClient
@@ -435,7 +437,7 @@ def _get_news_tavily(ticker: str, max_results: int = 5) -> Optional[list[str]]:
     except Exception as e:
         msg = str(e).lower()
         if any(marker in msg for marker in _TAVILY_EXHAUSTION_MARKERS):
-            _tavily_exhausted = True
+            _tavily_exhausted.set()
             logger.warning(
                 "Tavily plan exhausted (%s) — short-circuiting for rest of process", e,
             )
