@@ -41,8 +41,9 @@ An automated stock trading system that day-trades and swing-trades US equities t
   └────────────────┘          │              │
                        ┌──────▼──────┐        │
                        │  AI Analyst  │        │
-                       │  (Claude/GPT │        │
-                       │   + News)    │        │
+                       │  (Gemini /   │        │
+                       │   Ollama +   │        │
+                       │    News)     │        │
                        └──────┬──────┘        │
                               │               │
                        ┌──────▼──────┐        │
@@ -107,13 +108,14 @@ Output: ~10-20 candidates per market per scan interval.
 
 ### 5. AI Analyst
 
-Deep analysis on screener candidates only (~$0.20-1.00/day in API costs).
+Deep analysis on screener candidates only.
 
 For each candidate:
 - Gathers: technical indicator values, recent price action, news headlines, sector performance
-- Sends structured prompt to Claude or GPT API
-- Receives structured response: `{action: buy|sell|hold, confidence: 0-100, entry_price, stop_loss, take_profit, reasoning}`
+- Sends structured prompt through the provider router (`core/analyst._call_llm`): Gemini (`gemini-2.5-flash-lite` by default) when `GEMINI_API_KEY` is set and the process-lifetime exhaustion flag is clear, otherwise (or on Gemini transport failure / credits depleted) Ollama + Qwen 2.5 7B locally
+- Receives structured response: `{action: buy|sell|hold, confidence: 0-100, entry_price, stop_loss, take_profit, trade_type, reasoning}`
 - Confidence threshold: only act on signals with confidence >= 65 (configurable)
+- Fallback semantics mirror the Tavily→yfinance news path: permanent exhaustion (401/403, depleted credits) latches a process-wide flag; transient failures (5xx, network, per-minute 429) fall back for just this call
 
 ### 6. Risk Manager
 
@@ -173,7 +175,7 @@ Replays historical data through the same Strategy Engine code.
 - **Market data (primary)**: IBKR via `ib_insync` (historical + real-time)
 - **Market data (backtest fallback)**: `yfinance` for bulk historical downloads
 - **Technical analysis**: `pandas-ta` or `ta-lib`
-- **AI**: `anthropic` SDK (Claude) or `openai` SDK
+- **AI**: Gemini (primary) via direct `urllib.request` calls to the Generative Language API; Ollama (fallback) via local HTTP
 - **Database**: SQLite via `sqlite3`
 - **Notifications**: `python-telegram-bot`
 - **News**: Tavily API
@@ -233,7 +235,12 @@ MIN_MARKET_CAP = 50_000_000  # $50M
 # Strategy
 SCAN_INTERVAL_MINUTES = 15
 AI_CONFIDENCE_THRESHOLD = 65
-AI_MODEL = "claude-sonnet-4-6"
+AI_PROVIDER = "gemini"                  # "gemini" (auto-falls back to Ollama) or "ollama"
+GEMINI_API_KEY = ""                     # leave blank to disable Gemini and use Ollama only
+GEMINI_MODEL = "gemini-2.5-flash-lite"
+GEMINI_HOST = "https://generativelanguage.googleapis.com"
+AI_MODEL = "qwen2.5:7b"                 # Ollama fallback model
+OLLAMA_HOST = "http://localhost:11434"
 
 # Risk
 MAX_POSITION_SIZE_PCT = 5.0
@@ -267,7 +274,8 @@ TELEGRAM_CHAT_ID = ""
 - **Build from scratch** rather than forking `daily_stock_analysis` — that repo's architecture is built for notifications, not execution, and has lots of Chinese-market-specific code
 - **IBKR as single broker** for US markets
 - **IBKR as primary data source** — already connected for trading, provides both historical and real-time data for US stocks. YFinance only as backtest fallback for bulk downloads. This eliminates an external dependency and avoids YFinance reliability issues.
-- **Screener-then-AI pipeline** to keep LLM costs under ~$1/day
+- **Screener-then-AI pipeline** to keep LLM costs minimal (Gemini Flash-Lite is cheap-to-free at this volume; Ollama fallback is free)
+- **Gemini-primary, Ollama-fallback LLM routing** — reuses the same process-lifetime exhaustion-flag pattern as Tavily→yfinance news fallback; no general multi-provider abstraction. Transport failures on Gemini (HTTP 5xx, network, credits depleted) fall straight through to Ollama rather than burning retries on stateless server errors; content-level failures (malformed JSON) retry Gemini up to 3 times because re-prompting can yield a parseable response
 - **SQLite** instead of PostgreSQL — simpler for a local single-user system
 - **Skip options for now** — add as a future milestone once stock trading is stable
 - **Python** — best ecosystem for trading (ib_insync, pandas, yfinance, ta-lib)
