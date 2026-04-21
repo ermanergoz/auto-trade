@@ -3,6 +3,7 @@
 import asyncio
 import json
 import logging
+import urllib.error
 import urllib.request
 from datetime import date
 from pathlib import Path
@@ -12,9 +13,9 @@ import yfinance as yf
 from ib_insync import IB, Stock, ScannerSubscription, util
 
 from config.settings import (
-    AI_MODEL, DATA_DIR, EXCLUDED_COUNTRIES, EXCLUDED_SECTORS, EXCLUDED_TICKERS,
-    FINANCIAL_KEYWORDS, DEFENSE_KEYWORDS, MIN_DAILY_VOLUME, MIN_MARKET_CAP,
-    OLLAMA_HOST,
+    AI_MODEL, AI_PROVIDER, DATA_DIR, EXCLUDED_COUNTRIES, EXCLUDED_SECTORS,
+    EXCLUDED_TICKERS, FINANCIAL_KEYWORDS, DEFENSE_KEYWORDS, GEMINI_API_KEY,
+    GEMINI_HOST, GEMINI_MODEL, MIN_DAILY_VOLUME, MIN_MARKET_CAP, OLLAMA_HOST,
 )
 from core.models import StockInfo
 
@@ -256,6 +257,99 @@ def _classify_sector_yfinance(ticker: str) -> tuple[Optional[str], Optional[str]
         return None, None
 
 
+_SECTOR_CLASSIFICATION_PROMPT = (
+    "What sector and country does the stock ticker '{ticker}'{name_suffix} "
+    "belong to?\n\n"
+    "If this is an ETF, leveraged product, warrant, unit, right, or "
+    "preferred share — return sector as 'ETF' or 'Non-Stock'.\n\n"
+    'Return JSON: {{"sector": "...", "country": "..."}}\n'
+    "Use standard sector names: Technology, Healthcare, Energy, "
+    "Consumer Cyclical, Consumer Defensive, Industrials, Materials, "
+    "Utilities, Real Estate, Communication, Financials, ETF, Non-Stock."
+)
+
+
+def _sector_prompt(ticker: str, name: str) -> str:
+    return _SECTOR_CLASSIFICATION_PROMPT.format(
+        ticker=ticker, name_suffix=f" ({name})" if name else "",
+    )
+
+
+def _classify_sector_gemini(
+    ticker: str, name: str = "",
+) -> tuple[Optional[str], Optional[str]]:
+    """Use Gemini to classify sector and country for a ticker.
+
+    Short-circuits without an HTTP call if no key is configured or if the
+    process-wide _gemini_exhausted flag (shared with core.analyst) is latched.
+    Latches the flag on 401/403 and on 429 responses whose body matches the
+    permanent-exhaustion markers — matches the contract in core.analyst so a
+    single Gemini outage turns off all Gemini calls in the process.
+
+    Returns (sector, country) or (None, None) on failure.
+    """
+    # Import here to avoid a circular-import risk and to always observe the
+    # current state of the shared flag.
+    from core.analyst import _gemini_exhausted, _is_permanent_gemini_exhaustion
+
+    if not GEMINI_API_KEY or AI_PROVIDER != "gemini" or _gemini_exhausted.is_set():
+        return None, None
+
+    url = f"{GEMINI_HOST}/v1beta/models/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
+    payload = json.dumps({
+        "contents": [{"parts": [{"text": _sector_prompt(ticker, name)}]}],
+        "generationConfig": {
+            "responseMimeType": "application/json",
+            "maxOutputTokens": 128,
+            "thinkingConfig": {"thinkingBudget": 0},
+        },
+    }).encode()
+
+    req = urllib.request.Request(
+        url, data=payload, headers={"Content-Type": "application/json"},
+    )
+
+    try:
+        response = urllib.request.urlopen(req, timeout=30)
+        raw = response.read()
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", errors="replace") if hasattr(e, "read") else ""
+        if e.code in (401, 403):
+            logger.warning(
+                "Gemini sector lookup auth failed (%d) — latching exhausted: %s",
+                e.code, body[:200],
+            )
+            _gemini_exhausted.set()
+        elif e.code == 429 and _is_permanent_gemini_exhaustion(body):
+            logger.warning(
+                "Gemini sector lookup plan exhausted — latching: %s", body[:200],
+            )
+            _gemini_exhausted.set()
+        else:
+            logger.debug(
+                "Gemini sector lookup transient HTTP %d for %s: %s",
+                e.code, ticker, body[:200],
+            )
+        return None, None
+    except urllib.error.URLError as e:
+        logger.debug("Gemini sector lookup network error for %s: %s", ticker, e)
+        return None, None
+
+    try:
+        envelope = json.loads(raw)
+        text = envelope["candidates"][0]["content"]["parts"][0]["text"]
+        data = json.loads(text)
+    except (KeyError, IndexError, TypeError, json.JSONDecodeError) as e:
+        logger.debug("Gemini sector response malformed for %s: %s", ticker, e)
+        return None, None
+
+    sector = data.get("sector") or None
+    country = data.get("country") or None
+    if sector:
+        return sector, country
+    return None, None
+
+
 def _classify_sector_ollama(
     ticker: str, name: str = "", max_retries: int = 2,
 ) -> tuple[Optional[str], Optional[str]]:
@@ -263,16 +357,7 @@ def _classify_sector_ollama(
 
     Returns (sector, country) or (None, None) on failure.
     """
-    prompt = (
-        f"What sector and country does the stock ticker '{ticker}'"
-        f"{f' ({name})' if name else ''} belong to?\n\n"
-        "If this is an ETF, leveraged product, warrant, unit, right, or "
-        "preferred share — return sector as 'ETF' or 'Non-Stock'.\n\n"
-        'Return JSON: {{"sector": "...", "country": "..."}}\n'
-        "Use standard sector names: Technology, Healthcare, Energy, "
-        "Consumer Cyclical, Consumer Defensive, Industrials, Materials, "
-        "Utilities, Real Estate, Communication, Financials, ETF, Non-Stock."
-    )
+    prompt = _sector_prompt(ticker, name)
     for attempt in range(1, max_retries + 1):
         try:
             payload = json.dumps({
@@ -305,13 +390,16 @@ def _classify_sector_ollama(
 
 
 def _fill_missing_sectors(stocks: list[StockInfo]) -> list[StockInfo]:
-    """Fill sector/country for stocks missing it: yfinance -> Ollama -> exclude.
+    """Fill sector/country for stocks missing it: yfinance -> Gemini -> Ollama -> exclude.
 
+    Gemini is the primary LLM fallback; Ollama is reached only when Gemini is
+    unavailable (no key, exhausted, transport error) or returns no sector.
     Stocks that remain unclassified after all fallbacks are excluded entirely.
     """
     result = []
     need_lookup = 0
     excluded = 0
+    gemini_used = 0
     ollama_used = 0
 
     for stock in stocks:
@@ -321,7 +409,6 @@ def _fill_missing_sectors(stocks: list[StockInfo]) -> list[StockInfo]:
 
         need_lookup += 1
 
-        # Try yfinance first
         sector, country = _classify_sector_yfinance(stock.ticker)
         if sector:
             stock.sector = sector
@@ -329,7 +416,14 @@ def _fill_missing_sectors(stocks: list[StockInfo]) -> list[StockInfo]:
             result.append(stock)
             continue
 
-        # Try Ollama as last resort
+        sector, country = _classify_sector_gemini(stock.ticker, stock.name)
+        if sector:
+            stock.sector = sector
+            stock.country = country or ""
+            gemini_used += 1
+            result.append(stock)
+            continue
+
         sector, country = _classify_sector_ollama(stock.ticker, stock.name)
         if sector:
             stock.sector = sector
@@ -340,14 +434,14 @@ def _fill_missing_sectors(stocks: list[StockInfo]) -> list[StockInfo]:
 
         excluded += 1
         logger.warning(
-            "Excluding %s: no sector data from IBKR, yfinance, or Ollama",
+            "Excluding %s: no sector data from IBKR, yfinance, Gemini, or Ollama",
             stock.ticker,
         )
 
     if need_lookup:
         logger.info(
-            "Sector fallback: %d lookups, %d via Ollama, %d excluded",
-            need_lookup, ollama_used, excluded,
+            "Sector fallback: %d lookups, %d via Gemini, %d via Ollama, %d excluded",
+            need_lookup, gemini_used, ollama_used, excluded,
         )
     return result
 

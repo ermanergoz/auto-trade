@@ -10,6 +10,7 @@ from core.models import StockInfo
 from core.universe import (
     _classify_sector_yfinance,
     _classify_sector_ollama,
+    _classify_sector_gemini,
     _fill_missing_sectors,
     _filter_universe,
     _is_excluded_sector,
@@ -264,9 +265,13 @@ class TestYFinanceSectorFallback:
         assert result[0].country == "United States"
 
     @patch("core.universe._classify_sector_ollama")
+    @patch("core.universe._classify_sector_gemini")
     @patch("core.universe._classify_sector_yfinance")
-    def test_fill_missing_sectors_excludes_unclassifiable(self, mock_classify, mock_ollama):
+    def test_fill_missing_sectors_excludes_unclassifiable(
+        self, mock_classify, mock_gemini, mock_ollama,
+    ):
         mock_classify.return_value = (None, None)
+        mock_gemini.return_value = (None, None)
         mock_ollama.return_value = (None, None)
         stocks = [StockInfo("FAKE", "SMART", "", 0, 0)]
         result = _fill_missing_sectors(stocks)
@@ -281,13 +286,15 @@ class TestYFinanceSectorFallback:
         mock_classify.assert_not_called()
 
     @patch("core.universe._classify_sector_ollama")
+    @patch("core.universe._classify_sector_gemini")
     @patch("core.universe._classify_sector_yfinance")
-    def test_fill_missing_sectors_mixed(self, mock_classify, mock_ollama):
+    def test_fill_missing_sectors_mixed(self, mock_classify, mock_gemini, mock_ollama):
         def side_effect(ticker):
             if ticker == "GOOG":
                 return ("Technology", "United States")
             return (None, None)
         mock_classify.side_effect = side_effect
+        mock_gemini.return_value = (None, None)
         mock_ollama.return_value = (None, None)
 
         stocks = [
@@ -383,9 +390,13 @@ class TestOllamaSectorFallback:
         assert country is None
 
     @patch("core.universe._classify_sector_ollama")
+    @patch("core.universe._classify_sector_gemini")
     @patch("core.universe._classify_sector_yfinance")
-    def test_fill_missing_sectors_uses_ollama_when_yfinance_fails(self, mock_yf, mock_ollama):
+    def test_fill_missing_sectors_uses_ollama_when_yfinance_and_gemini_fail(
+        self, mock_yf, mock_gemini, mock_ollama,
+    ):
         mock_yf.return_value = (None, None)
+        mock_gemini.return_value = (None, None)
         mock_ollama.return_value = ("Energy", "Canada")
         stocks = [StockInfo("FAKE", "SMART", "", 0, 0, name="FAKE ENERGY CORP")]
         result = _fill_missing_sectors(stocks)
@@ -395,13 +406,195 @@ class TestOllamaSectorFallback:
         mock_ollama.assert_called_once()
 
     @patch("core.universe._classify_sector_ollama")
+    @patch("core.universe._classify_sector_gemini")
     @patch("core.universe._classify_sector_yfinance")
-    def test_fill_missing_sectors_excludes_when_all_fail(self, mock_yf, mock_ollama):
+    def test_fill_missing_sectors_excludes_when_all_fail(
+        self, mock_yf, mock_gemini, mock_ollama,
+    ):
         mock_yf.return_value = (None, None)
+        mock_gemini.return_value = (None, None)
         mock_ollama.return_value = (None, None)
         stocks = [StockInfo("FAKE", "SMART", "", 0, 0)]
         result = _fill_missing_sectors(stocks)
         assert len(result) == 0
+
+
+class TestGeminiSectorFallback:
+    """_classify_sector_gemini + its integration into _fill_missing_sectors.
+
+    Contract mirrors core.analyst._call_gemini:
+      - No key OR _gemini_exhausted latched -> (None, None) without HTTP call
+      - 401/403 latches _gemini_exhausted for the process
+      - 429 with permanent-exhaustion markers latches the flag
+      - Transient HTTP/network errors return (None, None) without latching
+    """
+
+    @pytest.fixture
+    def reset_gemini_state(self):
+        """Clear the process-wide Gemini exhaustion flag before and after each test."""
+        from core.analyst import _gemini_exhausted
+        _gemini_exhausted.clear()
+        yield
+        _gemini_exhausted.clear()
+
+    def _gemini_body(self, json_text: str) -> bytes:
+        """Build a successful Gemini generateContent response envelope."""
+        return json.dumps({
+            "candidates": [{"content": {"parts": [{"text": json_text}]}}],
+            "usageMetadata": {"promptTokenCount": 40, "candidatesTokenCount": 20},
+        }).encode()
+
+    @patch("core.universe.GEMINI_API_KEY", "fake-key")
+    @patch("core.universe.urllib.request.urlopen")
+    def test_classify_sector_gemini_returns_sector_and_country(
+        self, mock_urlopen, reset_gemini_state,
+    ):
+        mock_response = MagicMock()
+        mock_response.read.return_value = self._gemini_body(
+            json.dumps({"sector": "Technology", "country": "United States"})
+        )
+        mock_urlopen.return_value = mock_response
+
+        sector, country = _classify_sector_gemini("AAPL", "APPLE INC")
+        assert sector == "Technology"
+        assert country == "United States"
+
+    @patch("core.universe.GEMINI_API_KEY", "")
+    def test_classify_sector_gemini_returns_none_without_api_key(
+        self, reset_gemini_state,
+    ):
+        sector, country = _classify_sector_gemini("AAPL", "APPLE INC")
+        assert sector is None
+        assert country is None
+
+    @patch("core.universe.GEMINI_API_KEY", "fake-key")
+    @patch("core.universe.urllib.request.urlopen")
+    def test_classify_sector_gemini_returns_none_when_exhausted(
+        self, mock_urlopen, reset_gemini_state,
+    ):
+        """When _gemini_exhausted is latched, skip the HTTP call entirely."""
+        from core.analyst import _gemini_exhausted
+        _gemini_exhausted.set()
+
+        sector, country = _classify_sector_gemini("AAPL", "APPLE INC")
+        assert sector is None
+        assert country is None
+        mock_urlopen.assert_not_called()
+
+    @patch("core.universe.GEMINI_API_KEY", "fake-key")
+    @patch("core.universe.urllib.request.urlopen")
+    def test_classify_sector_gemini_returns_none_on_transient_http_error(
+        self, mock_urlopen, reset_gemini_state,
+    ):
+        """Transient 5xx or network errors do NOT latch the exhaustion flag."""
+        import urllib.error
+        from core.analyst import _gemini_exhausted
+
+        mock_urlopen.side_effect = urllib.error.HTTPError(
+            url="x", code=500, msg="srv", hdrs=None, fp=None,
+        )
+        sector, country = _classify_sector_gemini("AAPL", "APPLE INC")
+        assert sector is None
+        assert country is None
+        assert not _gemini_exhausted.is_set(), "500 must not latch exhaustion"
+
+    @patch("core.universe.GEMINI_API_KEY", "fake-key")
+    @patch("core.universe.urllib.request.urlopen")
+    def test_classify_sector_gemini_latches_exhausted_on_auth_failure(
+        self, mock_urlopen, reset_gemini_state,
+    ):
+        """401/403 latches _gemini_exhausted so subsequent calls short-circuit."""
+        import io
+        import urllib.error
+        from core.analyst import _gemini_exhausted
+
+        mock_urlopen.side_effect = urllib.error.HTTPError(
+            url="x", code=401, msg="unauthorized",
+            hdrs=None, fp=io.BytesIO(b"API key not valid"),
+        )
+        sector, country = _classify_sector_gemini("AAPL", "APPLE INC")
+        assert sector is None
+        assert country is None
+        assert _gemini_exhausted.is_set(), "401 must latch exhaustion"
+
+    @patch("core.universe.GEMINI_API_KEY", "fake-key")
+    @patch("core.universe.urllib.request.urlopen")
+    def test_classify_sector_gemini_latches_exhausted_on_quota_depletion(
+        self, mock_urlopen, reset_gemini_state,
+    ):
+        """429 matching permanent-exhaustion markers latches the flag."""
+        import io
+        import urllib.error
+        from core.analyst import _gemini_exhausted
+
+        mock_urlopen.side_effect = urllib.error.HTTPError(
+            url="x", code=429, msg="quota",
+            hdrs=None, fp=io.BytesIO(b"free tier limit reached"),
+        )
+        sector, country = _classify_sector_gemini("AAPL", "APPLE INC")
+        assert sector is None
+        assert country is None
+        assert _gemini_exhausted.is_set(), "permanent 429 must latch exhaustion"
+
+    @patch("core.universe.GEMINI_API_KEY", "fake-key")
+    @patch("core.universe.urllib.request.urlopen")
+    def test_classify_sector_gemini_transient_429_does_not_latch(
+        self, mock_urlopen, reset_gemini_state,
+    ):
+        """Per-minute rate limits (transient) must not latch the flag."""
+        import io
+        import urllib.error
+        from core.analyst import _gemini_exhausted
+
+        mock_urlopen.side_effect = urllib.error.HTTPError(
+            url="x", code=429, msg="rate",
+            hdrs=None, fp=io.BytesIO(b"Quota exceeded per minute"),
+        )
+        sector, country = _classify_sector_gemini("AAPL", "APPLE INC")
+        assert sector is None
+        assert country is None
+        assert not _gemini_exhausted.is_set(), "transient 429 must not latch"
+
+    # ---- _fill_missing_sectors routing order ----
+
+    @patch("core.universe._classify_sector_ollama")
+    @patch("core.universe._classify_sector_gemini")
+    @patch("core.universe._classify_sector_yfinance")
+    def test_fill_missing_sectors_prefers_gemini_over_ollama(
+        self, mock_yf, mock_gemini, mock_ollama, reset_gemini_state=None,
+    ):
+        """When yfinance fails and Gemini succeeds, Ollama must NOT be called."""
+        mock_yf.return_value = (None, None)
+        mock_gemini.return_value = ("Technology", "United States")
+        mock_ollama.return_value = ("SHOULD NOT BE USED", "X")
+
+        stocks = [StockInfo("FAKE", "SMART", "", 0, 0, name="FAKE TECH CORP")]
+        result = _fill_missing_sectors(stocks)
+
+        assert len(result) == 1
+        assert result[0].sector == "Technology"
+        assert result[0].country == "United States"
+        mock_gemini.assert_called_once()
+        mock_ollama.assert_not_called()
+
+    @patch("core.universe._classify_sector_ollama")
+    @patch("core.universe._classify_sector_gemini")
+    @patch("core.universe._classify_sector_yfinance")
+    def test_fill_missing_sectors_falls_back_to_ollama_when_gemini_returns_none(
+        self, mock_yf, mock_gemini, mock_ollama,
+    ):
+        """yfinance None -> Gemini None -> Ollama used."""
+        mock_yf.return_value = (None, None)
+        mock_gemini.return_value = (None, None)
+        mock_ollama.return_value = ("Energy", "Canada")
+
+        stocks = [StockInfo("FAKE", "SMART", "", 0, 0, name="FAKE ENERGY CORP")]
+        result = _fill_missing_sectors(stocks)
+
+        assert len(result) == 1
+        assert result[0].sector == "Energy"
+        mock_gemini.assert_called_once()
+        mock_ollama.assert_called_once()
 
 
 class TestGetTickersForMarket:

@@ -116,7 +116,7 @@ Each scan cycle (every 15 minutes by default) executes the following pipeline:
 
 1. **Stale order re-evaluation** -- Check unfilled limit orders older than 24 hours, re-run the screener on each, and cancel orders that no longer pass technical screening
 2. **Market hours check** -- Determine if the US market is currently open
-3. **Universe building** -- Build/load the tradeable stock list (cached daily) using 10 IBKR scanner types, enrich each stock with sector data via a 3-tier fallback chain (IBKR contract details -> yfinance -> Ollama LLM), classify ETFs by category (equity ETFs kept, bond/leveraged/commodity ETFs excluded), then filter out financial sector stocks and apply liquidity thresholds. Typical result: ~200-350 unique stocks
+3. **Universe building** -- Build/load the tradeable stock list (cached daily) using 10 IBKR scanner types, enrich each stock with sector data via a 4-tier fallback chain (IBKR contract details -> yfinance -> Gemini -> Ollama), classify ETFs by category (equity ETFs kept, bond/leveraged/commodity ETFs excluded), then filter out financial sector stocks and apply liquidity thresholds. Typical result: ~200-350 unique stocks
 4. **Data fetching** -- Fetch historical OHLCV data for all stocks in the universe from IBKR (or YFinance fallback)
 5. **Technical screening** -- Run 6 technical indicators on every stock, score candidates, inject sector data from the universe into each candidate's indicator values (so risk checks can enforce sector limits), and pass all qualifying stocks (above min_score) to AI analysis
 6. **AI analysis** -- Send each candidate to the local LLM (via Ollama) with price action, indicators, and news context; receive structured trade recommendations with confidence scores
@@ -936,7 +936,7 @@ This system is designed with multiple layers of safety:
 
 13. **Circuit breaker** -- If the system takes 3 consecutive losing trades within 60 minutes (both configurable), all new trading is paused and a Telegram alert is sent. This catches regime changes, stale data, or systematic issues before the daily loss limit is hit.
 
-14. **3-tier sector fallback** -- Stock sector data is resolved through IBKR contract details, then yfinance, then Ollama LLM classification. Only stocks that fail all three are excluded.
+14. **4-tier sector fallback** -- Stock sector data is resolved through IBKR contract details, then yfinance, then Gemini, then Ollama. Gemini shares the same process-wide exhaustion flag as the AI analyst, so an auth failure or quota depletion in one path disables Gemini everywhere and the bot degrades cleanly to the Ollama-only path. Only stocks that fail all four are excluded.
 
 14. **News resilience** -- Stock-specific news is fetched from Tavily first (richer results), falling back to yfinance when Tavily errors (e.g. rate limit), is unconfigured, or returns nothing. Each fetch logs which source succeeded so fallback behavior is visible in logs. Successful news is cached for 1 hour; failed fetches use a 60-second cache so retries happen sooner. When Tavily signals plan/rate-limit exhaustion, a process-lifetime flag short-circuits subsequent calls directly to the yfinance fallback until the process restarts — avoids burning dozens of Tavily requests per cycle once the quota is hit. Candidates with zero headlines from both sources are dropped before the AI analyst call so the LLM only sees tickers with at least one external news signal.
 

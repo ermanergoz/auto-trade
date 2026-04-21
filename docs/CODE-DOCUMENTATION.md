@@ -399,16 +399,21 @@ Step 3.5: Enrich with contract details.
           IBKR pacing violations.
           This is what makes the financial sector filter actually work.
 
-Step 3.6: 3-tier sector fallback for stocks still missing sector data:
+Step 3.6: 4-tier sector fallback for stocks still missing sector data:
           1. yfinance — looks up sector and country via yf.Ticker().info
              For ETFs, checks the "category" field to classify as:
                - "Equity ETF" (SPY, QQQ, IWM — kept in universe)
                - "Bond ETF" (HYG, SGOV — excluded)
                - "Leveraged ETF" (TQQQ, SQQQ, SOXL — excluded)
                - "Non-Stock ETF" (BITO, USO, UVIX — excluded)
-          2. Ollama LLM — asks the local AI model to classify the stock
-             by sector and country (fast, ~128 tokens per query)
-          3. Exclude — if all three sources fail, the stock is excluded
+          2. Gemini — asks gemini-2.5-flash-lite to classify by sector
+             and country (fast ~1s, ~128 tokens). Shares the process-wide
+             _gemini_exhausted flag with core.analyst, so an auth failure
+             or quota depletion here turns Gemini off everywhere.
+          3. Ollama LLM — local fallback for when Gemini is unconfigured,
+             exhausted, or returned no sector (slow ~30-60s on CPU,
+             ~128 tokens per query)
+          4. Exclude — if all four sources fail, the stock is excluded
              since we can't safely filter financials without knowing the sector
 
 Step 4: Filter out:
@@ -433,8 +438,9 @@ Step 5: Cache the result as a JSON file for the rest of the day
 **Sector classification fallback** — what if IBKR doesn't know the sector?
 1. **IBKR contract details** — `reqContractDetails` returns `category` for most stocks
 2. **yfinance** — `yf.Ticker().info["sector"]` for stocks, `.info["category"]` for ETFs
-3. **Ollama LLM** — asks the local AI model to classify by sector and country
-4. **Exclude** — unclassifiable stocks are dropped (can't safely filter financials)
+3. **Gemini** — `gemini-2.5-flash-lite` classifies the ticker by sector and country (~1s, ~128 tokens). Skipped without an HTTP call when `GEMINI_API_KEY` is unset, `AI_PROVIDER != "gemini"`, or the shared `_gemini_exhausted` flag is latched.
+4. **Ollama LLM** — asks the local AI model to classify by sector and country when Gemini is unavailable or returned nothing
+5. **Exclude** — unclassifiable stocks are dropped (can't safely filter financials)
 
 **Stock news priority** — Tavily-first for richer results, yfinance as free fallback:
 1. **Tavily API** — primary source; richer headlines from a broader crawl
