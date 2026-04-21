@@ -308,6 +308,29 @@ class TestScreenStocks:
         signals = screen_stocks(stock_data, min_score=0.1)
         assert len(signals) == 50
 
+    def test_illiquid_ticker_dropped(self):
+        """Tickers with avg 20-day volume below MIN_DAILY_VOLUME must be
+        dropped before indicator analysis. The IBKR scanner fills
+        StockInfo.avg_volume=0, so the universe-level filter is a no-op
+        and this screener-level gate is the real liquidity guard."""
+        # Average volume ~10_000/day — well below MIN_DAILY_VOLUME (100k default)
+        closes = _flat(25, 100) + [65]  # would otherwise be a strong BUY
+        low_vol = [10_000] * 26
+        stock_data = {"ILLIQ": ("SMART", _make_df(closes, low_vol))}
+        signals = screen_stocks(stock_data, min_score=0.1)
+        assert signals == [], (
+            "Illiquid ticker (avg volume 10k < MIN_DAILY_VOLUME) should be "
+            "dropped even when indicators would otherwise fire"
+        )
+
+    def test_liquid_ticker_passes(self):
+        """Sanity: a ticker with adequate volume still generates candidates."""
+        closes = _flat(25, 100) + [65]
+        high_vol = [500_000] * 25 + [3_000_000]
+        stock_data = {"LIQ": ("SMART", _make_df(closes, high_vol))}
+        signals = screen_stocks(stock_data, min_score=0.1)
+        assert len(signals) >= 1, "Liquid ticker with strong indicators must pass"
+
     def test_signals_sorted_by_score(self):
         stock_data = {}
         # Stock with more signals should rank higher

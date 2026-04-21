@@ -21,6 +21,7 @@ from config.settings import (
     DEFAULT_STOP_LOSS_PCT, DEFAULT_TAKE_PROFIT_PCT,
     INDICATOR_WEIGHTS,
     MAX_EXTENSION_OVER_MA20_PCT,
+    MIN_DAILY_VOLUME,
 )
 from core.models import Signal, Action, TradeType
 
@@ -531,12 +532,29 @@ def screen_stocks(
     """
     candidates: list[tuple[float, Signal]] = []
     extended_skipped = 0
+    illiquid_skipped = 0
 
     for ticker, (exchange, df) in stock_data.items():
         if df.empty or len(df) < MA_SLOW + 1:
             continue
 
         try:
+            # Liquidity gate: the IBKR scanner fills StockInfo.avg_volume=0
+            # so universe._filter_universe no-ops the volume check. This is
+            # the real gate — compute 20-day mean volume from the historical
+            # OHLCV we already have and drop illiquid names before indicators
+            # even run. Without this, penny stocks with 1k/day volume can
+            # reach the AI analyst and incur unfillable-in-size positions.
+            if MIN_DAILY_VOLUME > 0 and "volume" in df.columns:
+                recent_vol = df["volume"].iloc[-20:]
+                if len(recent_vol) >= 5 and recent_vol.mean() < MIN_DAILY_VOLUME:
+                    illiquid_skipped += 1
+                    logger.debug(
+                        "Skipping %s: 20d avg volume %.0f < MIN_DAILY_VOLUME %d",
+                        ticker, recent_vol.mean(), MIN_DAILY_VOLUME,
+                    )
+                    continue
+
             if _is_extended(df, max_pct=max_extension_pct):
                 extended_skipped += 1
                 logger.debug(
@@ -564,7 +582,8 @@ def screen_stocks(
 
     logger.info(
         "Screener found %d candidates (from %d stocks, min_score=%.0f, "
-        "dropped %d extended)",
-        len(result), len(stock_data), min_score, extended_skipped,
+        "dropped %d extended, %d illiquid)",
+        len(result), len(stock_data), min_score,
+        extended_skipped, illiquid_skipped,
     )
     return result
