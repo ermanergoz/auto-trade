@@ -7,6 +7,21 @@ import pytest
 from core.models import Signal, Position, Action, TradeType
 
 
+@pytest.fixture(autouse=True)
+def drain_gemini_rate_limiter():
+    """Autouse across all tests: start each test with an empty Gemini rate-limit window.
+
+    core.analyst._gemini_rate_limiter is a module-level singleton that appends
+    a timestamp on every acquire(). Without draining between tests, any suite
+    that makes >10 Gemini calls (the default GEMINI_RPM_LIMIT) in <60s will
+    block on the 11th call for ~60s. Draining is cheap and idempotent.
+    """
+    from core import analyst as _a
+    with _a._gemini_rate_limiter._lock:
+        _a._gemini_rate_limiter._calls.clear()
+    yield
+
+
 def make_signal(**kwargs) -> Signal:
     """Create a Signal with sensible defaults for testing."""
     defaults = dict(

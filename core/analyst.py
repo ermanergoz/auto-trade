@@ -5,9 +5,11 @@ and _gemini_exhausted for the process-lifetime short-circuit that mirrors the
 Tavily->YFinance exhaustion pattern in core/data.py.
 """
 
+import collections
 import json
 import logging
 import threading
+import time
 import urllib.error
 import urllib.request
 from datetime import datetime
@@ -23,6 +25,7 @@ from config.settings import (
     GEMINI_API_KEY,
     GEMINI_HOST,
     GEMINI_MODEL,
+    GEMINI_RPM_LIMIT,
     OLLAMA_HOST,
     MIN_RISK_REWARD_RATIO,
 )
@@ -62,6 +65,42 @@ _GEMINI_EXHAUSTION_MARKERS = (
 def _is_permanent_gemini_exhaustion(body_text: str) -> bool:
     lowered = (body_text or "").lower()
     return any(marker in lowered for marker in _GEMINI_EXHAUSTION_MARKERS)
+
+
+class _RateLimiter:
+    """Sliding-window rate limiter: at most `rpm` calls per window_seconds.
+
+    Thread-safe; the lock only covers the deque bookkeeping — callers sleep
+    outside the lock so concurrent threads don't serialize on the wait itself.
+    Pass rpm<=0 to disable throttling entirely.
+    """
+
+    def __init__(self, rpm: int, window_seconds: float = 60.0):
+        self.rpm = rpm
+        self.window_seconds = window_seconds
+        self._calls: collections.deque = collections.deque()
+        self._lock = threading.Lock()
+
+    def acquire(self) -> None:
+        if self.rpm <= 0:
+            return
+        while True:
+            with self._lock:
+                now = time.monotonic()
+                while self._calls and self._calls[0] < now - self.window_seconds:
+                    self._calls.popleft()
+                if len(self._calls) < self.rpm:
+                    self._calls.append(now)
+                    return
+                sleep_for = self._calls[0] + self.window_seconds - now
+            # Sleep outside the lock so other threads can make progress.
+            time.sleep(max(sleep_for, 0.01))
+
+
+# Shared across every Gemini caller in the process (analyst + universe sector
+# classifier). Free tier for gemini-2.5-flash-lite is ~15 RPM; 10 is the default
+# and leaves slack for bursts.
+_gemini_rate_limiter = _RateLimiter(GEMINI_RPM_LIMIT)
 
 
 def _reset_daily_usage_if_needed() -> None:
@@ -248,17 +287,57 @@ class _GeminiTransportError(Exception):
     letting the router retry Gemini up to max_retries for the content issue."""
 
 
+def _gemini_response_schema() -> dict:
+    """JSON schema for Gemini structured output.
+
+    Forces every required field including trade_type — observed in production
+    on 2026-04-21 that Gemini 2.5 Flash-Lite was silently omitting trade_type,
+    triggering validator-driven retries that burned our free-tier RPM budget.
+    The schema makes the field mandatory at the model level.
+    """
+    action_enum = ["buy", "sell", "hold"] if ALLOW_SHORT_SELLING else ["buy", "hold"]
+    return {
+        "type": "object",
+        "properties": {
+            "action": {"type": "string", "enum": action_enum},
+            "confidence": {"type": "integer"},
+            "entry_price": {"type": "number"},
+            "stop_loss": {"type": "number"},
+            "take_profit": {"type": "number"},
+            "trade_type": {"type": "string", "enum": ["day", "swing"]},
+            "reasoning": {"type": "string"},
+        },
+        "required": [
+            "action", "confidence", "entry_price",
+            "stop_loss", "take_profit", "trade_type", "reasoning",
+        ],
+    }
+
+
+_GEMINI_MAX_429_RETRIES = 3
+
+
 def _call_gemini(prompt: str) -> Optional[dict]:
     """Call Gemini generateContent. Returns parsed JSON dict.
 
+    Rate-limiting + retry behavior:
+      - Every attempt first acquires a slot on _gemini_rate_limiter (sleeps if
+        needed to stay under GEMINI_RPM_LIMIT). Prevents bursty scans from
+        blowing through free-tier RPM in the first place.
+      - Transient 429 (per-minute rate limit — body does NOT match the
+        permanent-exhaustion markers): back off 2s/4s/8s and retry the same
+        call up to _GEMINI_MAX_429_RETRIES times before raising. Recovering
+        from a 429 is much cheaper than falling through to Ollama, which takes
+        5+ minutes per candidate on CPU hardware.
+
     Exhaustion signals that latch _gemini_exhausted for the rest of the process:
       - HTTP 401/403 (invalid key / permissions)
-      - HTTP 429 whose body matches _GEMINI_EXHAUSTION_MARKERS (credits depleted, etc.)
+      - HTTP 429 whose body matches _GEMINI_EXHAUSTION_MARKERS (credits depleted)
 
-    Any transport failure (5xx, transient 429, network error, exhausted auth)
-    raises _GeminiTransportError so the router can fall straight through to
-    Ollama. Content issues (bad envelope, unparseable inner JSON) return None
-    so the router can retry the provider.
+    Any transport failure (5xx, transient 429 after retries, network error,
+    exhausted auth) raises _GeminiTransportError so the router can fall
+    straight through to Ollama. Content issues (bad envelope, unparseable
+    inner JSON) return None so the router can retry the provider.
     """
     if not GEMINI_API_KEY or _gemini_exhausted.is_set():
         raise _GeminiTransportError("gemini unavailable (no key or exhausted)")
@@ -268,6 +347,7 @@ def _call_gemini(prompt: str) -> Optional[dict]:
         "contents": [{"parts": [{"text": prompt}]}],
         "generationConfig": {
             "responseMimeType": "application/json",
+            "responseSchema": _gemini_response_schema(),
             "maxOutputTokens": 1024,
             # thinkingBudget:0 disables thinking for 2.5-series models (avoids
             # latency blowup); ignored by 2.0 models.
@@ -279,24 +359,40 @@ def _call_gemini(prompt: str) -> Optional[dict]:
         url, data=payload, headers={"Content-Type": "application/json"},
     )
 
-    try:
-        response = urllib.request.urlopen(req, timeout=120)
-        raw = response.read()
-    except urllib.error.HTTPError as e:
-        body = e.read().decode("utf-8", errors="replace") if hasattr(e, "read") else ""
-        if e.code in (401, 403):
-            logger.warning("Gemini auth failed (%d) — latching exhausted flag: %s", e.code, body[:200])
-            _gemini_exhausted.set()
-            raise _GeminiTransportError(f"auth {e.code}") from e
-        if e.code == 429 and _is_permanent_gemini_exhaustion(body):
-            logger.warning("Gemini plan exhausted — short-circuiting for process lifetime: %s", body[:200])
-            _gemini_exhausted.set()
-            raise _GeminiTransportError("429 exhausted") from e
-        logger.warning("Gemini transient HTTP %d: %s", e.code, body[:200])
-        raise _GeminiTransportError(f"http {e.code}") from e
-    except urllib.error.URLError as e:
-        logger.warning("Gemini network error: %s", e)
-        raise _GeminiTransportError(f"network: {e}") from e
+    raw = None
+    for attempt in range(1, _GEMINI_MAX_429_RETRIES + 1):
+        _gemini_rate_limiter.acquire()
+        try:
+            response = urllib.request.urlopen(req, timeout=120)
+            raw = response.read()
+            break
+        except urllib.error.HTTPError as e:
+            body = e.read().decode("utf-8", errors="replace") if hasattr(e, "read") else ""
+            if e.code in (401, 403):
+                logger.warning("Gemini auth failed (%d) — latching exhausted flag: %s", e.code, body[:200])
+                _gemini_exhausted.set()
+                raise _GeminiTransportError(f"auth {e.code}") from e
+            if e.code == 429 and _is_permanent_gemini_exhaustion(body):
+                logger.warning("Gemini plan exhausted — short-circuiting for process lifetime: %s", body[:200])
+                _gemini_exhausted.set()
+                raise _GeminiTransportError("429 exhausted") from e
+            if e.code == 429 and attempt < _GEMINI_MAX_429_RETRIES:
+                backoff = 2 ** attempt  # 2s, 4s, 8s
+                logger.warning(
+                    "Gemini 429 (transient rate limit) — backing off %ds (attempt %d/%d)",
+                    backoff, attempt, _GEMINI_MAX_429_RETRIES,
+                )
+                time.sleep(backoff)
+                continue
+            logger.warning("Gemini transient HTTP %d: %s", e.code, body[:200])
+            raise _GeminiTransportError(f"http {e.code}") from e
+        except urllib.error.URLError as e:
+            logger.warning("Gemini network error: %s", e)
+            raise _GeminiTransportError(f"network: {e}") from e
+
+    if raw is None:
+        # Retry loop exited without success (all 429 attempts exhausted).
+        raise _GeminiTransportError("429 retries exhausted")
 
     try:
         envelope = json.loads(raw)
@@ -412,8 +508,9 @@ def _validate_response(data: dict) -> bool:
                 return False
             risk = entry - sl
             reward = tp - entry
-            if risk > 0 and reward / risk < MIN_RISK_REWARD_RATIO:
-                logger.warning("BUY R:R %.2f below minimum %.2f", reward / risk, MIN_RISK_REWARD_RATIO)
+            rr = reward / risk if risk > 0 else 0
+            if risk > 0 and round(rr, 2) < MIN_RISK_REWARD_RATIO:
+                logger.warning("BUY R:R %.2f below minimum %.2f", rr, MIN_RISK_REWARD_RATIO)
                 return False
         elif data["action"] == "sell":
             if sl <= entry:
@@ -424,8 +521,9 @@ def _validate_response(data: dict) -> bool:
                 return False
             risk = sl - entry
             reward = entry - tp
-            if risk > 0 and reward / risk < MIN_RISK_REWARD_RATIO:
-                logger.warning("SELL R:R %.2f below minimum %.2f", reward / risk, MIN_RISK_REWARD_RATIO)
+            rr = reward / risk if risk > 0 else 0
+            if risk > 0 and round(rr, 2) < MIN_RISK_REWARD_RATIO:
+                logger.warning("SELL R:R %.2f below minimum %.2f", rr, MIN_RISK_REWARD_RATIO)
                 return False
 
     return True
