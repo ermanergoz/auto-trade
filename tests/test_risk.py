@@ -1525,3 +1525,92 @@ class TestPDTRestrictionInEvaluate:
         )
         # Must not be rejected for PDT reasons above threshold
         assert not any("pdt" in r.lower() for r in result.reasons)
+
+
+class TestDailyLossLimitBaseline:
+    """Daily loss limit must use start-of-day equity as the denominator, not
+    current (post-loss) equity. Using current equity causes the limit dollar
+    amount to shrink as the portfolio loses value — the brake tightens while
+    losses accumulate, so the cap moves around within a single session.
+    """
+
+    def test_uses_start_of_day_equity_when_provided(self):
+        """When start_of_day_equity is supplied, limit is computed from it."""
+        # Start of day $100k, down to $95k MTM, limit is 2% of $100k = $2000.
+        # Current loss is -$5000 which exceeds $2000 → reject.
+        ok, reason = check_daily_loss_limit(
+            daily_pnl=-5000.0,
+            portfolio_value=95_000.0,
+            limit_pct=2.0,
+            start_of_day_equity=100_000.0,
+        )
+        assert ok is False
+        assert "2000" in reason or "2,000" in reason
+
+    def test_backwards_compatible_without_start_of_day_equity(self):
+        """When start_of_day_equity is not provided, use portfolio_value (legacy)."""
+        ok, _ = check_daily_loss_limit(
+            daily_pnl=-500.0,
+            portfolio_value=100_000.0,
+            limit_pct=2.0,
+        )
+        assert ok is True
+
+    def test_start_of_day_equity_distinct_from_current(self):
+        """Passing a larger start_of_day_equity yields a larger (correct) limit."""
+        # If only current portfolio_value were used: 2% of $90k = $1800 → -$1900 rejects
+        # But start_of_day = $100k: 2% of $100k = $2000 → -$1900 passes
+        ok, _ = check_daily_loss_limit(
+            daily_pnl=-1900.0,
+            portfolio_value=90_000.0,
+            limit_pct=2.0,
+            start_of_day_equity=100_000.0,
+        )
+        assert ok is True
+
+    def test_invalid_start_of_day_equity_falls_back(self):
+        """Zero or negative start_of_day_equity falls back to portfolio_value."""
+        ok, _ = check_daily_loss_limit(
+            daily_pnl=-500.0,
+            portfolio_value=100_000.0,
+            limit_pct=2.0,
+            start_of_day_equity=0.0,
+        )
+        assert ok is True
+
+    def test_evaluate_accepts_start_of_day_equity(self):
+        """evaluate() must pass start_of_day_equity to the daily-loss check."""
+        sig = _make_signal()
+        # Current portfolio has drawn down but start-of-day was higher.
+        # Loss $-1800 would exceed 2% of $90k ($1800) but is under 2% of $100k ($2000).
+        result = evaluate(
+            sig, [], portfolio_value=90_000.0, daily_pnl=-1800.0,
+            start_of_day_equity=100_000.0,
+        )
+        # Loss-limit check itself must pass (the limit is based on start-of-day)
+        assert not any("halted" in r.lower() for r in result.reasons)
+
+
+class TestSectorConcentrationMissingSector:
+    """Missing sector must not silently bypass the concentration cap.
+
+    Universe builder excludes stocks whose sector cannot be resolved, so a
+    signal reaching the risk manager with no sector indicates the signal
+    bypassed that filter (backtest/dry-run). The risk manager must at least
+    record this so operators notice.
+    """
+
+    def test_missing_sector_logs_warning(self, caplog):
+        """A signal with no sector data logs a WARNING about bypass."""
+        import logging
+
+        from core.risk import check_sector_concentration
+
+        sig = _make_signal(ticker="XYZ")  # no indicator_values["sector"]
+        with caplog.at_level(logging.WARNING, logger="core.risk"):
+            ok, _ = check_sector_concentration(sig, [], 100_000)
+        assert ok is True  # soft gate — passes but logs
+        assert any(
+            "sector" in rec.message.lower() and "xyz" in rec.message.lower()
+            for rec in caplog.records
+        ), "Expected WARNING about missing sector for XYZ"

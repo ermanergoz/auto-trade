@@ -158,8 +158,34 @@ def run_scan_cycle(
     from core.connection import get_account_summary
     account = get_account_summary(ib)
     portfolio_value = account.get("NetLiquidation", 0)
-    daily_pnl = get_daily_pnl(unrealized_pnl=account.get("UnrealizedPnL", 0.0))
     open_positions = get_open_positions()
+
+    # Snapshot start-of-day equity on ET date rollover. The daily-loss-limit
+    # cap must reference a stable baseline; using live MTM equity would let
+    # the dollar threshold shrink as losses accumulate, tightening the brake
+    # precisely when stability is needed most.
+    _us_eastern = ZoneInfo("America/New_York")
+    today_et = datetime.now(_us_eastern).date()
+    if _state.start_of_day_date != today_et and portfolio_value > 0:
+        _state.start_of_day_equity = portfolio_value
+        _state.start_of_day_date = today_et
+        logger.info(
+            "Start-of-day equity snapshot (%s ET): $%.2f", today_et, portfolio_value,
+        )
+    start_of_day_equity = _state.start_of_day_equity
+
+    # daily_pnl for the loss-limit check must be today's EQUITY CHANGE, not
+    # realized_today + total-unrealized. IBKR's UnrealizedPnL is cumulative
+    # across all positions — for swing positions opened days ago it includes
+    # prior-day gains/losses, which would double-count historical P&L into
+    # today's loss-limit comparison. Using the snapshot-delta is self
+    # consistent with the start_of_day_equity baseline.
+    if start_of_day_equity and start_of_day_equity > 0:
+        daily_pnl = portfolio_value - start_of_day_equity
+    else:
+        # First scan before snapshot exists — fall back to the legacy
+        # realized+unrealized sum. This is only relevant pre-snapshot.
+        daily_pnl = get_daily_pnl(unrealized_pnl=account.get("UnrealizedPnL", 0.0))
     update_portfolio_data(account, open_positions, daily_pnl)
 
     # Fetch macro/political headlines once for all candidates
@@ -266,7 +292,12 @@ def run_scan_cycle(
             # Refresh account state to capture any fills since scan start
             fresh_account = get_account_summary(ib)
             portfolio_value = fresh_account.get("NetLiquidation", portfolio_value)
-            fresh_daily_pnl = get_daily_pnl(unrealized_pnl=fresh_account.get("UnrealizedPnL", 0.0))
+            # Today's equity change (MTM), not realized+cumulative-unrealized.
+            # See daily_pnl computation above for rationale.
+            if start_of_day_equity and start_of_day_equity > 0:
+                fresh_daily_pnl = portfolio_value - start_of_day_equity
+            else:
+                fresh_daily_pnl = get_daily_pnl(unrealized_pnl=fresh_account.get("UnrealizedPnL", 0.0))
 
             # Fetch current price for anti-momentum check
             sig_df = stock_data.get(signal.ticker, (None, None))[1]
@@ -291,7 +322,12 @@ def run_scan_cycle(
             analyst_data = get_analyst_recommendation(signal.ticker)
             analyst_consensus = analyst_data["consensus"] if analyst_data else None
 
-            result = evaluate(signal, open_positions, portfolio_value, fresh_daily_pnl, current_price=current_price, recent_trades=recent_trades, analyst_consensus=analyst_consensus)
+            result = evaluate(
+                signal, open_positions, portfolio_value, fresh_daily_pnl,
+                current_price=current_price, recent_trades=recent_trades,
+                analyst_consensus=analyst_consensus,
+                start_of_day_equity=start_of_day_equity,
+            )
             if not result.approved:
                 logger.info("Risk rejected %s: %s", signal.ticker, "; ".join(result.reasons))
                 if any("circuit breaker" in r.lower() for r in result.reasons):

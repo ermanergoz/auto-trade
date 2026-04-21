@@ -202,8 +202,13 @@ class TestShortSellingGate:
     # ---- Validator gating ----
 
     @patch("core.analyst.ALLOW_SHORT_SELLING", False)
-    def test_validator_rejects_sell_when_shorts_disabled(self):
-        assert _validate_response(self._valid_sell()) is False
+    def test_validator_accepts_sell_when_shorts_disabled(self):
+        """The validator is structural only — the short-selling gate lives in
+        risk.check_short_selling, which can distinguish a short-open (blocked)
+        from closing a held long (allowed). Rejecting SELL here would prevent
+        AI-driven exits on held positions even when shorts are disabled.
+        """
+        assert _validate_response(self._valid_sell()) is True
 
     @patch("core.analyst.ALLOW_SHORT_SELLING", True)
     def test_validator_accepts_sell_when_shorts_enabled(self):
