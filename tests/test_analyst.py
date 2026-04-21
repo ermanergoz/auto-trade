@@ -494,13 +494,11 @@ def _mock_http_response(body: bytes) -> MagicMock:
 
 @pytest.fixture
 def reset_analyst_state():
-    """Clear process-wide Gemini exhaustion flag, token counters, and rate limiter.
+    """Clear process-wide Gemini exhaustion flag and zero per-provider token counters.
 
     Autouse-style in every provider-routing / token test — state must not leak
-    across cases because _gemini_exhausted, _daily_token_usage, and the shared
-    _gemini_rate_limiter deque are module globals in core.analyst. Without
-    clearing the rate limiter, consecutive _call_gemini tests accumulate
-    timestamps and later tests sleep ~60s waiting for slots.
+    across cases because _gemini_exhausted and _daily_token_usage are module
+    globals in core.analyst.
     """
     from core import analyst as _a
     _a._gemini_exhausted.clear()
@@ -509,12 +507,8 @@ def reset_analyst_state():
     _a._daily_token_usage["ollama"]["input"] = 0
     _a._daily_token_usage["ollama"]["output"] = 0
     _a._daily_token_usage["date"] = None
-    with _a._gemini_rate_limiter._lock:
-        _a._gemini_rate_limiter._calls.clear()
     yield
     _a._gemini_exhausted.clear()
-    with _a._gemini_rate_limiter._lock:
-        _a._gemini_rate_limiter._calls.clear()
 
 
 class TestProviderConfigImports:
@@ -776,146 +770,6 @@ class TestGeminiCallContract:
         payload = self._extract_payload(mu)
         action_enum = payload["generationConfig"]["responseSchema"]["properties"]["action"]["enum"]
         assert set(action_enum) == {"buy", "sell", "hold"}
-
-
-class TestGeminiRateLimiter:
-    """Client-side throttle prevents free-tier 429 bursts.
-
-    Production log on 2026-04-21 showed the bot firing ~30+ Gemini calls in a
-    few seconds across 31 candidates × 1-3 retries each, blowing the ~15 RPM
-    free-tier limit and falling through to Ollama (330s per candidate). The
-    rate limiter sleeps the caller until a slot frees up in the sliding window.
-    """
-
-    @pytest.fixture
-    def reset_rate_limiter(self):
-        """Drain the shared limiter's window between tests."""
-        from core.analyst import _gemini_rate_limiter
-        with _gemini_rate_limiter._lock:
-            _gemini_rate_limiter._calls.clear()
-        yield
-        with _gemini_rate_limiter._lock:
-            _gemini_rate_limiter._calls.clear()
-
-    def test_acquire_allows_up_to_rpm_without_sleeping(self, reset_rate_limiter):
-        from core.analyst import _RateLimiter
-        limiter = _RateLimiter(rpm=3, window_seconds=60.0)
-        with patch("core.analyst.time.sleep") as mock_sleep:
-            for _ in range(3):
-                limiter.acquire()
-        assert mock_sleep.call_count == 0
-
-    def test_acquire_sleeps_when_limit_reached(self, reset_rate_limiter):
-        """4th call with rpm=3 must sleep until the oldest timestamp ages out."""
-        from core.analyst import _RateLimiter
-        limiter = _RateLimiter(rpm=3, window_seconds=60.0)
-
-        times = [100.0, 100.1, 100.2, 100.3, 160.4]  # 4th call at t=100.3
-        with patch("core.analyst.time.monotonic", side_effect=times), \
-             patch("core.analyst.time.sleep") as mock_sleep:
-            for _ in range(4):
-                limiter.acquire()
-
-        assert mock_sleep.call_count == 1
-        # First call was at 100.0, window is 60s, so sleep ~= (100.0+60) - 100.3 = 59.7
-        slept = mock_sleep.call_args[0][0]
-        assert 59.5 <= slept <= 60.0
-
-    def test_acquire_does_nothing_when_rpm_is_zero(self, reset_rate_limiter):
-        """rpm=0 disables throttling entirely."""
-        from core.analyst import _RateLimiter
-        limiter = _RateLimiter(rpm=0, window_seconds=60.0)
-        with patch("core.analyst.time.sleep") as mock_sleep:
-            for _ in range(100):
-                limiter.acquire()
-        assert mock_sleep.call_count == 0
-
-    def test_call_gemini_acquires_slot_before_request(
-        self, reset_rate_limiter, reset_analyst_state,
-    ):
-        """Every _call_gemini hit must pass through the rate limiter."""
-        from core.analyst import _call_gemini
-        with patch("core.analyst._gemini_rate_limiter.acquire") as mock_acquire, \
-             patch("core.analyst.urllib.request.urlopen") as mu, \
-             patch("core.analyst.GEMINI_API_KEY", "dummy"):
-            mu.return_value = _mock_http_response(_gemini_success_body(
-                _valid_llm_response_text(),
-            ))
-            _call_gemini("prompt")
-        assert mock_acquire.call_count >= 1
-
-
-class TestGemini429RetryBackoff:
-    """Transient 429s retry with exponential backoff before giving up.
-
-    Previous behavior: one 429 fell straight through to Ollama (330s per
-    candidate — blocks the whole scan). New behavior: retry the same Gemini
-    call up to 3 times with 2s/4s/8s backoff; only give up after all retries.
-    """
-
-    def _make_http_error(self, code: int, body: bytes):
-        import io
-        import urllib.error
-        return urllib.error.HTTPError(
-            url="https://generativelanguage.googleapis.com/fake",
-            code=code, msg="error", hdrs=None, fp=io.BytesIO(body),
-        )
-
-    def test_transient_429_retries_and_succeeds(self, reset_analyst_state):
-        """First call 429s (transient), second call succeeds — caller sees success."""
-        from core import analyst
-        from core.analyst import _call_gemini
-        transient_body = b'{"error":{"message":"Quota exceeded per minute"}}'
-        success_body = _gemini_success_body(_valid_llm_response_text())
-        with patch("core.analyst.urllib.request.urlopen") as mu, \
-             patch("core.analyst.GEMINI_API_KEY", "dummy"), \
-             patch("core.analyst.time.sleep") as mock_sleep, \
-             patch("core.analyst._gemini_rate_limiter.acquire"):
-            mu.side_effect = [
-                self._make_http_error(429, transient_body),
-                _mock_http_response(success_body),
-            ]
-            result = _call_gemini("prompt")
-
-        assert result is not None
-        assert mu.call_count == 2
-        assert mock_sleep.call_count >= 1
-        assert analyst._gemini_exhausted.is_set() is False
-
-    def test_transient_429_exhausts_retries_then_raises(self, reset_analyst_state):
-        """After max retries of 429, raise transport error so router falls to Ollama."""
-        from core import analyst
-        from core.analyst import _call_gemini, _GeminiTransportError
-        transient_body = b'{"error":{"message":"Quota exceeded per minute"}}'
-        with patch("core.analyst.urllib.request.urlopen") as mu, \
-             patch("core.analyst.GEMINI_API_KEY", "dummy"), \
-             patch("core.analyst.time.sleep"), \
-             patch("core.analyst._gemini_rate_limiter.acquire"):
-            mu.side_effect = [self._make_http_error(429, transient_body)] * 5
-            with pytest.raises(_GeminiTransportError):
-                _call_gemini("prompt")
-
-        # At least 3 attempts made before giving up
-        assert mu.call_count >= 3
-        # Transient 429s must NOT latch the exhausted flag
-        assert analyst._gemini_exhausted.is_set() is False
-
-    def test_permanent_429_raises_immediately_without_retrying(self, reset_analyst_state):
-        """Permanent-exhaustion 429 must latch the flag and bail after the first call."""
-        from core import analyst
-        from core.analyst import _call_gemini, _GeminiTransportError
-        permanent_body = b'{"error":{"message":"Free tier limit reached forever"}}'
-        with patch("core.analyst.urllib.request.urlopen") as mu, \
-             patch("core.analyst.GEMINI_API_KEY", "dummy"), \
-             patch("core.analyst.time.sleep") as mock_sleep, \
-             patch("core.analyst._gemini_rate_limiter.acquire"):
-            mu.side_effect = self._make_http_error(429, permanent_body)
-            with pytest.raises(_GeminiTransportError):
-                _call_gemini("prompt")
-
-        assert mu.call_count == 1, "permanent 429 must not retry"
-        assert mock_sleep.call_count == 0, "permanent 429 must not sleep/backoff"
-        assert analyst._gemini_exhausted.is_set() is True
 
 
 class TestLLMProviderRouting:

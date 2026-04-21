@@ -587,17 +587,11 @@ Two failure modes drive routing:
 - HTTP 401/403 — invalid key or missing permissions
 - HTTP 429 with a body matching `_GEMINI_EXHAUSTION_MARKERS` — prepayment credits depleted, free-tier `limit: 0`, usage-limit hit
 
-Markers are intentionally tighter than Tavily's: Gemini emits "Quota exceeded per minute" for transient per-minute rate limits, so a bare `"quota"` marker would false-positive and latch the flag on a recoverable condition. Transient 429s (per-minute caps) don't latch; instead the call retries the same prompt with 2s/4s/8s exponential backoff (`_GEMINI_MAX_429_RETRIES`) before raising `_GeminiTransportError` to the router. In practice recovering from a rate-limit in a few seconds is much cheaper than a 5-minute CPU-Ollama fallback.
-
-#### Client-side rate limit (`_gemini_rate_limiter`)
-
-A module-level `_RateLimiter` instance enforces a sliding-window cap of `GEMINI_RPM_LIMIT` calls per 60 seconds (default: 10, safely under the ~15 RPM free-tier ceiling). Every Gemini caller in the process — the analyst's `_call_gemini` and `core.universe._classify_sector_gemini` — calls `_gemini_rate_limiter.acquire()` before each HTTP request. `acquire()` sleeps outside the lock if the window is full, so concurrent callers don't serialize on the wait. Set `GEMINI_RPM_LIMIT=0` to disable throttling (e.g., on a paid tier with much higher limits).
-
-The tests' autouse `drain_gemini_rate_limiter` fixture in `tests/conftest.py` clears the deque between cases so the 11th consecutive unit test doesn't block for ~60s waiting for a slot.
+Markers are intentionally tighter than Tavily's: Gemini emits "Quota exceeded per minute" for transient per-minute rate limits, so a bare `"quota"` marker would false-positive and latch the flag on a recoverable condition. Transient 429s (per-minute caps) fall back for just this call; the next call tries Gemini again.
 
 #### Structured output (`_gemini_response_schema`)
 
-Gemini 2.5 Flash-Lite was observed dropping `trade_type` on a majority of responses, triggering validator retries that burned the RPM budget. The fix: every `_call_gemini` payload now includes a `responseSchema` in `generationConfig` that lists `trade_type` (and every other required field) as mandatory. The `action` enum adapts to `ALLOW_SHORT_SELLING` — when shorts are disabled the schema only offers `["buy", "hold"]`, closing the same loophole the prompt already closed so the model can't emit a `sell` even if it wanted to.
+Gemini 2.5 Flash-Lite was observed dropping `trade_type` on a majority of responses, triggering validator retries that wasted time on re-prompts. The fix: every `_call_gemini` payload now includes a `responseSchema` in `generationConfig` that lists `trade_type` (and every other required field) as mandatory. The `action` enum adapts to `ALLOW_SHORT_SELLING` — when shorts are disabled the schema only offers `["buy", "hold"]`, closing the same loophole the prompt already closed so the model can't emit a `sell` even if it wanted to.
 
 #### Per-provider token tracking
 

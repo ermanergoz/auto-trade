@@ -375,7 +375,6 @@ All trading parameters are configured in `config/settings.py`. Key settings:
 | `AI_PROVIDER` | `gemini` | Primary LLM provider. `gemini` falls back to Ollama on error; `ollama` skips Gemini entirely |
 | `GEMINI_MODEL` | `gemini-2.5-flash-lite` | Gemini model; `gemini-2.5-flash` is smarter but occasionally rate-limited |
 | `GEMINI_HOST` | `https://generativelanguage.googleapis.com` | Gemini API host (override for testing) |
-| `GEMINI_RPM_LIMIT` | `10` | Client-side throttle (calls per 60s sliding window). Free tier is ~15 RPM; set to `0` to disable throttling |
 | `AI_MODEL` | `qwen3:8b` | Ollama fallback model |
 
 #### Risk Settings
@@ -569,9 +568,7 @@ The LLM returns a structured JSON response:
 }
 ```
 
-Gemini calls send a `responseSchema` in `generationConfig` that marks every field (including `trade_type`) as required — this pins the model to a well-formed JSON shape so validator-driven retries stop eating the RPM budget. Response validation then rechecks all required fields, rejects malformed responses, and tolerates R:R values at the boundary (`round(rr, 2) < MIN_RISK_REWARD_RATIO`) so floating-point math doesn't reject trades that were right on the line. Content-level failures (malformed envelope, invalid JSON) trigger provider-internal retries up to 3 times.
-
-A client-side rate limiter (see `GEMINI_RPM_LIMIT`) throttles calls to stay under the free-tier 15 RPM cap; every Gemini call — analyst and sector-classifier alike — draws from the same shared budget. On a transient HTTP 429 (per-minute rate limit, body doesn't match the permanent-exhaustion markers) the call retries the same prompt with 2s/4s/8s backoff before falling through to Ollama. Recovering from a 429 in seconds is much cheaper than a 5-minute Ollama fallback. Permanent exhaustion (credits depleted, free-tier limit reached, auth failure) still latches `_gemini_exhausted` and short-circuits all Gemini calls for the rest of the process.
+Gemini calls send a `responseSchema` in `generationConfig` that marks every field (including `trade_type`) as required — this pins the model to a well-formed JSON shape so validator-driven retries stop firing on missing fields. Response validation then rechecks all required fields, rejects malformed responses, and tolerates R:R values at the boundary (`round(rr, 2) < MIN_RISK_REWARD_RATIO`) so floating-point math doesn't reject trades that were right on the line. Content-level failures (malformed envelope, invalid JSON) trigger provider-internal retries up to 3 times; transport failures on Gemini (including transient 429) fall straight through to Ollama. Permanent exhaustion (credits depleted, free-tier limit reached, auth failure) latches `_gemini_exhausted` and short-circuits all Gemini calls for the rest of the process.
 
 ### Filtering
 

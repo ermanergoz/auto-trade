@@ -483,30 +483,6 @@ class TestGeminiSectorFallback:
 
     @patch("core.universe.GEMINI_API_KEY", "fake-key")
     @patch("core.universe.urllib.request.urlopen")
-    def test_classify_sector_gemini_acquires_rate_limiter(
-        self, mock_urlopen, reset_gemini_state,
-    ):
-        """The sector classifier must share the analyst's rate-limit budget.
-
-        Without this, a single scan can burn all 15 RPM on sector lookups
-        before the analyst ever gets a Gemini slot.
-        """
-        mock_response = MagicMock()
-        mock_response.read.return_value = self._gemini_body(
-            json.dumps({"sector": "Technology", "country": "US"})
-        )
-        mock_urlopen.return_value = mock_response
-
-        from unittest.mock import patch as _patch
-        with _patch("core.analyst._gemini_rate_limiter.acquire") as mock_acquire:
-            _classify_sector_gemini("AAPL", "APPLE INC")
-
-        assert mock_acquire.call_count >= 1, (
-            "sector classifier must acquire a rate-limit slot before the HTTP call"
-        )
-
-    @patch("core.universe.GEMINI_API_KEY", "fake-key")
-    @patch("core.universe.urllib.request.urlopen")
     def test_classify_sector_gemini_returns_none_on_transient_http_error(
         self, mock_urlopen, reset_gemini_state,
     ):

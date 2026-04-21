@@ -289,10 +289,8 @@ def _classify_sector_gemini(
     Returns (sector, country) or (None, None) on failure.
     """
     # Import here to avoid a circular-import risk and to always observe the
-    # current state of the shared flag + rate limiter.
-    from core.analyst import (
-        _gemini_exhausted, _gemini_rate_limiter, _is_permanent_gemini_exhaustion,
-    )
+    # current state of the shared flag.
+    from core.analyst import _gemini_exhausted, _is_permanent_gemini_exhaustion
 
     if not GEMINI_API_KEY or AI_PROVIDER != "gemini" or _gemini_exhausted.is_set():
         return None, None
@@ -310,10 +308,6 @@ def _classify_sector_gemini(
     req = urllib.request.Request(
         url, data=payload, headers={"Content-Type": "application/json"},
     )
-
-    # Share the analyst's process-wide RPM budget — prevents sector lookups
-    # from starving the analyst (or vice versa) on the free tier.
-    _gemini_rate_limiter.acquire()
 
     try:
         response = urllib.request.urlopen(req, timeout=30)

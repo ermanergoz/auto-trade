@@ -82,10 +82,6 @@ AI_PROVIDER = os.getenv("AI_PROVIDER", "gemini").lower()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite")
 GEMINI_HOST = os.getenv("GEMINI_HOST", "https://generativelanguage.googleapis.com")
-# Client-side throttle (calls per 60s sliding window). Free tier for
-# gemini-2.5-flash-lite is ~15 RPM; 10 keeps us safely under the limit even
-# with validator retries. Set to 0 to disable throttling.
-GEMINI_RPM_LIMIT = int(os.getenv("GEMINI_RPM_LIMIT", "10"))
 
 # Ollama (fallback) — local, no key required.
 AI_MODEL = os.getenv("AI_MODEL", "qwen2.5:7b")
