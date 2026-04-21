@@ -168,7 +168,11 @@ DATA_DIR = _project_root / "data"
 # Backtesting
 # ---------------------------------------------------------------------------
 BACKTEST_SLIPPAGE_PCT = 0.1
-BACKTEST_COMMISSION = 1.0  # $ per trade
+# IBKR tiered pricing: $0.005/share with $1 minimum per order. A flat
+# per-trade commission systematically understates friction on large
+# positions (1000+ shares) and inflates reported Sharpe/profit factor.
+BACKTEST_COMMISSION = 1.0             # Minimum $ per trade (IBKR min)
+BACKTEST_COMMISSION_PER_SHARE = 0.005  # $ per share on top of the minimum
 RISK_FREE_RATE = 0.05  # for Sharpe ratio
 
 # ---------------------------------------------------------------------------

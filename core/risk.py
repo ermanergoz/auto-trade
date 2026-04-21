@@ -87,16 +87,30 @@ def check_daily_loss_limit(
     daily_pnl: float,
     portfolio_value: float,
     limit_pct: float = DAILY_LOSS_LIMIT_PCT,
+    start_of_day_equity: Optional[float] = None,
 ) -> tuple[bool, str]:
-    """Today's P&L must not have breached the daily loss limit."""
+    """Today's P&L must not have breached the daily loss limit.
+
+    The limit is a fraction of the START-OF-DAY equity, not the current
+    (post-loss) equity. Using current equity as the denominator lets the
+    dollar threshold drift down as losses accumulate, causing the cap to
+    tighten just as the trader most needs a stable reference point.
+
+    Args:
+        daily_pnl: Today's P&L (realized + unrealized).
+        portfolio_value: Current mark-to-market equity (fallback only).
+        start_of_day_equity: Equity at session open. Required for a stable
+            cap; when None or non-positive, falls back to portfolio_value.
+    """
     if portfolio_value <= 0:
         return False, "Portfolio value is zero or negative"
 
-    limit_amount = portfolio_value * (limit_pct / 100)
+    baseline = start_of_day_equity if (start_of_day_equity and start_of_day_equity > 0) else portfolio_value
+    limit_amount = baseline * (limit_pct / 100)
     if daily_pnl < -limit_amount:
         return False, (
             f"Daily loss ${daily_pnl:.2f} exceeds limit "
-            f"-${limit_amount:.2f} ({limit_pct}% of ${portfolio_value:.2f}). "
+            f"-${limit_amount:.2f} ({limit_pct}% of ${baseline:.2f}). "
             "Trading halted for today."
         )
     return True, ""
@@ -160,7 +174,17 @@ def check_sector_concentration(
     # (using entry_price * quantity as estimate)
     sector = (getattr(signal, "indicator_values", None) or {}).get("sector", "")
     if not sector:
-        return True, ""  # Unknown sector, let it through
+        # Universe builder excludes stocks whose sector cannot be resolved,
+        # so a missing sector here means the signal bypassed that filter
+        # (backtest injection, dry-run, or direct screener use). Let it
+        # through — backtests often lack sector data — but log prominently
+        # so operators notice a concentration gate silently softened.
+        logger.warning(
+            "Sector concentration bypass: signal for %s has no sector — "
+            "concentration limit not enforced for this signal",
+            signal.ticker,
+        )
+        return True, ""
 
     sector_value = sum(
         (p.current_price or p.entry_price) * abs(p.quantity)
@@ -530,7 +554,15 @@ def check_correlation(
             continue
         # Align on shared index — pandas .corr handles length mismatch via index alignment
         aligned_candidate, aligned_other = candidate_returns.align(other, join="inner")
-        if len(aligned_candidate.dropna()) < min_periods:
+        candidate_clean = aligned_candidate.dropna()
+        other_clean = aligned_other.dropna()
+        if len(candidate_clean) < min_periods or len(other_clean) < min_periods:
+            continue
+        # Zero-variance series (halted stock, brand-new listing with repeated
+        # closes) produce a NaN correlation from numpy with a divide-by-zero
+        # warning. Skip the pair explicitly so the check doesn't rely on
+        # NaN-swallowing and doesn't spam logs.
+        if candidate_clean.std() == 0 or other_clean.std() == 0:
             continue
         corr = aligned_candidate.corr(aligned_other)
         if pd.isna(corr):
@@ -756,6 +788,7 @@ def evaluate(
     analyst_consensus: str | None = None,
     returns_lookup: dict[str, pd.Series] | None = None,
     correlation_threshold: float = CORRELATION_CAP_THRESHOLD,
+    start_of_day_equity: Optional[float] = None,
 ) -> RiskResult:
     """Run all risk checks on a signal. Returns RiskResult.
 
@@ -800,7 +833,7 @@ def evaluate(
     checks = [
         check_short_selling(signal, open_positions),
         check_position_size(signal, portfolio_value),
-        check_daily_loss_limit(daily_pnl, portfolio_value),
+        check_daily_loss_limit(daily_pnl, portfolio_value, start_of_day_equity=start_of_day_equity),
         check_cumulative_risk(signal, open_positions, portfolio_value,
                               position_size=estimated_size),
         check_max_positions(signal, open_positions),

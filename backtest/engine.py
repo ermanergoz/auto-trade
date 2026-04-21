@@ -12,7 +12,7 @@ from typing import Optional
 import pandas as pd
 
 from config.settings import (
-    BACKTEST_SLIPPAGE_PCT, BACKTEST_COMMISSION,
+    BACKTEST_SLIPPAGE_PCT, BACKTEST_COMMISSION, BACKTEST_COMMISSION_PER_SHARE,
     DEFAULT_STOP_LOSS_PCT, DEFAULT_TAKE_PROFIT_PCT,
     MAX_EXTENSION_OVER_MA20_PCT,
 )
@@ -37,11 +37,33 @@ class SimulatedPortfolio:
     trades: list[Trade] = field(default_factory=list)
     equity_curve: list[tuple[date, float]] = field(default_factory=list)
     slippage_pct: float = BACKTEST_SLIPPAGE_PCT
+    # commission is now the MINIMUM per order (IBKR $1 floor);
+    # commission_per_share is added on top — matches IBKR tiered pricing.
+    # A flat per-trade fee undercounts friction on large positions.
     commission: float = BACKTEST_COMMISSION
+    commission_per_share: float = BACKTEST_COMMISSION_PER_SHARE
 
     def __post_init__(self):
         if self.cash == 0:
             self.cash = self.initial_capital
+        # If the caller explicitly disables the minimum commission (common in
+        # tests isolating other mechanics), also zero the per-share fee so
+        # the total commission is actually zero. Without this, setting only
+        # commission=0 would still charge commission_per_share × quantity.
+        if self.commission <= 0:
+            self.commission_per_share = 0.0
+
+    def _commission_for(self, quantity: int) -> float:
+        """IBKR-style commission: max(min, per_share * qty).
+
+        Flat minimum + per-share fee. Mirrors IBKR tiered pricing
+        (~$0.005/share, $1 minimum). A flat-per-trade model would
+        underestimate friction on large positions and inflate Sharpe.
+        """
+        if self.commission <= 0 and self.commission_per_share <= 0:
+            return 0.0
+        per_share = abs(quantity) * max(self.commission_per_share, 0.0)
+        return max(self.commission, per_share)
 
     def portfolio_value_mtm(self, current_prices: dict[str, float] | None = None) -> float:
         """Mark-to-market portfolio value using current prices when available."""
@@ -96,9 +118,10 @@ class SimulatedPortfolio:
                 stop_loss = adjusted_price * (1 + sl_pct)
                 take_profit = adjusted_price * (1 - tp_pct)
 
+        entry_commission = self._commission_for(quantity)
         if signal.action == Action.BUY:
             # Long: debit cash (pay for shares)
-            cost = adjusted_price * quantity + self.commission
+            cost = adjusted_price * quantity + entry_commission
             if cost > self.cash:
                 logger.debug("Insufficient cash for %s: need $%.2f, have $%.2f",
                             signal.ticker, cost, self.cash)
@@ -107,7 +130,7 @@ class SimulatedPortfolio:
             stored_quantity = quantity
         else:
             # Short: credit cash (receive sale proceeds)
-            self.cash += adjusted_price * quantity - self.commission
+            self.cash += adjusted_price * quantity - entry_commission
             stored_quantity = -quantity
 
         self.positions.append(Position(
@@ -138,7 +161,8 @@ class SimulatedPortfolio:
             adjusted_exit = exit_price * (1 - self.slippage_pct / 100)
         else:  # short: buying back, slippage raises exit price
             adjusted_exit = exit_price * (1 + self.slippage_pct / 100)
-        self.cash += adjusted_exit * pos.quantity - self.commission
+        exit_commission = self._commission_for(pos.quantity)
+        self.cash += adjusted_exit * pos.quantity - exit_commission
 
         trade = Trade(
             ticker=pos.ticker,
@@ -256,6 +280,7 @@ class BacktestConfig:
     initial_capital: float = 100_000.0
     slippage_pct: float = BACKTEST_SLIPPAGE_PCT
     commission: float = BACKTEST_COMMISSION
+    commission_per_share: float = BACKTEST_COMMISSION_PER_SHARE
     use_ai: bool = False  # AI analysis is expensive; default to screener-only
     min_screener_score: float = 15.0
     indicator_weights: dict[str, float] | None = None
@@ -322,6 +347,7 @@ def run_backtest(config: BacktestConfig) -> SimulatedPortfolio:
         initial_capital=config.initial_capital,
         slippage_pct=config.slippage_pct,
         commission=config.commission,
+        commission_per_share=config.commission_per_share,
     )
 
     # Iterate day by day (skip warmup period)
@@ -374,6 +400,10 @@ def run_backtest(config: BacktestConfig) -> SimulatedPortfolio:
         # Use mark-to-market prices for accurate portfolio value and daily PnL
         mtm_value = portfolio.portfolio_value_mtm(current_prices)
         mtm_daily_pnl = portfolio.daily_pnl_mtm(current_prices)
+        # Start-of-day equity = yesterday's end-of-day MTM (recorded at end
+        # of prior iteration). Gives daily-loss-limit check a stable baseline
+        # that doesn't drift down as today's losses accumulate.
+        start_of_day_equity = portfolio.equity_curve[-1][1] if portfolio.equity_curve else mtm_value
         for signal in candidates:
             # Fill at today's open price (realistic: signal from yesterday's close,
             # execution at today's open)
@@ -399,6 +429,7 @@ def run_backtest(config: BacktestConfig) -> SimulatedPortfolio:
                 mtm_daily_pnl,
                 current_price=fill_price,
                 volatility=candidate_volatility,
+                start_of_day_equity=start_of_day_equity,
             )
             if not result.approved:
                 continue

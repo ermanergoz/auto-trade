@@ -120,6 +120,50 @@ class TestSimulatedPortfolio:
         assert pos.take_profit < pos.entry_price
 
 
+class TestCommissionPerShare:
+    """Backtest commission must scale with position size.
+
+    IBKR tiered pricing charges ~$0.005/share with a $1 minimum per order.
+    A flat $1/trade drastically underestimates friction for positions of
+    1000+ shares — a typical 50%-of-$100k sizing at a $50 stock. Reported
+    Sharpe and profit factor get inflated when friction is undercounted.
+    """
+
+    def test_large_position_charges_per_share(self):
+        p = SimulatedPortfolio(
+            initial_capital=1_000_000, slippage_pct=0.0,
+        )
+        sig = _make_signal(action=Action.BUY, entry_price=100.0,
+                           stop_loss=95.0, take_profit=110.0)
+        # 1000 shares @ $100 = $100,000 position
+        # At $0.005/share: commission = $5.00 (not $1.00)
+        start_cash = p.cash
+        p.open_position(sig, 1000, 100.0, datetime(2024, 1, 15))
+        # Cost = 1000 * 100 + commission
+        # If flat $1: cost = 100_001; cash = 900_000 - 1 = 899_999
+        # If per-share $5: cost = 100_005; cash = 899_995
+        assert start_cash - p.cash >= 100_005 - 0.01, (
+            f"Large position must incur per-share commission; "
+            f"cash debit was only ${start_cash - p.cash:.2f}, "
+            f"expected >= $100,005 (1000 shares + $5 commission)"
+        )
+
+    def test_small_position_hits_minimum(self):
+        """A 10-share trade pays the $1 minimum, not $0.05."""
+        p = SimulatedPortfolio(
+            initial_capital=100_000, slippage_pct=0.0,
+        )
+        sig = _make_signal(action=Action.BUY, entry_price=100.0,
+                           stop_loss=95.0, take_profit=110.0)
+        start_cash = p.cash
+        p.open_position(sig, 10, 100.0, datetime(2024, 1, 15))
+        # 10 * 100 = $1000 + min commission $1 = $1001
+        assert abs((start_cash - p.cash) - 1001.0) < 0.01, (
+            f"Small position must hit $1 minimum commission; "
+            f"cash debit was ${start_cash - p.cash:.2f}, expected $1001"
+        )
+
+
 class TestShortPositionAccounting:
     """Short positions must credit cash on open and debit on close."""
 

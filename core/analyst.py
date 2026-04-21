@@ -219,9 +219,11 @@ def _validate_response(data: dict) -> bool:
     if data["action"] not in ("buy", "sell", "hold"):
         logger.warning("LLM response invalid action: %r", data["action"])
         return False
-    if data["action"] == "sell" and not ALLOW_SHORT_SELLING:
-        logger.warning("LLM returned SELL but shorts disabled — rejecting")
-        return False
+    # The short-selling gate lives in risk.check_short_selling, which knows
+    # whether the user holds the stock. Rejecting every SELL here would block
+    # AI-driven exits on held longs (a legitimate signal shape). The prompt
+    # also steers the LLM away from "sell" when shorts are disabled; this
+    # validator used to fight the prompt redundantly.
     if data.get("trade_type") not in ("day", "swing"):
         logger.warning("LLM response invalid trade_type: %r", data.get("trade_type"))
         return False
