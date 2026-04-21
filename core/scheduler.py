@@ -29,7 +29,7 @@ from core.portfolio import (
     get_open_positions, get_daily_pnl, record_signal,
     get_portfolio_value, get_trades,
 )
-from core.models import StockInfo
+from core.models import StockInfo, Position, TradeType, Action
 from notifications.telegram import (
     notify_scan_summary, notify_trade, notify_error,
     notify_shutdown, update_status, notify_risk_results,
@@ -283,6 +283,12 @@ def run_scan_cycle(
         # order placement via the on_signal callback, instead of waiting
         # for all AI analysis to complete first.
         risk_approved_signals = []
+        # Virtual positions for bracket orders placed this cycle whose fills
+        # haven't been written to the DB yet. Without this, two rapid AI
+        # approvals both evaluate against the same stale DB snapshot and the
+        # max-positions / sector-concentration / cumulative-risk checks both
+        # pass when they should not.
+        pending_this_cycle: list[Position] = []
 
         def _on_signal(signal):
             nonlocal open_positions, portfolio_value
@@ -298,6 +304,14 @@ def run_scan_cycle(
                 fresh_daily_pnl = portfolio_value - start_of_day_equity
             else:
                 fresh_daily_pnl = get_daily_pnl(unrealized_pnl=fresh_account.get("UnrealizedPnL", 0.0))
+
+            # Combine DB positions with in-flight virtual positions from this
+            # scan cycle. Prefer DB when the same ticker appears in both (DB
+            # reflects actual fill price / quantity).
+            db_tickers = {p.ticker for p in open_positions}
+            effective_positions = list(open_positions) + [
+                p for p in pending_this_cycle if p.ticker not in db_tickers
+            ]
 
             # Fetch current price for anti-momentum check
             sig_df = stock_data.get(signal.ticker, (None, None))[1]
@@ -323,7 +337,7 @@ def run_scan_cycle(
             analyst_consensus = analyst_data["consensus"] if analyst_data else None
 
             result = evaluate(
-                signal, open_positions, portfolio_value, fresh_daily_pnl,
+                signal, effective_positions, portfolio_value, fresh_daily_pnl,
                 current_price=current_price, recent_trades=recent_trades,
                 analyst_consensus=analyst_consensus,
                 start_of_day_equity=start_of_day_equity,
@@ -336,6 +350,20 @@ def run_scan_cycle(
                         "Trading paused. Review manually."
                     )
                 return
+
+            # Market-close boundary guard: wall-clock may have advanced into
+            # the close window while AI analysis was running. If so, skip —
+            # close_all_day_trades would immediately flatten this position,
+            # creating an unnecessary round-trip at uncertain market price.
+            if not force and CLOSE_DAY_TRADES_BEFORE_MARKET_CLOSE:
+                mins_left_now = minutes_to_close(market)
+                if 0 < mins_left_now <= CLOSE_MINUTES_BEFORE:
+                    logger.info(
+                        "Skipping %s: wall-clock entered close window "
+                        "(%d min to close, threshold %d min)",
+                        signal.ticker, mins_left_now, CLOSE_MINUTES_BEFORE,
+                    )
+                    return
 
             summary["risk_approved"] += 1
             risk_approved_signals.append(signal)
@@ -402,6 +430,33 @@ def run_scan_cycle(
                 else:
                     summary["orders_placed"] += 1
                     notify_trade(signal, result.position_size, action_type="SUBMITTED")
+                    # Track as a virtual position so subsequent risk checks in
+                    # this cycle see it, even if the DB refresh below hasn't
+                    # picked up the fill yet. Fill handler will update DB
+                    # asynchronously; the effective_positions merge handles
+                    # the overlap without double-counting.
+                    signed_qty = (
+                        result.position_size
+                        if signal.action == Action.BUY
+                        else -result.position_size
+                    )
+                    # entry_time must be UTC. The PDT check converts naive
+                    # datetimes to UTC by attaching a tzinfo=UTC (not by
+                    # converting); a datetime in Istanbul time would be
+                    # mis-bucketed by 3 hours relative to ET for the
+                    # day-trade boundary classification.
+                    from datetime import timezone as _utc_tz2
+                    pending_this_cycle.append(Position(
+                        ticker=signal.ticker,
+                        exchange=signal.exchange,
+                        quantity=signed_qty,
+                        entry_price=signal.entry_price,
+                        entry_time=datetime.now(_utc_tz2.utc),
+                        stop_loss=signal.stop_loss,
+                        take_profit=signal.take_profit,
+                        trade_type=signal.trade_type,
+                        sector=signal.indicator_values.get("sector", ""),
+                    ))
 
             # Always refresh positions for next risk check, regardless of
             # whether the order succeeded — async fills may have updated DB
@@ -622,7 +677,7 @@ def start_scheduler(
 
     # Graceful shutdown
     def shutdown(signum, frame):
-        _state.shutting_down = True
+        _state.shutting_down.set()
         logger.info("Received signal %s — shutting down...", signum)
 
     sig.signal(sig.SIGINT, shutdown)
@@ -637,7 +692,7 @@ def start_scheduler(
     last_reconcile_date: Optional[date] = None
 
     try:
-        while not _state.shutting_down:
+        while not _state.shutting_down.is_set():
             if ib.isConnected():
                 run_scan_cycle(ib, markets, mode, force=force)
 
@@ -652,7 +707,7 @@ def start_scheduler(
                         logger.error("Nightly reconciliation failed: %s", e)
                     last_reconcile_date = today
 
-            if _state.shutting_down:
+            if _state.shutting_down.is_set():
                 break
 
             # Sleep between scans, keeping the event loop alive.
@@ -662,7 +717,7 @@ def start_scheduler(
                 try:
                     ib.sleep(SCAN_INTERVAL_MINUTES * 60)
                 except Exception:
-                    if _state.shutting_down:
+                    if _state.shutting_down.is_set():
                         break
                     if watchdog_mode:
                         logger.debug("ib.sleep() interrupted — will retry")
@@ -674,7 +729,7 @@ def start_scheduler(
                 logger.info(
                     "IBKR disconnected — waiting for watchdog to reconnect..."
                 )
-                while not ib.isConnected() and not _state.shutting_down:
+                while not ib.isConnected() and not _state.shutting_down.is_set():
                     run(asyncio.sleep(5))
                 if ib.isConnected():
                     logger.info("Watchdog reconnected — resuming scans")
@@ -686,7 +741,7 @@ def start_scheduler(
     except (KeyboardInterrupt, SystemExit):
         pass
     finally:
-        _state.shutting_down = True
+        _state.shutting_down.set()
         logger.info("Scheduler stopped")
         # Close day trades before exit
         try:

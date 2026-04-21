@@ -757,7 +757,7 @@ def setup_disconnect_handler(ib: IB, reconnect: bool = True) -> None:
     def on_disconnect():
         from core import state as _state
         from core.data import clear_realtime_subscriptions
-        if _state.shutting_down or _reconnecting.is_set():
+        if _state.shutting_down.is_set() or _reconnecting.is_set():
             return
         _reconnecting.set()
         # IBKR drops all subscriptions on disconnect — clear tracking
