@@ -62,6 +62,40 @@ class TestPositions:
         tickers = {p.ticker for p in positions}
         assert tickers == {"AAPL", "MSFT", "NVDA"}
 
+    def test_concurrent_close_position_inserts_one_trade(self, db_path):
+        """Concurrent close_position calls for the same ticker must insert
+        exactly one Trade row. The exit handler (ib_insync event thread) and
+        close_all_day_trades (main thread) can both fire close_position for
+        the same ticker during a day-trade close; without serialization, two
+        trade records with identical data get written.
+        """
+        import threading
+
+        add_position(_make_position(ticker="AAPL"), db_path)
+
+        results = []
+        barrier = threading.Barrier(2)
+
+        def _close():
+            barrier.wait()  # release both threads simultaneously
+            t = close_position("AAPL", exit_price=160.0, db_path=db_path)
+            results.append(t)
+
+        t1 = threading.Thread(target=_close)
+        t2 = threading.Thread(target=_close)
+        t1.start(); t2.start()
+        t1.join(); t2.join()
+
+        trades = get_trades(db_path=db_path)
+        assert len(trades) == 1, (
+            f"Expected exactly 1 trade row after concurrent close, got {len(trades)}"
+        )
+        # Exactly one thread should have returned a Trade; the other gets None
+        non_none = [r for r in results if r is not None]
+        assert len(non_none) == 1, (
+            f"Expected exactly 1 close_position() to succeed, got {len(non_none)}"
+        )
+
     def test_close_position(self, db_path):
         add_position(_make_position(ticker="AAPL"), db_path)
         exit_dt = datetime(2024, 1, 15, 15, 0)
@@ -383,6 +417,35 @@ class TestReconcilePositions:
 class TestAutoFixWithFills:
     """Auto-reconcile should prefer actual IBKR fill prices over stop_loss
     estimates when fills are provided — so P&L reflects reality."""
+
+    def test_naive_fill_time_does_not_crash(self, db_path):
+        """ib_insync sometimes returns naive datetimes for fill.time. The
+        reconcile path must not raise TypeError when comparing naive fill
+        times against the aware entry_time. Either the fill must be
+        normalized to UTC, or the comparison must tolerate naive times.
+        """
+        from core.portfolio import reconcile_positions
+        from datetime import timezone
+
+        pos = _make_position(
+            ticker="NAIV", quantity=5, entry_price=50.0, stop_loss=45.0,
+            entry_time=datetime(2026, 4, 16, 14, 0, tzinfo=timezone.utc),
+        )
+        add_position(pos, db_path)
+
+        # Naive fill time (no tzinfo) — represents what ib_insync may return
+        fills = [{
+            "ticker": "NAIV", "side": "SLD", "shares": 5.0, "price": 46.0,
+            "time": datetime(2026, 4, 17, 13, 30, 0),  # naive
+        }]
+        # Must not raise TypeError
+        report = reconcile_positions(
+            [], auto_fix=True, ibkr_fills=fills, db_path=db_path,
+        )
+        assert report["auto_closed"] == ["NAIV"]
+        trades = get_trades(db_path=db_path)
+        # Naive time was treated as UTC (positive); fill actually used
+        assert trades[0].exit_price == pytest.approx(46.0)
 
     def test_fill_price_overrides_stop_loss(self, db_path):
         """When a matching IBKR fill exists, use its price, not stop_loss."""

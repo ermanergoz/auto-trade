@@ -16,13 +16,32 @@ logger = logging.getLogger(__name__)
 
 
 @contextmanager
-def _db_connection(db_path: Path = DB_PATH):
-    """Context manager for SQLite connections."""
+def _db_connection(db_path: Path = DB_PATH, immediate: bool = False):
+    """Context manager for SQLite connections.
+
+    Args:
+        immediate: When True, opens a BEGIN IMMEDIATE transaction on entry.
+            This acquires the database write lock upfront, serializing
+            concurrent writers and preventing SELECT-then-INSERT races
+            (e.g., two callers both observing an open position, both
+            inserting a Trade row, both DELETE-ing the position).
+    """
     db_path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(db_path))
+    # busy_timeout lets the second writer wait for the first to commit
+    # instead of failing with "database is locked".
+    conn = sqlite3.connect(str(db_path), timeout=30.0)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
+    conn.execute("PRAGMA busy_timeout=30000")
+    # sqlite3's default isolation level wraps writes in implicit deferred
+    # transactions that acquire the write lock only on first write. For
+    # read-then-write critical sections we need the write lock from the
+    # start — otherwise two concurrent readers both pass the SELECT check
+    # before either writes.
+    if immediate:
+        conn.isolation_level = None  # enter explicit transaction control
+        conn.execute("BEGIN IMMEDIATE")
     try:
         yield conn
         conn.commit()
@@ -172,10 +191,16 @@ def close_position(
     reasoning: str = "",
     db_path: Path = DB_PATH,
 ) -> Optional[Trade]:
-    """Close an open position and record it as a trade. Returns the Trade."""
+    """Close an open position and record it as a trade. Returns the Trade.
+
+    Uses BEGIN IMMEDIATE so the SELECT-INSERT-DELETE is atomic across
+    threads. Without this, the exit handler (ib_insync event thread) and
+    close_all_day_trades (main thread) can both observe the position and
+    both insert duplicate Trade rows before either deletes it.
+    """
     exit_time = exit_time or datetime.now(timezone.utc)
 
-    with _db_connection(db_path) as conn:
+    with _db_connection(db_path, immediate=True) as conn:
         row = conn.execute(
             "SELECT * FROM positions WHERE ticker = ? ORDER BY id ASC LIMIT 1",
             (ticker,),
@@ -319,16 +344,25 @@ def _find_closing_fill(
     # Normalize entry_time to UTC for comparison against IBKR fill times
     if entry_time.tzinfo is None:
         entry_time = entry_time.replace(tzinfo=timezone.utc)
+
+    def _aware(dt: datetime) -> datetime:
+        # ib_insync sometimes returns naive datetimes for fill.time. Comparing
+        # naive to aware datetimes raises TypeError, crashing the whole
+        # reconcile path. Treat naive fill times as UTC (IBKR servers report
+        # in UTC on the wire) — the failure mode of mis-bucketing by a few
+        # hours at most is far less severe than the crash.
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
     matches = [
         f for f in ibkr_fills
         if f.get("ticker") == ticker
         and f.get("side") == "SLD"
         and f.get("time") is not None
-        and f["time"] >= entry_time
+        and _aware(f["time"]) >= entry_time
     ]
     if not matches:
         return None
-    return max(matches, key=lambda f: f["time"])
+    return max(matches, key=lambda f: _aware(f["time"]))
 
 
 def reconcile_positions(
@@ -401,6 +435,9 @@ def reconcile_positions(
             if fill is not None:
                 exit_price = fill["price"]
                 exit_time = fill["time"]
+                # Ensure exit_time is tz-aware before downstream use
+                if exit_time.tzinfo is None:
+                    exit_time = exit_time.replace(tzinfo=timezone.utc)
                 reasoning = (
                     f"Auto-reconcile: closed at actual IBKR fill price "
                     f"${exit_price:.4f} (fill recorded at {exit_time.isoformat()})"
