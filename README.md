@@ -1,6 +1,6 @@
 # Auto Trade
 
-An automated stock trading system that day-trades and swing-trades US (NYSE/NASDAQ) equities through Interactive Brokers. The system uses a two-stage pipeline: a fast technical screener filters hundreds of stocks, then a local AI model (via Ollama) performs deep analysis on all qualifying candidates. A risk manager gates every trade before execution through IBKR.
+An automated stock trading system that day-trades and swing-trades US (NYSE/NASDAQ) equities through Interactive Brokers. The system uses a two-stage pipeline: a fast technical screener filters hundreds of stocks, then an AI analyst (Gemini primary with Ollama as automatic fallback) performs deep analysis on all qualifying candidates. A risk manager gates every trade before execution through IBKR.
 
 Financial sector stocks (banks, insurance, lending companies) and defense/military stocks (weapons, ammunition, combat systems) are automatically excluded from all trading.
 
@@ -35,7 +35,7 @@ Financial sector stocks (banks, insurance, lending companies) and defense/milita
 
 - **US market focus**: Trades US (NYSE/NASDAQ) equities through IBKR with 10 different scanner types for broad market coverage
 - **Two-stage screening pipeline**: Technical screener (fast, free) filters hundreds of stocks, then AI analyst performs deep analysis on all qualifying candidates
-- **AI-powered analysis**: Local LLM via Ollama (Qwen 2.5 7B by default) -- no API keys, no cost, fully offline
+- **AI-powered analysis**: Gemini (primary) for fast, capable cloud-based reasoning; Ollama + Qwen 2.5 7B (fallback) for resilience when Gemini is unavailable, rate-limited, or unconfigured
 - **Comprehensive risk management**: 14 risk checks including position sizing, daily loss limits, sector concentration limits, mandatory stop-losses, duplicate position prevention, defense/financial sector exclusion, circuit breaker, and analyst consensus. Exit signals bypass discipline checks so positions can always be closed
 - **Bracket order execution**: Automatic stop-loss and take-profit orders attached to every trade via IBKR bracket orders
 - **Day and swing trading**: Automatic end-of-day position closing for day trades, trailing stops for swing trades
@@ -48,7 +48,7 @@ Financial sector stocks (banks, insurance, lending companies) and defense/milita
 - **Connection resilience**: Automatic reconnection to IBKR on connection drops with retry logic; realtime subscriptions are properly cleaned up on disconnect to prevent callback leaks
 - **IBC Watchdog mode**: Optional auto-start of IB Gateway with automatic reconnection after daily restarts via IBC
 - **GTC bracket orders**: Orders placed outside market hours persist and execute at market open
-- **Zero AI cost**: Runs AI analysis locally via Ollama -- no cloud API fees
+- **Cost-efficient AI**: Gemini Flash-Lite is cheap-to-free on light workloads; on any Gemini error or quota depletion the bot transparently falls back to local Ollama (zero cost)
 
 ---
 
@@ -83,8 +83,9 @@ Financial sector stocks (banks, insurance, lending companies) and defense/milita
   └────────────────┘          │              │
                        ┌──────▼──────┐        │
                        │  AI Analyst  │        │
-                       │  (Ollama     │        │
-                       │   + News)    │        │
+                       │  (Gemini /   │        │
+                       │   Ollama +   │        │
+                       │    News)     │        │
                        └──────┬──────┘        │
                               │               │
                        ┌──────▼──────┐        │
@@ -245,24 +246,25 @@ Edit `~/ibc/config.ini` and set your IBKR credentials (`IbLoginId`, `IbPassword`
    ```
 5. Find your **chat_id** in the response JSON under `result[0].message.chat.id`
 
-### 5. Ollama (Local AI)
+### 5. LLM Providers
 
-The AI analyst runs locally via Ollama -- no cloud API keys needed.
+The AI analyst routes through **Gemini** (primary) with **Ollama** as an automatic fallback. At least one of them must be reachable:
+
+- **Gemini (recommended)** — set `GEMINI_API_KEY` in `.env`. Get a key at https://aistudio.google.com/apikey. On any Gemini error, rate limit, or credit exhaustion the bot transparently continues on Ollama for the rest of the process.
+- **Ollama (fallback / legacy)** — runs locally, no API key. Install and pull the model:
 
 ```bash
-# Install Ollama
 curl -fsSL https://ollama.com/install.sh | sh
-
-# Pull the default model
 ollama pull qwen3:8b
 ```
 
-Ollama must be running whenever the trading system is active. It starts automatically as a system service after installation.
+Ollama must be running (as a system service or `ollama serve`) whenever it may be used as a fallback. Set `AI_PROVIDER=ollama` in `.env` to skip Gemini entirely.
 
 ### 6. API Keys (Optional)
 
 | Service | Purpose | Where to get |
 |---------|---------|-------------|
+| **Gemini** | Primary LLM for trade analysis | https://aistudio.google.com/apikey |
 | **Tavily** | News headlines for AI context | https://tavily.com/ (free tier: 1000 searches/month) |
 
 ---
@@ -314,7 +316,15 @@ IBKR_HOST=127.0.0.1
 IBKR_PORT=7497                    # 7497 = paper trading, 7496 = live
 IBKR_CLIENT_ID=1
 
-# AI Model (Ollama local - no API key needed)
+# LLM provider — "gemini" (primary, auto-falls back to Ollama on error) or "ollama"
+AI_PROVIDER=gemini
+
+# Gemini (primary) — leave GEMINI_API_KEY blank to skip Gemini entirely
+GEMINI_API_KEY=
+GEMINI_MODEL=gemini-2.5-flash-lite
+GEMINI_HOST=https://generativelanguage.googleapis.com
+
+# Ollama (fallback) — no API key needed
 AI_MODEL=qwen3:8b
 OLLAMA_HOST=http://localhost:11434
 
@@ -362,7 +372,10 @@ All trading parameters are configured in `config/settings.py`. Key settings:
 | `SCAN_INTERVAL_MINUTES` | `15` | Minutes between scan cycles |
 | `AI_CONFIDENCE_THRESHOLD` | `65` | Minimum AI confidence to act (0-100) |
 | `AI_MAX_CANDIDATES` | `0` | Max candidates sent to AI per cycle (0 = unlimited) |
-| `AI_MODEL` | `qwen3:8b` | Ollama model for analysis |
+| `AI_PROVIDER` | `gemini` | Primary LLM provider. `gemini` falls back to Ollama on error; `ollama` skips Gemini entirely |
+| `GEMINI_MODEL` | `gemini-2.5-flash-lite` | Gemini model; `gemini-2.5-flash` is smarter but occasionally rate-limited |
+| `GEMINI_HOST` | `https://generativelanguage.googleapis.com` | Gemini API host (override for testing) |
+| `AI_MODEL` | `qwen3:8b` | Ollama fallback model |
 
 #### Risk Settings
 | Parameter | Default | Description |
@@ -528,7 +541,7 @@ Before scoring, the screener drops any ticker whose latest close sits more than 
 
 ## AI Analyst
 
-The AI analyst performs deep analysis on each screener candidate using a local LLM via Ollama (Qwen 2.5 7B by default).
+The AI analyst performs deep analysis on each screener candidate. It routes through **Gemini** (`gemini-2.5-flash-lite` by default) when `GEMINI_API_KEY` is set; on any Gemini transport failure (HTTP 5xx, network error, auth failure, or credits depleted) it transparently falls back to a local Ollama model (Qwen 2.5 7B by default) for this call. Permanent failures (invalid key, depleted prepayment credits) latch a process-lifetime flag so Gemini is skipped entirely until the process restarts — mirroring the Tavily→yfinance news-fallback pattern elsewhere in this codebase.
 
 ### Context Provided to the LLM
 
@@ -555,7 +568,7 @@ The LLM returns a structured JSON response:
 }
 ```
 
-Response validation checks all required fields including `trade_type` (must be "day" or "swing"). JSON parse errors (`KeyError`, `JSONDecodeError`) from Ollama are caught with specific log messages and trigger retries.
+Response validation checks all required fields including `trade_type` (must be "day" or "swing"). JSON parse errors (`KeyError`, `JSONDecodeError`) from either provider are caught with specific log messages. Content-level failures (malformed envelope, invalid JSON) trigger provider-internal retries up to 3 times; transport failures on Gemini fall straight through to Ollama without wasted retries.
 
 ### Filtering
 
@@ -563,7 +576,7 @@ Only signals with `confidence >= AI_CONFIDENCE_THRESHOLD` (default: 65) are forw
 
 ### Cost
 
-Zero. The AI runs locally via Ollama -- no cloud API fees. Each analysis takes ~30-60 seconds on CPU hardware.
+Gemini Flash-Lite is cheap-to-free on light workloads (see Google's pricing page and free-tier limits). Ollama is free — it runs locally. Per-candidate Gemini latency is typically ~2-5 seconds; Ollama takes ~30-60 seconds on CPU hardware, 5-10x faster on a GPU. Use `get_daily_token_usage()` to inspect per-provider input/output token counters.
 
 ---
 
@@ -962,15 +975,27 @@ This system is designed with multiple layers of safety:
 
 ### AI Analyst Issues
 
-**"LLM call failed" or connection refused**
+**"Gemini auth failed (401/403) -- latching exhausted flag"**
+- The `GEMINI_API_KEY` is invalid, revoked, or lacks permissions for the selected model
+- Check the key at https://aistudio.google.com/apikey; generate a fresh one and update `.env`
+- The flag clears on process restart; after fixing the key, restart the bot
+
+**"Gemini plan exhausted -- short-circuiting for process lifetime"**
+- Free-tier quota or prepaid credits are depleted on the Gemini project
+- The bot will continue transparently on Ollama until restarted; top up billing at https://ai.studio/projects or switch `AI_PROVIDER=ollama` to silence the warning
+
+**"Gemini transient HTTP 5xx" or "Gemini network error"**
+- Transient — no action required. The bot falls back to Ollama for this call and retries Gemini on the next candidate
+
+**"LLM call failed" or connection refused (Ollama)**
 - Make sure Ollama is running: `ollama serve` (or it runs as a system service)
 - Verify the model is downloaded: `ollama list` should show `qwen3:8b`
 - Check `OLLAMA_HOST` in `.env` matches the Ollama address (default: `http://localhost:11434`)
 
 **Slow analysis**
-- Each analysis takes ~30-60 seconds on CPU-only hardware -- this is normal
-- With a GPU, responses are 5-10x faster
-- You can try a smaller model (`qwen2.5:3b`) for faster but lower quality results
+- Ollama takes ~30-60 seconds on CPU-only hardware -- normal for local inference
+- With a GPU, Ollama responses are 5-10x faster; Gemini responses are typically 2-5 seconds regardless
+- For faster Ollama at the cost of quality, try a smaller model (`qwen2.5:3b`)
 
 ### Backtest Issues
 

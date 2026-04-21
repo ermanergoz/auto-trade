@@ -72,6 +72,18 @@ MARKET_HOURS = {
 SCAN_INTERVAL_MINUTES = 15
 AI_CONFIDENCE_THRESHOLD = 65
 AI_MAX_CANDIDATES = 0               # Max candidates sent to AI per cycle (0 = unlimited)
+
+# LLM provider — "gemini" (primary; auto-falls back to Ollama on error/exhaustion)
+# or "ollama" (legacy local-only path). Lower-cased so env vars like "Gemini" work.
+AI_PROVIDER = os.getenv("AI_PROVIDER", "gemini").lower()
+
+# Gemini (primary when AI_PROVIDER=gemini). Missing key silently falls back to
+# Ollama — matching the TAVILY_API_KEY "optional API" precedent.
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite")
+GEMINI_HOST = os.getenv("GEMINI_HOST", "https://generativelanguage.googleapis.com")
+
+# Ollama (fallback) — local, no key required.
 AI_MODEL = os.getenv("AI_MODEL", "qwen2.5:7b")
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
 

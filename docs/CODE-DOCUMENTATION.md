@@ -40,7 +40,7 @@ Think of it like a 3-person trading desk, automated:
 
 1. **The Screener** — A fast number-cruncher that scans hundreds of stocks every 15 minutes, looking for interesting patterns in prices, volume, and technical indicators. It's like a junior analyst who flags "hey, these 15 stocks look interesting right now."
 
-2. **The AI Analyst** — A local AI model (Qwen 2.5 7B running on Ollama) that takes those 15 candidates and does deep analysis. It looks at price trends, momentum, volume, news headlines, macro/political context, and a strict 7-point checklist. It's the senior analyst who says "of those 15, I'd actually buy these 3."
+2. **The AI Analyst** — An LLM that takes those 15 candidates and does deep analysis. It routes through **Gemini** (`gemini-2.5-flash-lite` by default) as the primary provider, and falls back to a local **Ollama + Qwen 2.5 7B** when Gemini is unavailable (missing key, rate limit, credits depleted, network error). It looks at price trends, momentum, volume, news headlines, macro/political context, and a strict 7-point checklist. It's the senior analyst who says "of those 15, I'd actually buy these 3."
 
 3. **The Risk Manager** — A paranoid rule-checker that gates every trade with 15 different safety checks (11 core + 4 discipline checks for new entries only). Position too big? Rejected. Already lost too much today? Rejected. Chasing a stock that already moved 5%? Rejected. Three losses in a row? Circuit breaker pauses everything. Portfolio below the PDT threshold and already used a day trade? The next potential day trade is blocked. Exit signals skip discipline checks so positions can always be closed. It's the compliance officer who makes sure we never blow up.
 
@@ -239,7 +239,11 @@ Why exclude financials? Banks and insurance companies behave very differently fr
 SCAN_INTERVAL_MINUTES = 15         # Run the full pipeline every 15 min
 AI_CONFIDENCE_THRESHOLD = 65       # AI must be 65%+ confident
 AI_MAX_CANDIDATES = 0              # Max stocks sent to AI per cycle (0 = no limit)
-AI_MODEL = "qwen3:8b"             # The local AI model
+AI_PROVIDER = "gemini"             # Primary LLM: "gemini" (auto-falls back to Ollama) or "ollama"
+GEMINI_API_KEY = ""                # Leave blank to skip Gemini and use Ollama only
+GEMINI_MODEL = "gemini-2.5-flash-lite"
+GEMINI_HOST = "https://generativelanguage.googleapis.com"
+AI_MODEL = "qwen3:8b"             # Ollama fallback model
 OLLAMA_HOST = "http://localhost:11434"  # Where Ollama runs
 ```
 
@@ -549,14 +553,49 @@ This adapts the stop-loss to each stock's personality.
 
 The AI analyst is the "smart filter." It takes candidates from the screener and does deep qualitative analysis using a local Large Language Model.
 
-### Why Local AI?
+### Why Gemini + Ollama?
 
-We use **Ollama** running **Qwen 2.5 7B** locally. This was a deliberate choice (and a pivot from the original design — see Challenges section). Benefits:
+The analyst routes through **Gemini** (primary) with **Ollama + Qwen 2.5 7B** as an automatic fallback:
 
-- **Zero cost** — No API fees. Cloud AI (Claude, GPT) would cost money per analysis, and we run 10-20 analyses every 15 minutes.
-- **No internet dependency** — Works offline. No API outages.
-- **Privacy** — Your trading data never leaves your machine.
-- **No rate limits** — Run as many analyses as you want.
+- **Gemini (primary)** — cloud, fast (~2-5s per analysis), capable. Gemini Flash-Lite is cheap-to-free on light workloads. Works when `GEMINI_API_KEY` is set.
+- **Ollama (fallback)** — local, slower (~30-60s on CPU, 5-10x faster on GPU), free, works offline. Kicks in automatically when Gemini is unreachable, rate-limited, has depleted credits, or is not configured.
+
+This was a pivot from the original cloud-only Claude/GPT design (see Challenges section). Keeping Ollama as the fallback preserves offline-capable, zero-cost resilience, while Gemini as the primary gives us significantly lower latency per scan cycle and higher-quality reasoning without the old cost-per-analysis anxiety.
+
+#### How the fallback routes
+
+`core/analyst._call_llm()` is the router:
+
+1. If `AI_PROVIDER == "gemini"`, `GEMINI_API_KEY` is set, and the process-lifetime exhaustion flag `_gemini_exhausted` is not latched — try Gemini up to `max_retries` times for content-level failures (malformed JSON, invalid response), falling straight through to Ollama on any transport failure (HTTP 5xx, network error, auth failure, credits depleted).
+2. Otherwise (or after Gemini gives up) call Ollama up to `max_retries` times.
+
+Two failure modes drive routing:
+
+- **Transport failures** raise `_GeminiTransportError` — router breaks out of the Gemini leg immediately, no retry loop on stateless server errors.
+- **Content failures** return `None` — router retries Gemini up to `max_retries` because a re-prompt may produce a parseable response.
+
+#### Exhaustion flag (permanent vs transient)
+
+`_gemini_exhausted` is a `threading.Event` (same pattern as `_tavily_exhausted` in `core/data.py`). Once set, all future Gemini calls this process are skipped — the router goes straight to Ollama. The flag latches on:
+
+- HTTP 401/403 — invalid key or missing permissions
+- HTTP 429 with a body matching `_GEMINI_EXHAUSTION_MARKERS` — prepayment credits depleted, free-tier `limit: 0`, usage-limit hit
+
+Markers are intentionally tighter than Tavily's: Gemini emits "Quota exceeded per minute" for transient per-minute rate limits, so a bare `"quota"` marker would false-positive and latch the flag on a recoverable condition. Transient 429s (per-minute caps) fall back for just this call; the next call tries Gemini again.
+
+#### Per-provider token tracking
+
+`get_daily_token_usage()` now returns a per-provider breakdown:
+
+```python
+{
+  "gemini": {"input": N, "output": N},
+  "ollama": {"input": N, "output": N},
+  "date": "YYYY-MM-DD",
+}
+```
+
+Counters reset at local midnight (`_reset_daily_usage_if_needed`). This is a shape change from the prior flat `{input, output, date}`; no in-repo callers read the old shape, so the switch is safe. External consumers (if any) will need to update.
 
 ### How Analysis Works
 
@@ -601,7 +640,7 @@ Decision Checklist — evaluate each:
 
 #### Step 2: Call the AI
 
-Makes an HTTP request to the local Ollama server. The AI processes the prompt and returns structured JSON:
+Routes through the provider router: Gemini's `generateContent` endpoint first (when configured and not exhausted), with an automatic fallback to the local Ollama `/api/generate` endpoint. Either way the response is structured JSON:
 
 ```json
 {
@@ -625,9 +664,9 @@ The system checks:
 - Is `take_profit` above `entry_price` (for buys)?
 - Is `trade_type` one of "day" or "swing"?
 
-The Ollama JSON response is parsed inside a try/except that catches both `KeyError` (missing fields) and `JSONDecodeError` (malformed output), logging specific error messages for each case.
+Each provider's JSON response is parsed inside a try/except that catches both `KeyError` (missing fields) and `JSONDecodeError` (malformed output), logging specific error messages. Gemini's response is doubly nested — the outer envelope has `candidates[0].content.parts[0].text`, which is itself a JSON string (because we set `responseMimeType: application/json` in the request).
 
-Invalid responses are rejected and retried (up to 3 times with exponential backoff).
+Invalid responses are rejected and retried up to 3 times. Gemini transport failures (HTTP 5xx, network error, auth, credits depleted) skip the retry loop and fall straight through to Ollama instead — retrying stateless server errors rarely helps and wastes scan-cycle latency.
 
 #### Step 4: Filter by Confidence
 
