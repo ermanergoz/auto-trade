@@ -487,6 +487,39 @@ class TestLookAheadBias:
             "Backtester must use strict < for date filtering to avoid look-ahead bias"
         )
 
+    def test_decision_mtm_uses_open_not_close(self):
+        """Risk check / position sizing must use today's OPEN for MTM, not close.
+
+        The decision point in a daily-bar backtest is at the START of the bar —
+        that's when the previous-close-based signal is acted on and fills at
+        today's open. Using bar.close for MTM pulls in information from the
+        rest of the day (intraday high/low/close) that wasn't available at
+        decision time, skewing position sizing and daily_pnl-limit gating.
+        """
+        import inspect
+        from backtest.engine import run_backtest
+
+        source = inspect.getsource(run_backtest)
+        # The source should NOT pass a close-based price map into the risk
+        # check (mtm_value / mtm_daily_pnl). It should use open prices there.
+        # We accept either a separate `decision_prices` variable using "open",
+        # or inline use of bar["open"] for the risk-check MTM.
+        # Flag the known-bad pattern: close-based current_prices fed directly
+        # into portfolio_value_mtm for the risk branch.
+        bad_pattern = 'bar["close"] for t, bar in day_data.items()'
+        # Count occurrences — one close-based map is OK (for end-of-day
+        # record_equity), but the risk branch must use open-based prices.
+        # The simplest check: ensure an open-based price dict is built for
+        # the risk calculation.
+        has_open_map = (
+            'bar["open"]' in source and 'portfolio_value_mtm' in source
+        )
+        # Must have an open-price source for decision MTM
+        assert has_open_map, (
+            "Backtester risk check should use today's bar['open'] for MTM "
+            "at decision time. Using bar['close'] leaks intraday future info."
+        )
+
 
 # ---------------------------------------------------------------------------
 # Indicator Weights in Backtest

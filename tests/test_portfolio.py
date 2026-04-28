@@ -614,3 +614,79 @@ class TestAutoFixWithFills:
         trades = get_trades(db_path=db_path)
         # BOT fill ignored, falls back to SL/TP midpoint = (95+110)/2 = 102.5
         assert trades[0].exit_price == pytest.approx(102.5)
+
+
+# ---------------------------------------------------------------------------
+# TestPendingOrdersConfidenceColumn
+# ---------------------------------------------------------------------------
+
+class TestPendingOrdersConfidence:
+    """AI confidence must be persisted per pending order to power eviction.
+
+    Motivating bug (2026-04-22 paper run): when a stronger candidate appears
+    mid-scan we need to evict the weakest pending BUY. The ranking metric is
+    the AI confidence at placement time, so it must survive across restarts.
+    """
+
+    def test_save_pending_order_accepts_confidence(self, db_path):
+        from core.portfolio import save_pending_order, get_pending_order_confidence
+        save_pending_order(12345, "AAPL", confidence=72.5, db_path=db_path)
+        assert get_pending_order_confidence(12345, db_path=db_path) == pytest.approx(72.5)
+
+    def test_save_pending_order_confidence_is_optional(self, db_path):
+        """Legacy callers that don't pass confidence must still work; column is NULL."""
+        from core.portfolio import save_pending_order, get_pending_order_confidence
+        save_pending_order(67890, "MSFT", db_path=db_path)
+        assert get_pending_order_confidence(67890, db_path=db_path) is None
+
+    def test_get_pending_order_confidence_missing_row_returns_none(self, db_path):
+        from core.portfolio import get_pending_order_confidence
+        assert get_pending_order_confidence(999, db_path=db_path) is None
+
+
+class TestPendingOrdersMigration:
+    """Existing DBs from prior releases must upgrade to include the confidence column."""
+
+    def test_init_db_adds_confidence_column_to_legacy_pending_orders(self, tmp_path):
+        """A DB that pre-dates the confidence column must be upgraded in place."""
+        import sqlite3
+        path = tmp_path / "legacy.db"
+        # Build the *pre-migration* schema by hand
+        with sqlite3.connect(str(path)) as conn:
+            conn.execute(
+                """CREATE TABLE pending_orders (
+                    perm_id INTEGER PRIMARY KEY,
+                    ticker TEXT NOT NULL,
+                    placed_at TEXT NOT NULL
+                )"""
+            )
+            conn.execute(
+                "INSERT INTO pending_orders (perm_id, ticker, placed_at) VALUES (?, ?, ?)",
+                (111, "LEGACY", "2026-04-20T10:00:00+00:00"),
+            )
+            conn.commit()
+
+        # Run migration (init_db must be idempotent and migrate the column)
+        from core.portfolio import init_db, get_pending_order_time, get_pending_order_confidence
+        init_db(path)
+
+        # Existing row's placed_at must still be readable
+        from datetime import datetime as _dt
+        placed_at = get_pending_order_time(111, db_path=path)
+        assert placed_at is not None
+        assert placed_at.year == 2026 and placed_at.month == 4 and placed_at.day == 20
+
+        # New confidence column exists and returns NULL for legacy rows
+        assert get_pending_order_confidence(111, db_path=path) is None
+
+        # Column is writable via the updated save_pending_order
+        from core.portfolio import save_pending_order
+        save_pending_order(222, "NEW", confidence=81.0, db_path=path)
+        assert get_pending_order_confidence(222, db_path=path) == pytest.approx(81.0)
+
+    def test_init_db_is_idempotent_on_already_migrated_schema(self, tmp_path):
+        """Running init_db twice must not raise (no duplicate-column error)."""
+        from core.portfolio import init_db
+        path = tmp_path / "fresh.db"
+        init_db(path)
+        init_db(path)  # would raise 'duplicate column name: confidence' without the PRAGMA guard

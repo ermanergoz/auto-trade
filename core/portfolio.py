@@ -108,7 +108,8 @@ _TABLES = [
     """CREATE TABLE IF NOT EXISTS pending_orders (
         perm_id INTEGER PRIMARY KEY,
         ticker TEXT NOT NULL,
-        placed_at TEXT NOT NULL
+        placed_at TEXT NOT NULL,
+        confidence REAL
     )""",
     # UNIQUE index enforces one-open-row-per-ticker at the DB level so that
     # concurrent inserts (fill handler thread vs scheduler) cannot both create
@@ -123,11 +124,25 @@ _REQUIRED_TABLES = {"positions", "trades", "daily_summary", "signals", "pending_
 
 
 def init_db(db_path: Path = DB_PATH) -> None:
-    """Create all tables if they don't exist."""
+    """Create all tables if they don't exist and run in-place migrations."""
     with _db_connection(db_path) as conn:
         for stmt in _TABLES:
             conn.execute(stmt)
+        _migrate_pending_orders_confidence(conn)
     logger.info("Database initialized at %s", db_path)
+
+
+def _migrate_pending_orders_confidence(conn: sqlite3.Connection) -> None:
+    """Add the ``confidence`` column to pending_orders for legacy databases.
+
+    Eviction (see core.executor.evict_weakest_pending) ranks pending BUY orders
+    by the AI confidence recorded at placement. Databases created before that
+    feature need an in-place ALTER TABLE so existing pending rows survive and
+    new rows can store the field.
+    """
+    cols = {row["name"] for row in conn.execute("PRAGMA table_info(pending_orders)")}
+    if "confidence" not in cols:
+        conn.execute("ALTER TABLE pending_orders ADD COLUMN confidence REAL")
 
 
 def verify_db(db_path: Path = DB_PATH) -> None:
@@ -609,13 +624,26 @@ def get_daily_summary(
 # Pending Orders
 # ---------------------------------------------------------------------------
 
-def save_pending_order(perm_id: int, ticker: str, db_path: Path = DB_PATH) -> None:
-    """Record when a parent order was placed (persists across reconnections)."""
+def save_pending_order(
+    perm_id: int,
+    ticker: str,
+    db_path: Path = DB_PATH,
+    *,
+    confidence: Optional[float] = None,
+) -> None:
+    """Record when a parent order was placed (persists across reconnections).
+
+    ``confidence`` is the AI analyst confidence (0-100) at placement time;
+    used later by the eviction logic to rank weakest pending BUYs. Leave it
+    unset for non-AI paths (e.g., manual orders) — the column is nullable.
+    Keyword-only so the long-standing positional ``db_path`` callers are
+    unaffected.
+    """
     with _db_connection(db_path) as conn:
         conn.execute(
-            """INSERT OR IGNORE INTO pending_orders (perm_id, ticker, placed_at)
-               VALUES (?, ?, ?)""",
-            (perm_id, ticker, datetime.now(timezone.utc).isoformat()),
+            """INSERT OR IGNORE INTO pending_orders (perm_id, ticker, placed_at, confidence)
+               VALUES (?, ?, ?, ?)""",
+            (perm_id, ticker, datetime.now(timezone.utc).isoformat(), confidence),
         )
 
 
@@ -630,6 +658,18 @@ def get_pending_order_time(perm_id: int, db_path: Path = DB_PATH) -> Optional[da
         dt = datetime.fromisoformat(row["placed_at"])
         return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
     return None
+
+
+def get_pending_order_confidence(perm_id: int, db_path: Path = DB_PATH) -> Optional[float]:
+    """Return the AI confidence recorded at placement, or None if missing/legacy."""
+    with _db_connection(db_path) as conn:
+        row = conn.execute(
+            "SELECT confidence FROM pending_orders WHERE perm_id = ?",
+            (perm_id,),
+        ).fetchone()
+    if row is None:
+        return None
+    return row["confidence"]
 
 
 def remove_pending_order(perm_id: int, db_path: Path = DB_PATH) -> None:

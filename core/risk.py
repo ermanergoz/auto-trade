@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
-from core.models import Signal, Position, Trade, Action
+from core.models import Signal, Position, Trade, Action, TradeType
 import math
 from typing import Optional
 
@@ -53,6 +53,12 @@ class RiskResult:
     approved: bool
     reasons: list[str]
     position_size: int = 0  # recommended quantity if approved
+    # True when the signal closes an existing position (SELL on long,
+    # BUY on short). Executors must route these to a plain close order
+    # rather than a bracket — a bracket's SL/TP children would stay live
+    # at IBKR after the parent fills and could re-enter the ticker when
+    # price crosses the target or stop level.
+    is_exit: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -596,21 +602,26 @@ def check_pdt_restriction(
 
     Logic:
       - Portfolio >= threshold → pass (unconstrained).
+      - Sub-threshold + new entry with trade_type=DAY → block outright.
+        A DAY-type entry is a declared same-day round-trip — the scheduler's
+        close_all_day_trades will force-close it at market close, so there
+        is no path for it NOT to consume a day-trade slot. On an account
+        that only has 1 slot to spare before IBKR's 30-day lockout, we
+        cannot afford a guaranteed day trade.
       - Otherwise count same-calendar-day round-trip trades in the last 5
         business days (~7 calendar days).
-      - New entries (BUY without an existing long, SELL without existing
-        short) could become a day trade if closed same-day → block when
-        count would push total to max_day_trades.
+      - New SWING entries could still become a day trade if the bracket
+        SL/TP fires intraday → block when count would push total to
+        max_day_trades.
       - Same-day exits (closing a position opened today) definitively are
         a day trade → block under the same threshold.
       - Exits of positions opened on a prior day are NOT day trades — always
         allow so the trader isn't trapped in a swing position.
 
-    Set max_day_trades=0 to disable.
+    Set max_day_trades=0 to disable the count-based ceiling (the DAY-type
+    guard above still fires).
     """
     if portfolio_value >= threshold_usd:
-        return True, ""
-    if max_day_trades <= 0:
         return True, ""
 
     def _ensure_utc(dt: datetime) -> datetime:
@@ -626,20 +637,10 @@ def check_pdt_restriction(
         return _ensure_utc(dt).astimezone(_US_EASTERN).date()
 
     now_utc = datetime.now(timezone.utc)
-    window_start = now_utc - timedelta(days=7)  # 5 business days ≈ 7 calendar days
-
-    day_trade_count = 0
-    for trade in recent_trades or []:
-        if not getattr(trade, "exit_time", None) or not getattr(trade, "entry_time", None):
-            continue
-        exit_t = _ensure_utc(trade.exit_time)
-        if exit_t < window_start:
-            continue
-        if _et_date(trade.entry_time) == _et_date(trade.exit_time):
-            day_trade_count += 1
-
-    # Classify the signal: same-day exit, new entry, or prior-day exit
     today_et = _et_date(now_utc)
+
+    # Classify the signal first so we can distinguish exits (always allowed
+    # to avoid trapping the trader) from new entries.
     is_exit_today = False
     is_exit_prior_day = False
     for pos in open_positions:
@@ -654,9 +655,35 @@ def check_pdt_restriction(
                 is_exit_prior_day = True
         break
 
-    # Exit of a position opened on a prior day — not a day trade → allow
+    # Exit of a position opened on a prior day — not a day trade → allow.
     if is_exit_prior_day:
         return True, ""
+
+    is_new_entry = not is_exit_today and not is_exit_prior_day
+
+    # Sub-threshold + DAY-type new entry → guaranteed day trade → block.
+    if is_new_entry and signal.trade_type == TradeType.DAY:
+        return False, (
+            f"PDT protection: portfolio ${portfolio_value:,.0f} < "
+            f"${threshold_usd:,.0f} threshold — DAY-type entries are "
+            "forbidden on sub-threshold accounts (the EOD force-close would "
+            "guarantee a same-day round-trip and consume IBKR's only "
+            "remaining day-trade slot)."
+        )
+
+    if max_day_trades <= 0:
+        return True, ""
+
+    window_start = now_utc - timedelta(days=7)  # 5 business days ≈ 7 calendar days
+    day_trade_count = 0
+    for trade in recent_trades or []:
+        if not getattr(trade, "exit_time", None) or not getattr(trade, "entry_time", None):
+            continue
+        exit_t = _ensure_utc(trade.exit_time)
+        if exit_t < window_start:
+            continue
+        if _et_date(trade.entry_time) == _et_date(trade.exit_time):
+            day_trade_count += 1
 
     # Block if adding this potential day trade would hit the configured cap
     if day_trade_count >= max_day_trades:
@@ -671,26 +698,44 @@ def check_pdt_restriction(
     return True, ""
 
 
+_BULLISH = ("buy", "strong_buy")
+
+
 def check_analyst_consensus(
     signal: Signal,
-    consensus: str | None,
+    yfinance_consensus: str | None,
+    ibkr_consensus: str | None,
     enabled: bool = CHECK_ANALYST_CONSENSUS,
 ) -> tuple[bool, str]:
-    """Block BUY when analyst consensus is sell or strong sell.
+    """Allow BUY only when BOTH analyst sources agree on buy/strong_buy.
 
     Args:
-        consensus: "strong_buy", "buy", "hold", "sell", "strong_sell", or None.
-        enabled: Feature toggle (from settings.CHECK_ANALYST_CONSENSUS).
+        yfinance_consensus: Yahoo/yfinance recommendations_summary modal bucket.
+        ibkr_consensus: IBKR Reuters/Refinitiv RESC consensus bucket.
+            Each is one of "strong_buy", "buy", "hold", "sell", "strong_sell"
+            or None when the source had no data.
+        enabled: Feature toggle (config/settings.CHECK_ANALYST_CONSENSUS).
 
-    Pass-through when: disabled, not a BUY signal, or no data available.
+    Block when either source reports hold/sell/strong_sell, or when either
+    source returned None — we cannot confirm two-source agreement without
+    both reads, so missing data is treated the same as a bearish signal.
+    Pass-through when disabled, or when the signal is not a BUY (we don't
+    want to gate exits/holds on analyst data).
     """
-    if not enabled or signal.action != Action.BUY or consensus is None:
+    if not enabled or signal.action != Action.BUY:
         return True, ""
 
-    if consensus in ("sell", "strong_sell"):
+    if yfinance_consensus not in _BULLISH:
+        yf_label = yfinance_consensus or "no data"
         return False, (
-            f"Analyst consensus is '{consensus}' — blocking BUY. "
-            "Analysts recommend selling this stock."
+            f"yfinance analyst consensus is '{yf_label}' (need buy/strong_buy) "
+            "— blocking BUY."
+        )
+    if ibkr_consensus not in _BULLISH:
+        ibkr_label = ibkr_consensus or "no data"
+        return False, (
+            f"IBKR analyst consensus is '{ibkr_label}' (need buy/strong_buy) "
+            "— blocking BUY."
         )
     return True, ""
 
@@ -786,6 +831,7 @@ def evaluate(
     recent_trades: list[Trade] | None = None,
     volatility: float | None = None,
     analyst_consensus: str | None = None,
+    analyst_consensus_ibkr: str | None = None,
     returns_lookup: dict[str, pd.Series] | None = None,
     correlation_threshold: float = CORRELATION_CAP_THRESHOLD,
     start_of_day_equity: Optional[float] = None,
@@ -797,8 +843,11 @@ def evaluate(
     Args:
         volatility: Current annualized market volatility. When provided,
                     position sizes are scaled inversely (high vol → smaller).
-        analyst_consensus: Analyst recommendation consensus string
+        analyst_consensus: yfinance analyst recommendation consensus
                           ("buy", "sell", "hold", etc.) or None if unavailable.
+        analyst_consensus_ibkr: IBKR (Reuters/Refinitiv RESC) consensus, same
+                                vocabulary. BUYs require BOTH sources to agree
+                                on buy/strong_buy.
         returns_lookup: {ticker: pd.Series of daily returns} for correlation
                         check. Pass None to disable the correlation cap.
         correlation_threshold: Max tolerated correlation with any existing
@@ -813,49 +862,60 @@ def evaluate(
     indicator_values = getattr(signal, "indicator_values", {}) or {}
 
     # Detect if this signal is closing an existing position (exit signal).
-    # Exit signals must not be blocked by discipline checks (trend, anti-momentum,
-    # risk/reward, analyst consensus) — those only apply to new entries. Blocking
-    # an exit can trap the trader in a losing position indefinitely.
-    is_exit = False
+    # Exit signals must not be blocked by checks that assume a fresh entry —
+    # they would otherwise trap the trader in a position that can't be exited
+    # through the bot (e.g. legacy holdings in newly-excluded sectors, or
+    # positions whose existing open risk already sits near the daily cap).
+    existing_pos: Optional[Position] = None
     for pos in open_positions:
         if pos.ticker == signal.ticker and pos.quantity != 0:
             # SELL on existing long = exit, BUY on existing short = exit
             if (signal.action == Action.SELL and pos.quantity > 0) or \
                (signal.action == Action.BUY and pos.quantity < 0):
-                is_exit = True
+                existing_pos = pos
                 break
+    is_exit = existing_pos is not None
 
-    # Pre-compute position size for sector concentration check
-    # so we use the actual risk-sized value, not a fixed max estimate
-    estimated_size = calculate_position_size(signal, portfolio_value, volatility=volatility)
-    proposed_value = signal.entry_price * estimated_size if estimated_size > 0 else 0.0
+    # Size the order. For exits, we close the EXACT existing position quantity
+    # — never a freshly-calculated size, which could exceed the holding and
+    # flip the position to a net short (or net long) in violation of intent.
+    # For new entries, size by portfolio risk budget and volatility scaling.
+    if is_exit:
+        estimated_size = abs(existing_pos.quantity)
+        proposed_value = 0.0  # exit reduces exposure; no new value is proposed
+    else:
+        estimated_size = calculate_position_size(
+            signal, portfolio_value, volatility=volatility,
+        )
+        proposed_value = signal.entry_price * estimated_size if estimated_size > 0 else 0.0
 
     checks = [
         check_short_selling(signal, open_positions),
-        check_position_size(signal, portfolio_value),
         check_daily_loss_limit(daily_pnl, portfolio_value, start_of_day_equity=start_of_day_equity),
-        check_cumulative_risk(signal, open_positions, portfolio_value,
-                              position_size=estimated_size),
         check_max_positions(signal, open_positions),
         check_stop_loss(signal),
-        check_sector_concentration(signal, open_positions, portfolio_value,
-                                    proposed_value=proposed_value),
         check_no_duplicate(signal, open_positions),
-        check_excluded_sector(signal),
         check_circuit_breaker(recent_trades or []),
         check_pdt_restriction(signal, open_positions, portfolio_value,
                               recent_trades=recent_trades),
     ]
 
-    # Discipline checks only apply to new entries, not exits.
-    # Blocking an exit with trend/momentum/R:R checks would prevent
-    # closing losing positions when the market moves against us.
+    # Entry-only checks: skip for exits. An exit REDUCES sector exposure,
+    # REDUCES cumulative open risk, and must be allowed even when the
+    # ticker/sector is on the excluded list (legacy holding). Applying these
+    # to exits would block legitimate closes.
     if not is_exit:
         checks.extend([
+            check_position_size(signal, portfolio_value),
+            check_cumulative_risk(signal, open_positions, portfolio_value,
+                                  position_size=estimated_size),
+            check_sector_concentration(signal, open_positions, portfolio_value,
+                                        proposed_value=proposed_value),
+            check_excluded_sector(signal),
             check_risk_reward(signal),
             check_anti_momentum(signal, price),
             check_trend_confirmation(signal, indicator_values),
-            check_analyst_consensus(signal, analyst_consensus),
+            check_analyst_consensus(signal, analyst_consensus, analyst_consensus_ibkr),
         ])
         if returns_lookup is not None:
             checks.append(check_correlation(
@@ -891,4 +951,5 @@ def evaluate(
         approved=approved,
         reasons=reasons,
         position_size=position_size,
+        is_exit=is_exit,
     )

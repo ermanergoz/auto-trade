@@ -800,3 +800,284 @@ class TestExitHandlerParentMatching:
                 h(child)
 
             assert mock_close.call_count == 1
+
+
+# ---------------------------------------------------------------------------
+# TestGetPendingBuyReserve
+# ---------------------------------------------------------------------------
+
+def _make_open_trade(
+    *,
+    ticker: str,
+    action: str = "BUY",
+    qty: float = 10.0,
+    lmt_price: float = 100.0,
+    order_type: str = "LMT",
+    parent_id: int = 0,
+    status: str = "Submitted",
+    perm_id: int = 0,
+):
+    """Build a mock ib_insync Trade for pending-order tests.
+
+    Covers the fields consulted by get_pending_buy_reserve / get_stale_orders:
+    order.action, order.orderType, order.parentId, order.totalQuantity,
+    order.lmtPrice, order.permId, orderStatus.status, contract.symbol.
+    """
+    trade = MagicMock()
+    trade.contract.symbol = ticker
+    trade.order.action = action
+    trade.order.orderType = order_type
+    trade.order.parentId = parent_id
+    trade.order.totalQuantity = qty
+    trade.order.lmtPrice = lmt_price
+    trade.order.permId = perm_id
+    trade.orderStatus.status = status
+    trade.log = []
+    return trade
+
+
+class TestGetPendingBuyReserve:
+    """Cash committed to unfilled parent BUY LMT orders must be subtractable.
+
+    Motivating bug (2026-04-22): HPE bracket reserved ~$200.20 while STLD $215
+    was approved against unchanged NetLiquidation, causing IBKR rejection with
+    'Cash needed 417.20 USD'. The reserve helper is the missing piece.
+    """
+
+    def test_sums_unfilled_parent_buy_lmt_orders(self):
+        from core.executor import get_pending_buy_reserve
+        ib = MagicMock()
+        ib.openTrades.return_value = [
+            _make_open_trade(ticker="HPE", action="BUY", qty=7, lmt_price=28.60),
+            _make_open_trade(ticker="STLD", action="BUY", qty=1, lmt_price=215.00),
+        ]
+        assert get_pending_buy_reserve(ib) == pytest.approx(7 * 28.60 + 215.00)
+
+    def test_ignores_sell_parents(self):
+        """ARTV TP in the production log is a SELL parent; must not reduce buying power."""
+        from core.executor import get_pending_buy_reserve
+        ib = MagicMock()
+        ib.openTrades.return_value = [
+            _make_open_trade(ticker="ARTV", action="SELL", qty=7, lmt_price=18.45),
+            _make_open_trade(ticker="HPE", action="BUY", qty=7, lmt_price=28.60),
+        ]
+        assert get_pending_buy_reserve(ib) == pytest.approx(7 * 28.60)
+
+    def test_ignores_child_orders(self):
+        """TP/SL children have parentId != 0 and must be excluded (already counted via parent)."""
+        from core.executor import get_pending_buy_reserve
+        ib = MagicMock()
+        ib.openTrades.return_value = [
+            _make_open_trade(ticker="HPE", action="BUY", qty=7, lmt_price=28.60, parent_id=0),
+            _make_open_trade(ticker="HPE", action="SELL", qty=7, lmt_price=30.50, parent_id=123),
+            _make_open_trade(
+                ticker="HPE", action="SELL", qty=7, lmt_price=0.0,
+                order_type="STP", parent_id=123,
+            ),
+        ]
+        assert get_pending_buy_reserve(ib) == pytest.approx(7 * 28.60)
+
+    def test_ignores_cancelled_and_inactive(self):
+        from core.executor import get_pending_buy_reserve
+        ib = MagicMock()
+        ib.openTrades.return_value = [
+            _make_open_trade(ticker="X", action="BUY", qty=10, lmt_price=10.0, status="Cancelled"),
+            _make_open_trade(ticker="Y", action="BUY", qty=10, lmt_price=10.0, status="Inactive"),
+            _make_open_trade(ticker="Z", action="BUY", qty=10, lmt_price=10.0, status="Submitted"),
+        ]
+        assert get_pending_buy_reserve(ib) == pytest.approx(100.0)
+
+    def test_counts_presubmitted_same_as_submitted(self):
+        """IBKR reports PreSubmitted during initial transmit; it still reserves cash."""
+        from core.executor import get_pending_buy_reserve
+        ib = MagicMock()
+        ib.openTrades.return_value = [
+            _make_open_trade(ticker="Z", action="BUY", qty=5, lmt_price=20.0, status="PreSubmitted"),
+        ]
+        assert get_pending_buy_reserve(ib) == pytest.approx(100.0)
+
+    def test_empty_returns_zero(self):
+        from core.executor import get_pending_buy_reserve
+        ib = MagicMock()
+        ib.openTrades.return_value = []
+        assert get_pending_buy_reserve(ib) == 0.0
+
+
+# ---------------------------------------------------------------------------
+# TestGetPendingBuyOrders
+# ---------------------------------------------------------------------------
+
+class TestGetPendingBuyOrders:
+    """Enumerate unfilled parent BUY orders with their AI confidence and reserved cash."""
+
+    def test_joins_ib_openTrades_with_db_confidence(self, db_path):
+        from core.executor import get_pending_buy_orders
+        from core.portfolio import save_pending_order
+
+        save_pending_order(700001, "HPE", db_path=db_path, confidence=70.0)
+
+        ib = MagicMock()
+        ib.openTrades.return_value = [
+            _make_open_trade(
+                ticker="HPE", action="BUY", qty=7, lmt_price=28.60, perm_id=700001,
+            ),
+        ]
+
+        with patch("core.executor.DB_PATH", db_path):
+            result = get_pending_buy_orders(ib)
+
+        assert len(result) == 1
+        row = result[0]
+        assert row["perm_id"] == 700001
+        assert row["ticker"] == "HPE"
+        assert row["confidence"] == pytest.approx(70.0)
+        assert row["reserved_cash"] == pytest.approx(7 * 28.60)
+        assert row["trade"] is ib.openTrades.return_value[0]
+
+    def test_ignores_sell_and_cancelled(self, db_path):
+        from core.executor import get_pending_buy_orders
+        from core.portfolio import save_pending_order
+
+        save_pending_order(1, "A", db_path=db_path, confidence=50.0)
+        save_pending_order(2, "B", db_path=db_path, confidence=60.0)
+        save_pending_order(3, "C", db_path=db_path, confidence=70.0)
+
+        ib = MagicMock()
+        ib.openTrades.return_value = [
+            _make_open_trade(ticker="A", action="BUY", qty=1, lmt_price=100.0,
+                             perm_id=1, status="Cancelled"),
+            _make_open_trade(ticker="B", action="SELL", qty=1, lmt_price=100.0, perm_id=2),
+            _make_open_trade(ticker="C", action="BUY", qty=1, lmt_price=100.0, perm_id=3),
+        ]
+
+        with patch("core.executor.DB_PATH", db_path):
+            result = get_pending_buy_orders(ib)
+
+        assert [r["ticker"] for r in result] == ["C"]
+
+    def test_missing_db_row_sets_confidence_none(self, db_path):
+        """Legacy pending orders placed before the migration have no confidence."""
+        from core.executor import get_pending_buy_orders
+
+        ib = MagicMock()
+        ib.openTrades.return_value = [
+            _make_open_trade(
+                ticker="LEGACY", action="BUY", qty=2, lmt_price=50.0, perm_id=99,
+            ),
+        ]
+
+        with patch("core.executor.DB_PATH", db_path):
+            result = get_pending_buy_orders(ib)
+
+        assert len(result) == 1
+        assert result[0]["confidence"] is None
+
+
+# ---------------------------------------------------------------------------
+# TestEvictWeakestPending
+# ---------------------------------------------------------------------------
+
+class TestEvictWeakestPending:
+    """Cancel the weakest pending BUY only when a meaningfully stronger candidate arrives.
+
+    The margin prevents thrash (e.g., cancelling a 70-confidence order for a 71).
+    A single eviction must also free enough cash; otherwise cancelling achieves
+    nothing and we skip instead.
+    """
+
+    def test_evicts_when_margin_met_and_frees_enough_cash(self, db_path):
+        from core.executor import evict_weakest_pending
+        from core.portfolio import save_pending_order
+
+        save_pending_order(1, "WEAK", db_path=db_path, confidence=60.0)
+        save_pending_order(2, "STRONG", db_path=db_path, confidence=70.0)
+
+        weak_trade = _make_open_trade(
+            ticker="WEAK", action="BUY", qty=10, lmt_price=20.0, perm_id=1,
+        )
+        strong_trade = _make_open_trade(
+            ticker="STRONG", action="BUY", qty=5, lmt_price=30.0, perm_id=2,
+        )
+        ib = MagicMock()
+        ib.openTrades.return_value = [weak_trade, strong_trade]
+
+        with patch("core.executor.DB_PATH", db_path):
+            did_evict = evict_weakest_pending(
+                ib, new_confidence=78.0, needed_cash=150.0, margin=5,
+            )
+
+        assert did_evict is True
+        ib.cancelOrder.assert_called_once_with(weak_trade.order)
+
+    def test_declines_within_margin(self, db_path):
+        from core.executor import evict_weakest_pending
+        from core.portfolio import save_pending_order
+
+        save_pending_order(1, "HPE", db_path=db_path, confidence=70.0)
+
+        ib = MagicMock()
+        ib.openTrades.return_value = [
+            _make_open_trade(ticker="HPE", action="BUY", qty=7, lmt_price=28.60, perm_id=1),
+        ]
+
+        with patch("core.executor.DB_PATH", db_path):
+            did_evict = evict_weakest_pending(
+                ib, new_confidence=72.0, needed_cash=100.0, margin=5,
+            )
+
+        assert did_evict is False
+        ib.cancelOrder.assert_not_called()
+
+    def test_declines_if_single_eviction_insufficient_cash(self, db_path):
+        """v1 does not chain-evict. If weakest doesn't free enough, we skip."""
+        from core.executor import evict_weakest_pending
+        from core.portfolio import save_pending_order
+
+        save_pending_order(1, "SMALL", db_path=db_path, confidence=40.0)
+
+        ib = MagicMock()
+        ib.openTrades.return_value = [
+            _make_open_trade(ticker="SMALL", action="BUY", qty=1, lmt_price=50.0, perm_id=1),
+        ]
+
+        with patch("core.executor.DB_PATH", db_path):
+            did_evict = evict_weakest_pending(
+                ib, new_confidence=80.0, needed_cash=200.0, margin=5,
+            )
+
+        assert did_evict is False
+        ib.cancelOrder.assert_not_called()
+
+    def test_no_candidates_returns_false(self, db_path):
+        from core.executor import evict_weakest_pending
+        ib = MagicMock()
+        ib.openTrades.return_value = []
+        with patch("core.executor.DB_PATH", db_path):
+            assert evict_weakest_pending(ib, new_confidence=80.0, needed_cash=100.0) is False
+
+    def test_legacy_null_confidence_treated_as_weakest(self, db_path):
+        """Pre-migration rows (confidence=NULL) count as zero for eviction ranking."""
+        from core.executor import evict_weakest_pending
+        from core.portfolio import save_pending_order
+
+        # NULL confidence (simulate legacy row)
+        save_pending_order(1, "LEGACY", db_path=db_path)
+        save_pending_order(2, "NEW", db_path=db_path, confidence=80.0)
+
+        legacy_trade = _make_open_trade(
+            ticker="LEGACY", action="BUY", qty=10, lmt_price=30.0, perm_id=1,
+        )
+        ib = MagicMock()
+        ib.openTrades.return_value = [
+            legacy_trade,
+            _make_open_trade(ticker="NEW", action="BUY", qty=5, lmt_price=20.0, perm_id=2),
+        ]
+
+        with patch("core.executor.DB_PATH", db_path):
+            did_evict = evict_weakest_pending(
+                ib, new_confidence=50.0, needed_cash=200.0, margin=5,
+            )
+
+        # 50 > 0 + 5, and legacy reserves $300 >= $200, so evict legacy
+        assert did_evict is True
+        ib.cancelOrder.assert_called_once_with(legacy_trade.order)

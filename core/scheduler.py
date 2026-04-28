@@ -21,9 +21,11 @@ from core.screener import screen_stocks
 from core.analyst import analyze_batch
 from core.risk import evaluate
 from core.executor import (
-    place_order, close_all_day_trades, setup_fill_handler,
+    place_order, place_market_order, close_all_day_trades, setup_fill_handler,
     setup_exit_handler, setup_disconnect_handler,
     get_stale_orders, cancel_bracket_order,
+    setup_exit_close_handler,
+    get_pending_buy_reserve, evict_weakest_pending,
 )
 from core.portfolio import (
     get_open_positions, get_daily_pnl, record_signal,
@@ -331,15 +333,24 @@ def run_scan_cycle(
             _pdt_window_start = (datetime.now(_utc_tz.utc) - _timedelta(days=7)).date()
             recent_trades = get_trades(start_date=_pdt_window_start)
 
-            # Fetch analyst consensus to block buys on sell-rated stocks
-            from core.data import get_analyst_recommendation
-            analyst_data = get_analyst_recommendation(signal.ticker)
-            analyst_consensus = analyst_data["consensus"] if analyst_data else None
+            # Two-source analyst consensus gate: BUY only when BOTH yfinance
+            # and IBKR (Reuters/Refinitiv) agree on buy/strong_buy. A None
+            # from either source blocks the BUY at risk-eval time — see
+            # check_analyst_consensus in core/risk.py.
+            from core.data import (
+                get_analyst_recommendation,
+                get_analyst_recommendation_ibkr,
+            )
+            yf_data = get_analyst_recommendation(signal.ticker)
+            analyst_consensus = yf_data["consensus"] if yf_data else None
+            ibkr_data = get_analyst_recommendation_ibkr(ib, signal.ticker, signal.exchange)
+            analyst_consensus_ibkr = ibkr_data["consensus"] if ibkr_data else None
 
             result = evaluate(
                 signal, effective_positions, portfolio_value, fresh_daily_pnl,
                 current_price=current_price, recent_trades=recent_trades,
                 analyst_consensus=analyst_consensus,
+                analyst_consensus_ibkr=analyst_consensus_ibkr,
                 start_of_day_equity=start_of_day_equity,
             )
             if not result.approved:
@@ -365,6 +376,44 @@ def run_scan_cycle(
                     )
                     return
 
+            # Cash-reserve gate — only long entries consume settled cash.
+            # IBKR's TotalCashValue is not decremented for unfilled parent
+            # BUY orders, so we subtract that reserve ourselves. Without
+            # this, two back-to-back approvals can over-commit and the
+            # second bracket is rejected by IBKR (Error 201 — see 2026-04-22
+            # HPE+STLD run). If short on cash, try to evict the weakest
+            # pending BUY (only if the new one is clearly stronger).
+            if signal.action == Action.BUY and not result.is_exit:
+                total_cash = fresh_account.get("TotalCashValue", 0.0)
+                pending_reserve = get_pending_buy_reserve(ib)
+                needed_cash = signal.entry_price * result.position_size
+                available_cash = total_cash - pending_reserve
+                if needed_cash > available_cash:
+                    evicted = evict_weakest_pending(
+                        ib,
+                        new_confidence=signal.confidence,
+                        needed_cash=needed_cash,
+                    )
+                    if evicted:
+                        logger.info(
+                            "Evicted a weaker pending BUY to free cash for %s "
+                            "(confidence %.0f)",
+                            signal.ticker, signal.confidence,
+                        )
+                        # Refresh cash view after cancellation — the freed
+                        # reserve should now cover this order.
+                        ib.sleep(0.5)
+                        pending_reserve = get_pending_buy_reserve(ib)
+                        available_cash = total_cash - pending_reserve
+                    if needed_cash > available_cash:
+                        logger.info(
+                            "Skipping %s: cash short "
+                            "(need $%.2f, have $%.2f = $%.2f cash - $%.2f reserved)",
+                            signal.ticker, needed_cash, available_cash,
+                            total_cash, pending_reserve,
+                        )
+                        return
+
             summary["risk_approved"] += 1
             risk_approved_signals.append(signal)
 
@@ -384,6 +433,29 @@ def run_scan_cycle(
                 if trades_list:
                     notify_trade_closed(trades_list[0])
                 refresh_positions_cache()
+
+            # Route exits through a plain close order rather than a bracket.
+            # A bracket's SL/TP children would stay live at IBKR after the
+            # parent closes our position — those orders could later fire when
+            # price crosses the stop or target level, opening a FRESH position
+            # in the opposite direction. A simple market close has no such tail.
+            if result.is_exit:
+                action_str = "BUY" if signal.action == Action.BUY else "SELL"
+                market_trade = place_market_order(
+                    ib, signal.ticker, signal.exchange,
+                    action_str, result.position_size, dry_run=dry_run,
+                )
+                if market_trade and not dry_run:
+                    setup_exit_close_handler(
+                        ib, signal, market_trade, on_exit=_on_exit,
+                    )
+                    summary["orders_placed"] += 1
+                    notify_trade(signal, result.position_size, action_type="CLOSING")
+                elif dry_run:
+                    summary["orders_placed"] += 1
+                ib.sleep(0.5)
+                open_positions = get_open_positions()
+                return
 
             trades = place_order(ib, signal, result.position_size, dry_run=dry_run)
 

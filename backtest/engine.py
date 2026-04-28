@@ -381,9 +381,13 @@ def run_backtest(config: BacktestConfig) -> SimulatedPortfolio:
                 exchange = "SMART"
                 stock_data[ticker] = (exchange, hist)
 
-        # Build current prices for MTM from today's bars (available regardless
-        # of whether the screener finds candidates)
-        current_prices = {t: bar["close"] for t, bar in day_data.items()}
+        # Decision-time MTM uses today's OPEN — the decision is enacted at
+        # bar open (fills at the open), so pricing positions with bar.close
+        # would leak intraday future info (high/low/close) into the risk
+        # gates (daily-loss-limit, position sizing, sector concentration).
+        decision_prices = {t: bar["open"] for t, bar in day_data.items()}
+        # End-of-day equity uses today's CLOSE — the actual settled value.
+        eod_prices = {t: bar["close"] for t, bar in day_data.items()}
 
         # Step 3: Run screener (with optional indicator weights)
         candidates = screen_stocks(
@@ -393,13 +397,15 @@ def run_backtest(config: BacktestConfig) -> SimulatedPortfolio:
         )
 
         if not candidates:
-            portfolio.record_equity(current_date, current_prices=current_prices)
+            portfolio.record_equity(current_date, current_prices=eod_prices)
             continue
 
         # Step 4: Risk check and execute
-        # Use mark-to-market prices for accurate portfolio value and daily PnL
-        mtm_value = portfolio.portfolio_value_mtm(current_prices)
-        mtm_daily_pnl = portfolio.daily_pnl_mtm(current_prices)
+        # Use decision-time open prices for portfolio value / daily PnL so
+        # risk gates aren't comparing against prices that hadn't yet been
+        # observed at decision time.
+        mtm_value = portfolio.portfolio_value_mtm(decision_prices)
+        mtm_daily_pnl = portfolio.daily_pnl_mtm(decision_prices)
         # Start-of-day equity = yesterday's end-of-day MTM (recorded at end
         # of prior iteration). Gives daily-loss-limit check a stable baseline
         # that doesn't drift down as today's losses accumulate.
@@ -430,13 +436,20 @@ def run_backtest(config: BacktestConfig) -> SimulatedPortfolio:
                 current_price=fill_price,
                 volatility=candidate_volatility,
                 start_of_day_equity=start_of_day_equity,
+                # Backtests don't fetch live analyst consensus (no yfinance
+                # recommendations_summary / IBKR Reuters Fundamentals call per
+                # candidate per bar). Pass synthetic 'buy' on both sources so
+                # the consensus check is a no-op in backtests; the live
+                # scheduler still gates on the real two-source agreement.
+                analyst_consensus="buy",
+                analyst_consensus_ibkr="buy",
             )
             if not result.approved:
                 continue
 
             portfolio.open_position(signal, result.position_size, fill_price, current_dt)
 
-        portfolio.record_equity(current_date, current_prices=current_prices)
+        portfolio.record_equity(current_date, current_prices=eod_prices)
 
     # Close remaining positions at last available price
     for pos in list(portfolio.positions):

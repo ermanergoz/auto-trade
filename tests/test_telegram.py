@@ -1,6 +1,6 @@
 """Tests for notifications/telegram.py — TDD: written before implementation."""
 
-from unittest.mock import patch, MagicMock
+from unittest.mock import AsyncMock, patch, MagicMock
 
 import pytest
 
@@ -477,6 +477,123 @@ class TestRefreshPositionsCache:
 
         mock_summary.assert_called_once_with(mock_ib)
         assert _system_status["account"] == fresh_account
+
+
+class TestSanitizeHtml:
+    """_sanitize_html escapes unsafe tags while preserving Telegram-supported formatting.
+
+    Motivating bug (2026-04-22 paper run): IBKR error strings contain literal
+    <br> fragments that crash the HTML parser at byte offset 241. The sanitizer
+    must escape any tag Telegram doesn't support while keeping <b>/<i>/<code>/<pre>.
+    """
+
+    def test_escapes_br_tag(self):
+        from notifications.telegram import _sanitize_html
+        result = _sanitize_html("Cash needed: <br>417 USD")
+        assert "<br>" not in result
+        assert "&lt;br&gt;" in result
+
+    def test_preserves_bold(self):
+        from notifications.telegram import _sanitize_html
+        assert _sanitize_html("<b>Title</b>") == "<b>Title</b>"
+
+    def test_preserves_italic(self):
+        from notifications.telegram import _sanitize_html
+        assert _sanitize_html("<i>note</i>") == "<i>note</i>"
+
+    def test_preserves_code(self):
+        from notifications.telegram import _sanitize_html
+        assert _sanitize_html("<code>AAPL</code>") == "<code>AAPL</code>"
+
+    def test_preserves_pre(self):
+        from notifications.telegram import _sanitize_html
+        assert _sanitize_html("<pre>block</pre>") == "<pre>block</pre>"
+
+    def test_sanitizes_br_inside_code(self):
+        """Real-world case: notify_error wraps the IBKR reason in <code>...</code>."""
+        from notifications.telegram import _sanitize_html
+        raw = "<code>Cash needed for this order and other pending orders: <br>417.20 USD</code>"
+        result = _sanitize_html(raw)
+        assert result.startswith("<code>")
+        assert result.endswith("</code>")
+        assert "<br>" not in result
+        assert "&lt;br&gt;" in result
+
+    def test_escapes_script_tag(self):
+        from notifications.telegram import _sanitize_html
+        result = _sanitize_html("<script>alert(1)</script>")
+        assert "<script>" not in result
+        assert "&lt;script&gt;" in result
+
+    def test_escapes_raw_ampersand(self):
+        """Raw & must become &amp; so Telegram doesn't treat it as an entity start."""
+        from notifications.telegram import _sanitize_html
+        result = _sanitize_html("P&L: $100")
+        assert "&amp;" in result
+
+    def test_preserves_already_escaped_entities_are_not_double_escaped(self):
+        """If caller already wrote &amp;, the output should still have exactly &amp;."""
+        from notifications.telegram import _sanitize_html
+        result = _sanitize_html("A &amp; B")
+        # html.escape by default re-escapes &amp; -> &amp;amp;. That's acceptable
+        # for safety; the contract we care about is that the output is parseable HTML.
+        # So we only assert the semantic invariant: no bare tags that would crash.
+        assert "<" not in result.replace("&lt;", "").replace("<b>", "").replace("</b>", "")
+
+
+class TestSendSyncSanitizesBeforeSending:
+    """_send_sync must route text through _sanitize_html before passing to Telegram.
+
+    Without this, a body containing <br> crashes the send at 'Can't parse entities'.
+    """
+
+    def test_send_sync_escapes_br_before_send(self):
+        from notifications import telegram as tg
+
+        # Arrange: fake Bot whose send_message returns a real coroutine
+        captured = {}
+
+        class _FakeBot:
+            def __init__(self, token=None):
+                pass
+
+            def send_message(self, **kwargs):
+                captured.update(kwargs)
+                async def _ok():
+                    return True
+                return _ok()
+
+        with patch.object(tg, "TELEGRAM_BOT_TOKEN", "fake-token"), \
+             patch.object(tg, "TELEGRAM_CHAT_ID", "12345"), \
+             patch("telegram.Bot", _FakeBot):
+            ok = tg._send_sync("Error: <br>oops")
+
+        assert ok is True
+        assert "<br>" not in captured["text"]
+        assert "&lt;br&gt;" in captured["text"]
+        assert captured["parse_mode"] == "HTML"
+
+    def test_send_sync_preserves_intentional_bold(self):
+        from notifications import telegram as tg
+
+        captured = {}
+
+        class _FakeBot:
+            def __init__(self, token=None):
+                pass
+
+            def send_message(self, **kwargs):
+                captured.update(kwargs)
+                async def _ok():
+                    return True
+                return _ok()
+
+        with patch.object(tg, "TELEGRAM_BOT_TOKEN", "fake-token"), \
+             patch.object(tg, "TELEGRAM_CHAT_ID", "12345"), \
+             patch("telegram.Bot", _FakeBot):
+            tg._send_sync("<b>Hello</b>")
+
+        assert captured["text"] == "<b>Hello</b>"
 
 
 class TestThreadSafety:

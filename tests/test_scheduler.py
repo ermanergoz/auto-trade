@@ -20,6 +20,7 @@ _PATCHES = [
     "core.scheduler.setup_exit_handler",
     "core.scheduler.notify_trade",
     "core.scheduler.place_order",
+    "core.scheduler.place_market_order",
     "core.scheduler.record_signal",
     "core.scheduler.evaluate",
     "core.scheduler.get_open_positions",
@@ -34,6 +35,7 @@ _PATCHES = [
     "core.scheduler.get_news",
     "core.scheduler.get_macro_news",
     "core.scheduler.get_active_markets",
+    "core.scheduler.get_pending_buy_reserve",
 ]
 
 
@@ -51,6 +53,7 @@ def _setup_mocks(
     risk_approved=None,
     positions_sequence=None,
     sectors=None,
+    is_exit_flags=None,
 ):
     """Configure mocks for a standard pipeline run.
 
@@ -65,6 +68,8 @@ def _setup_mocks(
         positions_sequence = [[]] * (len(signals) + 1)
     if sectors is None:
         sectors = [""] * len(signals)
+    if is_exit_flags is None:
+        is_exit_flags = [False] * len(signals)
 
     mocks["get_active_markets"].return_value = ["US"]
     mocks["get_daily_pnl"].return_value = 0.0
@@ -94,24 +99,38 @@ def _setup_mocks(
     mocks["analyze_batch"].side_effect = fake_analyze_batch
 
     risk_results = []
-    for approved in risk_approved:
+    for approved, is_exit in zip(risk_approved, is_exit_flags):
         if approved:
-            risk_results.append(RiskResult(approved=True, reasons=[], position_size=10))
+            risk_results.append(RiskResult(
+                approved=True, reasons=[], position_size=10, is_exit=is_exit,
+            ))
         else:
-            risk_results.append(RiskResult(approved=False, reasons=["test rejection"]))
+            risk_results.append(RiskResult(
+                approved=False, reasons=["test rejection"], is_exit=is_exit,
+            ))
     mocks["evaluate"].side_effect = risk_results
 
     mocks["place_order"].return_value = [MagicMock()]
+    mocks["place_market_order"].return_value = MagicMock()
+    # Default: nothing reserved. Cash-gate tests override this.
+    mocks["get_pending_buy_reserve"].return_value = 0.0
 
 
-def _run_cycle(mocks):
-    """Run a scan cycle with a fake IB connection."""
+def _run_cycle(mocks, account=None):
+    """Run a scan cycle with a fake IB connection.
+
+    ``account`` lets a test override the mocked IBKR account summary dict.
+    Default includes TotalCashValue so the cash-reserve gate in _on_signal
+    does not trip on tests that don't care about cash.
+    """
     from core.scheduler import run_scan_cycle
 
     ib = MagicMock()
+    if account is None:
+        account = {"NetLiquidation": 100_000, "TotalCashValue": 100_000}
 
     with patch("core.scheduler._fetch_market_data") as mock_fetch, \
-         patch("core.connection.get_account_summary", return_value={"NetLiquidation": 100_000}), \
+         patch("core.connection.get_account_summary", return_value=account), \
          patch("core.scheduler.minutes_to_close", return_value=999), \
          patch("core.scheduler.get_trades", return_value=[]):
         mock_fetch.return_value = _make_stock_data(
@@ -328,6 +347,39 @@ class TestStreamingPipeline:
         # The signal passed to evaluate should have sector in indicator_values
         evaluated_signal = self.m["evaluate"].call_args[0][0]
         assert evaluated_signal.indicator_values.get("sector") == "Technology"
+
+    def test_exit_signal_uses_market_order_not_bracket(self):
+        """Exit signals (RiskResult.is_exit=True) must use place_market_order,
+        not place_order (bracket). A bracket's SL/TP children stay live at
+        IBKR after the parent closes our position — they can re-enter the
+        ticker when price crosses the child's trigger. For an exit, we want
+        a clean one-shot close with no residual orders.
+        """
+        from core.models import Action
+        sig = _make_signal(ticker="EXIT", action=Action.SELL)
+        _setup_mocks(
+            self.m, [sig], risk_approved=[True],
+            is_exit_flags=[True],
+        )
+
+        _run_cycle(self.m)
+
+        self.m["place_order"].assert_not_called()
+        self.m["place_market_order"].assert_called_once()
+
+    def test_entry_signal_still_uses_bracket(self):
+        """Entries must keep the bracket order — SL/TP children are what
+        protect an open position once the parent fills."""
+        sig = _make_signal(ticker="ENTRY")
+        _setup_mocks(
+            self.m, [sig], risk_approved=[True],
+            is_exit_flags=[False],
+        )
+
+        _run_cycle(self.m)
+
+        self.m["place_order"].assert_called_once()
+        self.m["place_market_order"].assert_not_called()
 
 
 class TestNewsSkip:
@@ -837,3 +889,236 @@ class TestPdtTradeWindow:
             f"need at least 5 business days (~7 calendar days) to honour IBKR's "
             f"5-day rolling PDT rule."
         )
+
+
+# ---------------------------------------------------------------------------
+# TestCashGate
+# ---------------------------------------------------------------------------
+
+class TestCashGate:
+    """Risk-approved BUY must still check available cash vs. pending BUY reserves.
+
+    Motivating bug (2026-04-22): HPE bracket reserved ~$200.20, then STLD $215
+    got risk-approved against a stale NetLiquidation and IBKR rejected with
+    Error 201 (cash needed 417.20 USD). Available cash must be computed as
+    TotalCashValue − sum(unfilled parent BUY reserves); if insufficient, the
+    scheduler must skip the candidate without calling place_order.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _patch_all(self):
+        patchers = {name.split(".")[-1]: patch(name) for name in _PATCHES}
+        self.m = {}
+        for key, p in patchers.items():
+            self.m[key] = p.start()
+        yield
+        for p in patchers.values():
+            p.stop()
+
+    def test_skips_place_order_when_cash_short_no_eviction(self, caplog):
+        from core.models import Action
+        signals = [_make_signal(ticker="STLD", action=Action.BUY, entry_price=215.0)]
+        _setup_mocks(self.m, signals)
+
+        # Mirror the 2026-04-22 bug: $369 cash, $200 reserved in pending HPE,
+        # STLD wants $215 — risk approves on NLV but cash is short.
+        self.m["get_pending_buy_reserve"].return_value = 200.0
+        self.m["evaluate"].side_effect = [
+            RiskResult(approved=True, reasons=[], position_size=1, is_exit=False),
+        ]
+
+        import logging
+        with caplog.at_level(logging.INFO, logger="core.scheduler"):
+            _run_cycle(self.m, account={"NetLiquidation": 455.0, "TotalCashValue": 369.0})
+
+        self.m["place_order"].assert_not_called()
+        assert any("cash short" in rec.message.lower() for rec in caplog.records), (
+            "Expected a 'cash short' log when available cash < needed cash; "
+            f"got: {[r.message for r in caplog.records]}"
+        )
+
+    def test_proceeds_when_cash_sufficient(self):
+        from core.models import Action
+        signals = [_make_signal(ticker="AAPL", action=Action.BUY, entry_price=150.0)]
+        _setup_mocks(self.m, signals)
+        self.m["get_pending_buy_reserve"].return_value = 0.0
+        # position_size=10 → $1500 needed, $5000 available → OK
+        self.m["evaluate"].side_effect = [
+            RiskResult(approved=True, reasons=[], position_size=10, is_exit=False),
+        ]
+
+        _run_cycle(self.m, account={"NetLiquidation": 10_000, "TotalCashValue": 5_000})
+
+        self.m["place_order"].assert_called_once()
+
+    def test_ignores_cash_gate_for_exit_signals(self):
+        """Exit signals close existing positions — they don't consume new cash."""
+        from core.models import Action
+        signals = [_make_signal(ticker="AAPL", action=Action.SELL, entry_price=150.0)]
+        _setup_mocks(self.m, signals)
+        # No available cash, but this is an exit, so gate must not fire
+        self.m["get_pending_buy_reserve"].return_value = 0.0
+        self.m["evaluate"].side_effect = [
+            RiskResult(approved=True, reasons=[], position_size=10, is_exit=True),
+        ]
+
+        _run_cycle(self.m, account={"NetLiquidation": 100, "TotalCashValue": 0})
+
+        # Exit goes through place_market_order, not place_order
+        self.m["place_market_order"].assert_called_once()
+        self.m["place_order"].assert_not_called()
+
+    def test_ignores_cash_gate_for_sell_entries(self):
+        """Opening a short (SELL entry) doesn't consume cash — don't gate on it."""
+        from core.models import Action
+        signals = [_make_signal(ticker="AAPL", action=Action.SELL, entry_price=150.0)]
+        _setup_mocks(self.m, signals)
+        self.m["get_pending_buy_reserve"].return_value = 0.0
+        self.m["evaluate"].side_effect = [
+            RiskResult(approved=True, reasons=[], position_size=10, is_exit=False),
+        ]
+
+        _run_cycle(self.m, account={"NetLiquidation": 100, "TotalCashValue": 0})
+
+        self.m["place_order"].assert_called_once()
+
+
+class TestEvictAndPlace:
+    """When cash is short, evict a weak pending BUY to make room for a stronger one."""
+
+    @pytest.fixture(autouse=True)
+    def _patch_all(self):
+        patchers = {name.split(".")[-1]: patch(name) for name in _PATCHES}
+        # Eviction helper is looked up via core.scheduler — add its patch too.
+        evict_patch = patch("core.scheduler.evict_weakest_pending")
+        patchers["evict_weakest_pending"] = evict_patch
+        self.m = {}
+        for key, p in patchers.items():
+            self.m[key] = p.start()
+        yield
+        for p in patchers.values():
+            p.stop()
+
+    def test_evicts_then_places_when_new_is_stronger(self):
+        """New conf 78 vs pending conf 60 (+margin 5) → evict, retry, place."""
+        from core.models import Action
+        signals = [_make_signal(
+            ticker="STLD", action=Action.BUY, entry_price=215.0, confidence=78.0,
+        )]
+        _setup_mocks(self.m, signals)
+
+        # Starting state: $369 cash, $200 reserved (mirrors the 2026-04-22 bug).
+        self.m["get_pending_buy_reserve"].side_effect = [200.0, 0.0]
+        # Eviction succeeds
+        self.m["evict_weakest_pending"].return_value = True
+        self.m["evaluate"].side_effect = [
+            RiskResult(approved=True, reasons=[], position_size=1, is_exit=False),
+        ]
+
+        _run_cycle(self.m, account={"NetLiquidation": 455.0, "TotalCashValue": 369.0})
+
+        # Eviction called with the new signal's confidence and needed cash
+        self.m["evict_weakest_pending"].assert_called_once()
+        args, kwargs = (
+            self.m["evict_weakest_pending"].call_args.args,
+            self.m["evict_weakest_pending"].call_args.kwargs,
+        )
+        # Support either positional or keyword call shapes
+        new_conf = kwargs.get("new_confidence", args[1] if len(args) > 1 else None)
+        needed = kwargs.get("needed_cash", args[2] if len(args) > 2 else None)
+        assert new_conf == pytest.approx(78.0)
+        assert needed == pytest.approx(215.0)
+        # After eviction freed cash, bracket is placed
+        self.m["place_order"].assert_called_once()
+
+    def test_skips_when_eviction_declined(self):
+        """Eviction returns False → skip; no place_order, no crash."""
+        from core.models import Action
+        signals = [_make_signal(
+            ticker="STLD", action=Action.BUY, entry_price=215.0, confidence=72.0,
+        )]
+        _setup_mocks(self.m, signals)
+
+        self.m["get_pending_buy_reserve"].return_value = 200.0
+        self.m["evict_weakest_pending"].return_value = False
+        self.m["evaluate"].side_effect = [
+            RiskResult(approved=True, reasons=[], position_size=1, is_exit=False),
+        ]
+
+        _run_cycle(self.m, account={"NetLiquidation": 455.0, "TotalCashValue": 369.0})
+
+        self.m["evict_weakest_pending"].assert_called_once()
+        self.m["place_order"].assert_not_called()
+
+
+class TestTwoSourceConsensusWiring:
+    """Scheduler must fetch BOTH yfinance and IBKR analyst consensus and pass
+    both into risk evaluate(). If either source is missing or doesn't agree on
+    buy/strong_buy, evaluate() will block the BUY (asserted in test_risk.py).
+    These tests verify the scheduler-side wiring only.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _patch_all(self):
+        patchers = {name.split(".")[-1]: patch(name) for name in _PATCHES}
+        # Inline imports inside run_scan_cycle target core.data.* directly
+        # — patch them at the module of definition, not core.scheduler.
+        patchers["yf_recs"] = patch("core.data.get_analyst_recommendation")
+        patchers["ibkr_recs"] = patch("core.data.get_analyst_recommendation_ibkr")
+        self.m = {}
+        for key, p in patchers.items():
+            self.m[key] = p.start()
+        yield
+        for p in patchers.values():
+            p.stop()
+
+    def test_evaluate_receives_both_consensus_kwargs(self):
+        """run_scan_cycle must pass analyst_consensus= and
+        analyst_consensus_ibkr= into evaluate() for every BUY signal."""
+        from core.models import Action
+        sig = _make_signal(ticker="AAPL", action=Action.BUY)
+        _setup_mocks(self.m, [sig])
+        self.m["yf_recs"].return_value = {"consensus": "buy", "details": {}}
+        self.m["ibkr_recs"].return_value = {"consensus": "strong_buy"}
+
+        _run_cycle(self.m)
+
+        self.m["evaluate"].assert_called_once()
+        call_kwargs = self.m["evaluate"].call_args.kwargs
+        assert call_kwargs.get("analyst_consensus") == "buy", (
+            f"Scheduler must pass yfinance consensus as analyst_consensus= "
+            f"to evaluate(). Got kwargs={list(call_kwargs)}"
+        )
+        assert call_kwargs.get("analyst_consensus_ibkr") == "strong_buy", (
+            f"Scheduler must pass IBKR consensus as analyst_consensus_ibkr= "
+            f"to evaluate(). Got kwargs={list(call_kwargs)}"
+        )
+
+    def test_ibkr_consensus_fetcher_is_called(self):
+        """The IBKR analyst-rec fetch must be invoked for each BUY candidate."""
+        from core.models import Action
+        sig = _make_signal(ticker="MSFT", action=Action.BUY)
+        _setup_mocks(self.m, [sig])
+        self.m["yf_recs"].return_value = {"consensus": "buy", "details": {}}
+        self.m["ibkr_recs"].return_value = {"consensus": "buy"}
+
+        _run_cycle(self.m)
+
+        assert self.m["ibkr_recs"].called, (
+            "Scheduler must call get_analyst_recommendation_ibkr — "
+            "the second source is required for the two-source agreement gate."
+        )
+
+    def test_passes_none_when_ibkr_returns_none(self):
+        """IBKR fetch returns None (no subscription/network) → evaluate must
+        receive analyst_consensus_ibkr=None and risk layer will block."""
+        from core.models import Action
+        sig = _make_signal(ticker="GOOG", action=Action.BUY)
+        _setup_mocks(self.m, [sig])
+        self.m["yf_recs"].return_value = {"consensus": "buy", "details": {}}
+        self.m["ibkr_recs"].return_value = None
+
+        _run_cycle(self.m)
+
+        call_kwargs = self.m["evaluate"].call_args.kwargs
+        assert call_kwargs.get("analyst_consensus_ibkr") is None

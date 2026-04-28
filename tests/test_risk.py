@@ -135,10 +135,16 @@ class TestPositionSizing:
         assert qty == 0
 
 
+# BUYs require BOTH yfinance and IBKR analyst consensus to be buy/strong_buy.
+# Tests that exercise OTHER risk checks but want a BUY to pass must opt into
+# this gate explicitly so the assertion is testing the intended check.
+_BULLISH_CONSENSUS = dict(analyst_consensus="buy", analyst_consensus_ibkr="buy")
+
+
 class TestFullEvaluation:
     def test_approved(self):
         sig = _make_signal()
-        result = evaluate(sig, [], 100_000, 0)
+        result = evaluate(sig, [], 100_000, 0, **_BULLISH_CONSENSUS)
         assert result.approved is True
         assert result.position_size > 0
         assert result.reasons == []
@@ -201,7 +207,7 @@ class TestCumulativeRisk:
     def test_cumulative_risk_included_in_evaluate(self):
         """evaluate() must include cumulative risk check."""
         sig = _make_signal()
-        result = evaluate(sig, [], 100_000, 0)
+        result = evaluate(sig, [], 100_000, 0, **_BULLISH_CONSENSUS)
         # Should still pass with no positions
         assert result.approved is True
 
@@ -434,7 +440,7 @@ class TestCircuitBreakerInEvaluate:
     def test_evaluate_accepts_recent_trades(self):
         """evaluate() should accept recent_trades parameter."""
         sig = _make_signal()
-        result = evaluate(sig, [], 100_000, 0, recent_trades=[])
+        result = evaluate(sig, [], 100_000, 0, recent_trades=[], **_BULLISH_CONSENSUS)
         assert result.approved is True
 
     def test_evaluate_rejects_on_circuit_breaker(self):
@@ -453,13 +459,13 @@ class TestCircuitBreakerInEvaluate:
     def test_evaluate_passes_with_no_trades(self):
         """evaluate() passes circuit breaker when no recent trades."""
         sig = _make_signal()
-        result = evaluate(sig, [], 100_000, 0, recent_trades=[])
+        result = evaluate(sig, [], 100_000, 0, recent_trades=[], **_BULLISH_CONSENSUS)
         assert result.approved is True
 
     def test_evaluate_backward_compatible(self):
         """evaluate() still works without recent_trades (defaults to no trades)."""
         sig = _make_signal()
-        result = evaluate(sig, [], 100_000, 0)
+        result = evaluate(sig, [], 100_000, 0, **_BULLISH_CONSENSUS)
         assert result.approved is True
 
 
@@ -713,8 +719,10 @@ class TestVolatilityInEvaluate:
 
     def test_high_vol_reduces_approved_size(self):
         sig = _make_signal(entry_price=150.0, stop_loss=145.0)
-        result_normal = evaluate(sig, [], 100_000, 0)
-        result_high_vol = evaluate(sig, [], 100_000, 0, volatility=0.40)
+        result_normal = evaluate(sig, [], 100_000, 0, **_BULLISH_CONSENSUS)
+        result_high_vol = evaluate(
+            sig, [], 100_000, 0, volatility=0.40, **_BULLISH_CONSENSUS,
+        )
         assert result_normal.approved is True
         assert result_high_vol.approved is True
         assert result_high_vol.position_size < result_normal.position_size
@@ -725,77 +733,168 @@ class TestVolatilityInEvaluate:
 # ---------------------------------------------------------------------------
 
 class TestAnalystConsensus:
-    """check_analyst_consensus blocks BUY when analysts say sell."""
+    """BUY only when BOTH yfinance AND IBKR analyst consensus are 'buy' or
+    'strong_buy'. Either source reporting hold/sell/strong_sell — or returning
+    None (no data) — blocks the BUY. Two-source agreement is the gate.
+    """
 
-    def test_blocks_buy_on_sell_consensus(self):
+    def test_allows_buy_when_both_buy(self):
         sig = _make_signal(action=Action.BUY)
-        ok, reason = check_analyst_consensus(sig, "sell")
+        ok, _ = check_analyst_consensus(sig, "buy", "buy")
+        assert ok is True
+
+    def test_allows_buy_when_both_strong_buy(self):
+        sig = _make_signal(action=Action.BUY)
+        ok, _ = check_analyst_consensus(sig, "strong_buy", "strong_buy")
+        assert ok is True
+
+    def test_allows_buy_when_yf_buy_ibkr_strong_buy(self):
+        sig = _make_signal(action=Action.BUY)
+        ok, _ = check_analyst_consensus(sig, "buy", "strong_buy")
+        assert ok is True
+
+    def test_allows_buy_when_yf_strong_buy_ibkr_buy(self):
+        sig = _make_signal(action=Action.BUY)
+        ok, _ = check_analyst_consensus(sig, "strong_buy", "buy")
+        assert ok is True
+
+    def test_blocks_buy_on_yf_hold(self):
+        """Hold no longer counts as buy — must block even if IBKR is bullish."""
+        sig = _make_signal(action=Action.BUY)
+        ok, reason = check_analyst_consensus(sig, "hold", "buy")
         assert ok is False
         assert "analyst" in reason.lower()
 
-    def test_blocks_buy_on_strong_sell_consensus(self):
+    def test_blocks_buy_on_ibkr_hold(self):
         sig = _make_signal(action=Action.BUY)
-        ok, reason = check_analyst_consensus(sig, "strong_sell")
+        ok, reason = check_analyst_consensus(sig, "buy", "hold")
         assert ok is False
         assert "analyst" in reason.lower()
 
-    def test_allows_buy_on_buy_consensus(self):
+    def test_blocks_buy_on_yf_sell(self):
         sig = _make_signal(action=Action.BUY)
-        ok, _ = check_analyst_consensus(sig, "buy")
-        assert ok is True
+        ok, reason = check_analyst_consensus(sig, "sell", "buy")
+        assert ok is False
+        assert "analyst" in reason.lower()
 
-    def test_allows_buy_on_strong_buy_consensus(self):
+    def test_blocks_buy_on_ibkr_sell(self):
         sig = _make_signal(action=Action.BUY)
-        ok, _ = check_analyst_consensus(sig, "strong_buy")
-        assert ok is True
+        ok, reason = check_analyst_consensus(sig, "buy", "sell")
+        assert ok is False
+        assert "analyst" in reason.lower()
 
-    def test_allows_buy_on_hold_consensus(self):
+    def test_blocks_buy_on_yf_strong_sell(self):
         sig = _make_signal(action=Action.BUY)
-        ok, _ = check_analyst_consensus(sig, "hold")
-        assert ok is True
+        ok, reason = check_analyst_consensus(sig, "strong_sell", "buy")
+        assert ok is False
+        assert "analyst" in reason.lower()
 
-    def test_allows_buy_when_no_data(self):
-        """No analyst data available — still allow the buy."""
+    def test_blocks_buy_on_ibkr_strong_sell(self):
         sig = _make_signal(action=Action.BUY)
-        ok, _ = check_analyst_consensus(sig, None)
+        ok, reason = check_analyst_consensus(sig, "buy", "strong_sell")
+        assert ok is False
+        assert "analyst" in reason.lower()
+
+    def test_blocks_buy_when_yf_missing(self):
+        """yfinance has no data — cannot confirm two-source agreement → block."""
+        sig = _make_signal(action=Action.BUY)
+        ok, reason = check_analyst_consensus(sig, None, "buy")
+        assert ok is False
+        assert "analyst" in reason.lower()
+
+    def test_blocks_buy_when_ibkr_missing(self):
+        """IBKR has no data — cannot confirm two-source agreement → block."""
+        sig = _make_signal(action=Action.BUY)
+        ok, reason = check_analyst_consensus(sig, "buy", None)
+        assert ok is False
+        assert "analyst" in reason.lower()
+
+    def test_blocks_buy_when_both_missing(self):
+        sig = _make_signal(action=Action.BUY)
+        ok, reason = check_analyst_consensus(sig, None, None)
+        assert ok is False
+        assert "analyst" in reason.lower()
+
+    def test_disabled_passes_through(self):
+        """When CHECK_ANALYST_CONSENSUS=False, all combinations pass."""
+        sig = _make_signal(action=Action.BUY)
+        ok, _ = check_analyst_consensus(sig, "sell", "sell", enabled=False)
         assert ok is True
 
     def test_sell_signal_always_passes(self):
         """Analyst consensus check only applies to BUY signals."""
         sig = _make_signal(action=Action.SELL, entry_price=150, stop_loss=155, take_profit=140)
-        ok, _ = check_analyst_consensus(sig, "sell")
+        ok, _ = check_analyst_consensus(sig, "sell", "sell")
         assert ok is True
 
     def test_hold_signal_always_passes(self):
         sig = _make_signal(action=Action.HOLD)
-        ok, _ = check_analyst_consensus(sig, "sell")
+        ok, _ = check_analyst_consensus(sig, "sell", "sell")
         assert ok is True
 
 
 class TestAnalystConsensusInEvaluate:
-    """evaluate() integrates the analyst consensus check."""
+    """evaluate() integrates the two-source consensus check."""
 
-    def test_evaluate_rejects_buy_on_sell_consensus(self):
+    def test_evaluate_allows_buy_when_both_buy(self):
         sig = _make_signal(action=Action.BUY)
-        result = evaluate(sig, [], 100_000, 0, analyst_consensus="sell")
+        result = evaluate(
+            sig, [], 100_000, 0,
+            analyst_consensus="buy",
+            analyst_consensus_ibkr="buy",
+        )
+        assert result.approved is True
+
+    def test_evaluate_blocks_buy_when_yf_sell_even_if_ibkr_buy(self):
+        sig = _make_signal(action=Action.BUY)
+        result = evaluate(
+            sig, [], 100_000, 0,
+            analyst_consensus="sell",
+            analyst_consensus_ibkr="buy",
+        )
         assert result.approved is False
         assert any("analyst" in r.lower() for r in result.reasons)
 
-    def test_evaluate_allows_buy_on_hold_consensus(self):
+    def test_evaluate_blocks_buy_when_ibkr_sell_even_if_yf_buy(self):
         sig = _make_signal(action=Action.BUY)
-        result = evaluate(sig, [], 100_000, 0, analyst_consensus="hold")
-        assert result.approved is True
+        result = evaluate(
+            sig, [], 100_000, 0,
+            analyst_consensus="buy",
+            analyst_consensus_ibkr="sell",
+        )
+        assert result.approved is False
+        assert any("analyst" in r.lower() for r in result.reasons)
 
-    def test_evaluate_allows_buy_when_no_consensus(self):
+    def test_evaluate_blocks_buy_on_hold(self):
+        """Hold from either source must block — was previously allowed."""
         sig = _make_signal(action=Action.BUY)
-        result = evaluate(sig, [], 100_000, 0, analyst_consensus=None)
-        assert result.approved is True
+        result = evaluate(
+            sig, [], 100_000, 0,
+            analyst_consensus="hold",
+            analyst_consensus_ibkr="buy",
+        )
+        assert result.approved is False
+        assert any("analyst" in r.lower() for r in result.reasons)
 
-    def test_evaluate_backward_compatible(self):
-        """evaluate() still works without analyst_consensus param."""
+    def test_evaluate_blocks_buy_when_ibkr_missing(self):
         sig = _make_signal(action=Action.BUY)
-        result = evaluate(sig, [], 100_000, 0)
-        assert result.approved is True
+        result = evaluate(
+            sig, [], 100_000, 0,
+            analyst_consensus="buy",
+            analyst_consensus_ibkr=None,
+        )
+        assert result.approved is False
+        assert any("analyst" in r.lower() for r in result.reasons)
+
+    def test_evaluate_blocks_buy_when_both_missing(self):
+        sig = _make_signal(action=Action.BUY)
+        result = evaluate(
+            sig, [], 100_000, 0,
+            analyst_consensus=None,
+            analyst_consensus_ibkr=None,
+        )
+        assert result.approved is False
+        assert any("analyst" in r.lower() for r in result.reasons)
 
 
 # ---------------------------------------------------------------------------
@@ -889,6 +988,214 @@ class TestExitSignalsNotBlocked:
             result = evaluate(sig, [], 100_000, 0)
         # With uptrend, trend confirmation should reject a new short
         # (This test verifies discipline checks still apply to entries)
+
+    def test_sell_exit_passes_cumulative_risk(self):
+        """SELL to close a long must not be blocked by cumulative risk.
+
+        Scenario: the AAPL position alone carries enough open risk to breach
+        the daily loss limit. Closing it REDUCES total risk to zero, but the
+        current check treats the exit as a fresh entry and adds phantom
+        new_risk on top of existing_risk (which already includes AAPL). Both
+        the presence of existing AAPL risk AND the phantom new_risk trip the
+        cap and trap the trader in the losing position.
+        """
+        # AAPL long with a deliberately wide stop — existing risk alone
+        # exceeds the 10% daily-loss-limit ($10k on $100k portfolio).
+        aapl_pos = _make_position(
+            ticker="AAPL", entry_price=150.0, stop_loss=50.0, quantity=150,
+            sector="Technology",
+        )  # risk = $100 * 150 = $15,000 (already > $10k cap)
+        positions = [aapl_pos]
+
+        sig = _make_signal(
+            ticker="AAPL", action=Action.SELL,
+            entry_price=160, stop_loss=170, take_profit=140,
+            indicator_values={"sector": "Technology"},
+        )
+        result = evaluate(
+            sig, positions, 100_000, 0,
+            current_price=160.0,
+        )
+        cum_reasons = [r for r in result.reasons if "cumulative risk" in r.lower()]
+        assert cum_reasons == [], (
+            f"Exit signal blocked by cumulative risk: {cum_reasons}"
+        )
+
+    def test_sell_exit_passes_sector_concentration(self):
+        """SELL to close a long must not be blocked by sector concentration.
+
+        Scenario: technology sector is already at 40% of portfolio. A SELL
+        to close AAPL (tech) reduces tech exposure — must not be blocked
+        because the check added `proposed_value` as if opening a new tech
+        position on top.
+        """
+        # Portfolio heavily weighted to tech (2 × 20% positions)
+        pos1 = _make_position(
+            ticker="AAPL", entry_price=150, quantity=133, sector="Technology",
+        )  # ~$20k
+        pos2 = _make_position(
+            ticker="MSFT", entry_price=300, quantity=67, sector="Technology",
+        )  # ~$20k
+        positions = [pos1, pos2]
+        # Close AAPL — tech exposure will DROP after the exit, not rise
+        sig = _make_signal(
+            ticker="AAPL", action=Action.SELL,
+            entry_price=160, stop_loss=170, take_profit=140,
+            indicator_values={"sector": "Technology"},
+        )
+        # With MAX_SECTOR_CONCENTRATION_PCT=25 (hypothetical tight cap),
+        # existing 40% tech + proposed-value would trip the check even
+        # though we're closing one of those positions.
+        result = evaluate(
+            sig, positions, 100_000, 0,
+            current_price=160.0,
+        )
+        sector_reasons = [r for r in result.reasons if "sector" in r.lower() and "concentration" not in r.lower() or "exposure" in r.lower()]
+        # The specific error message contains "exposure" when tripped
+        sector_violations = [r for r in result.reasons if "exposure" in r.lower()]
+        assert sector_violations == [], (
+            f"Exit signal blocked by sector concentration: {sector_violations}"
+        )
+
+    def test_sell_exit_passes_excluded_sector(self):
+        """SELL to close a legacy position in newly-excluded sector must pass.
+
+        Scenario: user imports a legacy position in JPM (financial sector).
+        The universe filter blocks new entries, but an exit must still be
+        allowed — otherwise the user is trapped in the position.
+        """
+        positions = [_make_position(
+            ticker="JPM", entry_price=150, quantity=10, sector="Financials",
+        )]
+        sig = _make_signal(
+            ticker="JPM", action=Action.SELL,
+            entry_price=155, stop_loss=160, take_profit=145,
+            indicator_values={"sector": "Financials"},
+        )
+        result = evaluate(
+            sig, positions, 100_000, 0,
+            current_price=155.0,
+        )
+        excluded_reasons = [r for r in result.reasons if "excluded" in r.lower()]
+        assert excluded_reasons == [], (
+            f"Exit signal blocked by excluded-sector check: {excluded_reasons}"
+        )
+
+    def test_sell_exit_passes_excluded_ticker(self):
+        """SELL to close a position in EXCLUDED_TICKERS must pass.
+
+        The exclusion list prevents new entries into specific tickers,
+        but a legacy position must still be exitable.
+        """
+        from unittest.mock import patch
+        positions = [_make_position(
+            ticker="TEVA", entry_price=10, quantity=100, sector="Healthcare",
+        )]
+        sig = _make_signal(
+            ticker="TEVA", action=Action.SELL,
+            entry_price=11, stop_loss=12, take_profit=9,
+            indicator_values={"sector": "Healthcare"},
+        )
+        # Confirm TEVA is in the default exclusion list, then verify evaluate
+        # doesn't block an exit of an already-held TEVA position.
+        with patch("core.risk.EXCLUDED_TICKERS", {"TEVA"}):
+            result = evaluate(
+                sig, positions, 100_000, 0,
+                current_price=11.0,
+            )
+        excluded_reasons = [r for r in result.reasons if "excluded" in r.lower()]
+        assert excluded_reasons == [], (
+            f"Exit of excluded-ticker position blocked: {excluded_reasons}"
+        )
+
+    def test_exit_signal_position_size_matches_existing_holding(self):
+        """For exit signals, RiskResult.position_size must equal the existing
+        position's absolute quantity — not a freshly-calculated new-entry size.
+
+        Scenario: user holds AAPL 100 shares long. An exit SELL signal arrives.
+        calculate_position_size(), treating it as a fresh short, would compute
+        a much larger quantity based on portfolio risk budget. Passing that
+        larger quantity to place_order would close the 100 long AND open a
+        net short in the remainder — a position inversion that violates
+        ALLOW_SHORT_SELLING=False and is never the user's intent.
+        """
+        # Hold 100 AAPL long
+        positions = [_make_position(
+            ticker="AAPL", entry_price=150.0, stop_loss=145.0, quantity=100,
+            sector="Technology",
+        )]
+        # SELL signal to close — with a wide stop that would imply a large
+        # fresh-entry size under the default 5% RISK_PER_TRADE_PCT.
+        sig = _make_signal(
+            ticker="AAPL", action=Action.SELL,
+            entry_price=160, stop_loss=170, take_profit=140,
+            indicator_values={"sector": "Technology"},
+        )
+        result = evaluate(
+            sig, positions, 100_000, 0,
+            current_price=160.0,
+        )
+        assert result.approved, (
+            f"Exit signal unexpectedly rejected: {result.reasons}"
+        )
+        # position_size must match existing holding, not a fresh-entry calc.
+        assert result.position_size == 100, (
+            f"Exit position_size={result.position_size} — should equal "
+            "existing quantity (100) so we close, not invert. A larger value "
+            "would flip the position to a net short."
+        )
+
+    def test_exit_signal_covering_short_matches_existing_short(self):
+        """Exit of a short (BUY to cover) must size to match the short."""
+        # Hold 50 MSFT short (quantity = -50)
+        positions = [_make_position(
+            ticker="MSFT", entry_price=300.0, stop_loss=310.0, quantity=-50,
+            sector="Technology",
+        )]
+        # BUY signal to close the short
+        sig = _make_signal(
+            ticker="MSFT", action=Action.BUY,
+            entry_price=290, stop_loss=280, take_profit=310,
+            indicator_values={"sector": "Technology"},
+        )
+        result = evaluate(
+            sig, positions, 100_000, 0,
+            current_price=290.0,
+        )
+        assert result.approved, (
+            f"Short-cover signal unexpectedly rejected: {result.reasons}"
+        )
+        assert result.position_size == 50, (
+            f"Cover position_size={result.position_size} — should equal "
+            "abs(existing short quantity) = 50."
+        )
+
+    def test_risk_result_flags_exit_signal(self):
+        """RiskResult must expose is_exit so the executor can route exits to
+        a simple close order instead of a bracket. A bracket placed for an
+        exit would leave SL/TP child orders live after the parent fills — at
+        IBKR those orders can re-enter the ticker at the stop or target price.
+        """
+        positions = [_make_position(ticker="AAPL", quantity=100)]
+        sig = _make_signal(
+            ticker="AAPL", action=Action.SELL,
+            entry_price=160, stop_loss=170, take_profit=140,
+            indicator_values={"sector": "Technology"},
+        )
+        result = evaluate(sig, positions, 100_000, 0, current_price=160.0)
+        assert result.is_exit is True, (
+            "Exit signal (SELL on existing long) must set RiskResult.is_exit"
+        )
+
+    def test_risk_result_new_entry_is_not_exit(self):
+        """New entries must have is_exit=False so the executor places a full
+        bracket order with SL/TP."""
+        sig = _make_signal(
+            ticker="AAPL", action=Action.BUY,
+            entry_price=150, stop_loss=145, take_profit=165,
+        )
+        result = evaluate(sig, [], 100_000, 0)
+        assert result.is_exit is False
 
 
 # ---------------------------------------------------------------------------
@@ -1219,6 +1526,7 @@ class TestCorrelationInEvaluate:
         result = evaluate(
             sig, positions, 100_000, 0.0, current_price=150.0,
             returns_lookup=returns_lookup, correlation_threshold=0.7,
+            **_BULLISH_CONSENSUS,
         )
         assert result.approved is True
 
@@ -1270,8 +1578,13 @@ class TestPDTRestriction:
         assert ok is True
 
     def test_passes_under_threshold_with_no_day_trades(self):
-        """Under threshold, no prior day trades — still within budget."""
-        sig = _make_signal(ticker="QUBT", action=Action.BUY)
+        """Under threshold, no prior day trades, SWING signal — still within
+        budget. (DAY-type entries on sub-threshold accounts are blocked by a
+        separate guard, exercised in TestPDTBlocksDayTypeOnSubThreshold.)
+        """
+        sig = _make_signal(
+            ticker="QUBT", action=Action.BUY, trade_type=TradeType.SWING,
+        )
         ok, _ = check_pdt_restriction(
             sig, [], portfolio_value=3000.0, recent_trades=[],
             threshold_usd=5000.0, max_day_trades=1,
@@ -1279,8 +1592,9 @@ class TestPDTRestriction:
         assert ok is True
 
     def test_blocks_new_entry_when_day_trade_already_used(self):
-        """Under threshold + 1 day trade in 5-day window — a new BUY could
-        become a 2nd day trade (if stop fires same day). Block conservatively.
+        """Under threshold + 1 day trade in 5-day window — a new SWING BUY
+        could still become a 2nd day trade if the bracket fires same-day.
+        Block conservatively.
         """
         now = datetime.now(timezone.utc)
         day_trade = _make_trade(
@@ -1288,7 +1602,9 @@ class TestPDTRestriction:
             entry_time=now - timedelta(days=1, hours=2),
             exit_time=now - timedelta(days=1),  # entered and exited same calendar day
         )
-        sig = _make_signal(ticker="QUBT", action=Action.BUY)
+        sig = _make_signal(
+            ticker="QUBT", action=Action.BUY, trade_type=TradeType.SWING,
+        )
         ok, reason = check_pdt_restriction(
             sig, [], portfolio_value=3000.0, recent_trades=[day_trade],
             threshold_usd=5000.0, max_day_trades=1,
@@ -1358,7 +1674,9 @@ class TestPDTRestriction:
             entry_time=now - timedelta(days=14, hours=2),
             exit_time=now - timedelta(days=14),
         )
-        sig = _make_signal(ticker="QUBT", action=Action.BUY)
+        sig = _make_signal(
+            ticker="QUBT", action=Action.BUY, trade_type=TradeType.SWING,
+        )
         ok, _ = check_pdt_restriction(
             sig, [], portfolio_value=3000.0, recent_trades=[old_day_trade],
             threshold_usd=5000.0, max_day_trades=1,
@@ -1373,22 +1691,29 @@ class TestPDTRestriction:
             entry_time=now - timedelta(days=3),
             exit_time=now - timedelta(days=1),
         )
-        sig = _make_signal(ticker="QUBT", action=Action.BUY)
+        sig = _make_signal(
+            ticker="QUBT", action=Action.BUY, trade_type=TradeType.SWING,
+        )
         ok, _ = check_pdt_restriction(
             sig, [], portfolio_value=3000.0, recent_trades=[swing],
             threshold_usd=5000.0, max_day_trades=1,
         )
         assert ok is True
 
-    def test_max_day_trades_zero_disables_check(self):
-        """max_day_trades=0 means feature disabled — always pass."""
+    def test_max_day_trades_zero_disables_count_check(self):
+        """max_day_trades=0 disables the count-based ceiling — a SWING entry
+        that would otherwise hit the count cap passes. The DAY-type guard
+        above is not affected by max_day_trades.
+        """
         now = datetime.now(timezone.utc)
         day_trade = _make_trade(
             ticker="PRIOR",
             entry_time=now - timedelta(days=1, hours=2),
             exit_time=now - timedelta(days=1),
         )
-        sig = _make_signal(ticker="QUBT", action=Action.BUY)
+        sig = _make_signal(
+            ticker="QUBT", action=Action.BUY, trade_type=TradeType.SWING,
+        )
         ok, _ = check_pdt_restriction(
             sig, [], portfolio_value=3000.0, recent_trades=[day_trade],
             threshold_usd=5000.0, max_day_trades=0,
@@ -1435,7 +1760,12 @@ class TestPDTRestriction:
         fake_swing = _make_trade(
             ticker="PRIOR", entry_time=entry_utc, exit_time=exit_utc,
         )
-        sig = _make_signal(ticker="QUBT", action=Action.BUY)
+        # SWING signal so we isolate the count/ET-classification logic (a
+        # DAY signal would be rejected by the earlier DAY-type guard and
+        # this test wouldn't exercise ET-date handling).
+        sig = _make_signal(
+            ticker="QUBT", action=Action.BUY, trade_type=TradeType.SWING,
+        )
 
         # Stub datetime.now in the risk module so "today" is a fixed ET Wednesday
         # within the 5-day window of the fake trade's ET exit (Tuesday).
@@ -1465,6 +1795,83 @@ class TestPDTRestriction:
         )
 
 
+class TestPDTBlocksDayTypeOnSubThreshold:
+    """On sub-threshold accounts, any new-entry signal with trade_type=DAY is
+    a guaranteed same-day round-trip (close_all_day_trades will force-close
+    at market close) → must be blocked outright, regardless of historical
+    day-trade count. Otherwise a single DAY signal consumes IBKR's only
+    remaining day-trade slot and one more mishap locks the account out for
+    30 days.
+
+    SWING signals are still allowed under historical-count logic because the
+    intent is to hold overnight; only an accidental same-day bracket hit
+    would make them a day trade.
+
+    Exits are never blocked by this rule — we must not trap a trader in a
+    position they want to close.
+    """
+
+    def test_blocks_day_type_buy_with_no_history(self):
+        """DAY-type BUY on a sub-$5k account with zero prior day trades must
+        still be rejected — the DAY intent guarantees a same-day round-trip.
+        """
+        sig = _make_signal(
+            ticker="QUBT", action=Action.BUY, trade_type=TradeType.DAY,
+        )
+        ok, reason = check_pdt_restriction(
+            sig, [], portfolio_value=3000.0, recent_trades=[],
+            threshold_usd=5000.0, max_day_trades=1,
+        )
+        assert ok is False, (
+            f"DAY-type BUY on sub-threshold account must be blocked, got ok={ok}"
+        )
+        assert "day" in reason.lower()
+
+    def test_allows_swing_type_buy_with_no_history(self):
+        """Same conditions but trade_type=SWING → allowed (overnight hold,
+        no guaranteed day trade)."""
+        sig = _make_signal(
+            ticker="QUBT", action=Action.BUY, trade_type=TradeType.SWING,
+        )
+        ok, _ = check_pdt_restriction(
+            sig, [], portfolio_value=3000.0, recent_trades=[],
+            threshold_usd=5000.0, max_day_trades=1,
+        )
+        assert ok is True
+
+    def test_allows_day_type_buy_above_threshold(self):
+        """Above the threshold, PDT rules don't apply — DAY-type BUY OK."""
+        sig = _make_signal(
+            ticker="QUBT", action=Action.BUY, trade_type=TradeType.DAY,
+        )
+        ok, _ = check_pdt_restriction(
+            sig, [], portfolio_value=10_000.0, recent_trades=[],
+            threshold_usd=5000.0, max_day_trades=1,
+        )
+        assert ok is True
+
+    def test_allows_exit_of_day_position_even_on_sub_threshold(self):
+        """A SELL closing an existing DAY position must not be blocked — we
+        cannot trap the trader in a position; the close decision has already
+        been made upstream. The rule gates ENTRIES, not exits.
+        """
+        now = datetime.now(timezone.utc)
+        pos = _make_position(
+            ticker="AAPL", quantity=10, entry_time=now,
+            trade_type=TradeType.DAY,
+        )
+        sig = _make_signal(
+            ticker="AAPL", action=Action.SELL, trade_type=TradeType.DAY,
+        )
+        ok, _ = check_pdt_restriction(
+            sig, [pos], portfolio_value=3000.0, recent_trades=[],
+            threshold_usd=5000.0, max_day_trades=1,
+        )
+        # Same-day exit with count=0 — allowed (first day trade within budget);
+        # the DAY-type block only fires for new entries.
+        assert ok is True
+
+
 class TestPDTRestrictionInEvaluate:
     """PDT check must be wired into the main evaluate() function."""
 
@@ -1490,9 +1897,12 @@ class TestPDTRestrictionInEvaluate:
         assert any("pdt" in r.lower() or "day trade" in r.lower() for r in result.reasons)
 
     def test_evaluate_allows_under_threshold_with_no_day_trades(self):
-        """evaluate() must not add PDT friction when there are no prior day trades."""
+        """evaluate() must not add PDT friction for a SWING entry when there
+        are no prior day trades. (DAY-type entries under threshold are
+        blocked by a separate guard, covered in TestPDTBlocksDayTypeOnSubThreshold.)
+        """
         sig = _make_signal(
-            ticker="QUBT", action=Action.BUY,
+            ticker="QUBT", action=Action.BUY, trade_type=TradeType.SWING,
             entry_price=10.0, stop_loss=9.5, take_profit=11.0,
         )
         sig.indicator_values.update({"MA5": 10.5, "MA10": 10.2, "MA20": 10.0})

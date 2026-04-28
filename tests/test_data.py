@@ -677,6 +677,116 @@ class TestAnalystRecommendation:
         )
 
 
+class TestIBKRAnalystRecommendation:
+    """get_analyst_recommendation_ibkr() — Reuters/Refinitiv RESC report via IBKR.
+
+    The RESC report's <ConsRecom> field is a 1.0–5.0 average where
+    1=Strong Buy, 2=Buy, 3=Hold, 4=Sell/Underperform, 5=Strong Sell.
+    The fetch wraps ib.reqFundamentalData(contract, 'RESC') and parses XML.
+
+    All tests mock the IB client so no live connection is needed.
+    """
+
+    @staticmethod
+    def _resc_xml(cons_recom: float | str) -> str:
+        """Build a minimal RESC XML payload with a ConsRecom field."""
+        return (
+            f"<REResearch>"
+            f"<ConsensusEstimates>"
+            f"<Recommendation><ConsRecom>{cons_recom}</ConsRecom></Recommendation>"
+            f"</ConsensusEstimates>"
+            f"</REResearch>"
+        )
+
+    def _make_ib(self, xml: str | None):
+        """Mock ib_insync IB instance whose reqFundamentalData returns xml."""
+        ib = MagicMock()
+        ib.reqFundamentalData = MagicMock(return_value=xml)
+        return ib
+
+    def test_returns_strong_buy_when_cons_recom_below_1_5(self):
+        from core.data import get_analyst_recommendation_ibkr
+        ib = self._make_ib(self._resc_xml(1.2))
+        result = get_analyst_recommendation_ibkr(ib, "AAPL")
+        assert result is not None
+        assert result["consensus"] == "strong_buy"
+
+    def test_returns_buy_when_cons_recom_around_2(self):
+        from core.data import get_analyst_recommendation_ibkr
+        ib = self._make_ib(self._resc_xml(2.0))
+        result = get_analyst_recommendation_ibkr(ib, "MSFT")
+        assert result is not None
+        assert result["consensus"] == "buy"
+
+    def test_returns_hold_when_cons_recom_around_3(self):
+        from core.data import get_analyst_recommendation_ibkr
+        ib = self._make_ib(self._resc_xml(3.0))
+        result = get_analyst_recommendation_ibkr(ib, "GE")
+        assert result is not None
+        assert result["consensus"] == "hold"
+
+    def test_returns_sell_when_cons_recom_around_4(self):
+        from core.data import get_analyst_recommendation_ibkr
+        ib = self._make_ib(self._resc_xml(4.0))
+        result = get_analyst_recommendation_ibkr(ib, "F")
+        assert result is not None
+        assert result["consensus"] == "sell"
+
+    def test_returns_strong_sell_when_cons_recom_above_4_5(self):
+        from core.data import get_analyst_recommendation_ibkr
+        ib = self._make_ib(self._resc_xml(4.7))
+        result = get_analyst_recommendation_ibkr(ib, "BAD")
+        assert result is not None
+        assert result["consensus"] == "strong_sell"
+
+    def test_returns_none_on_empty_xml(self):
+        """No subscription / no data — IBKR returns empty string."""
+        from core.data import get_analyst_recommendation_ibkr
+        ib = self._make_ib("")
+        result = get_analyst_recommendation_ibkr(ib, "NODATA")
+        assert result is None
+
+    def test_returns_none_on_none_response(self):
+        from core.data import get_analyst_recommendation_ibkr
+        ib = self._make_ib(None)
+        result = get_analyst_recommendation_ibkr(ib, "NODATA")
+        assert result is None
+
+    def test_returns_none_when_consrecom_missing(self):
+        """RESC XML returned but ConsRecom field absent — return None gracefully."""
+        from core.data import get_analyst_recommendation_ibkr
+        ib = self._make_ib("<REResearch><Other/></REResearch>")
+        result = get_analyst_recommendation_ibkr(ib, "WEIRD")
+        assert result is None
+
+    def test_returns_none_on_exception(self):
+        """If ib.reqFundamentalData raises, swallow and return None — must not
+        block trading just because the IBKR fundamentals call failed."""
+        from core.data import get_analyst_recommendation_ibkr
+        ib = MagicMock()
+        ib.reqFundamentalData = MagicMock(side_effect=Exception("subscription required"))
+        result = get_analyst_recommendation_ibkr(ib, "FAIL")
+        assert result is None
+
+    def test_caches_result_per_ticker(self):
+        """Second call for the same ticker should not re-hit IBKR."""
+        from core.data import get_analyst_recommendation_ibkr
+        ib = self._make_ib(self._resc_xml(1.8))
+        get_analyst_recommendation_ibkr(ib, "CACHED")
+        get_analyst_recommendation_ibkr(ib, "CACHED")
+        assert ib.reqFundamentalData.call_count == 1
+
+    def test_uses_resc_report_type(self):
+        """Must request the Analyst Estimates report ('RESC')."""
+        from core.data import get_analyst_recommendation_ibkr
+        ib = self._make_ib(self._resc_xml(2.0))
+        get_analyst_recommendation_ibkr(ib, "AAPL")
+        # reportType is the 2nd positional argument or `reportType=` kwarg.
+        call = ib.reqFundamentalData.call_args
+        report_type = call.args[1] if len(call.args) > 1 else call.kwargs.get("reportType")
+        assert report_type == "RESC"
+
+
 # ---------------------------------------------------------------------------
 # Feature 1: Split/dividend adjustment
 # ---------------------------------------------------------------------------

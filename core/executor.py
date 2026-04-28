@@ -7,11 +7,13 @@ from typing import Optional
 
 from ib_insync import IB, Trade as IBTrade, Order, LimitOrder, MarketOrder, StopOrder
 
+from config.settings import DB_PATH
 from core.models import Signal, Position, Trade, Action, TradeType
 from core.connection import create_contract, ensure_connected
 from core.portfolio import (
     add_position, close_position as db_close_position,
-    save_pending_order, get_pending_order_time, remove_pending_order,
+    save_pending_order, get_pending_order_time, get_pending_order_confidence,
+    remove_pending_order,
 )
 
 logger = logging.getLogger(__name__)
@@ -92,7 +94,10 @@ def place_order(
             if parent_order.permId:
                 break
         if parent_order.permId:
-            save_pending_order(parent_order.permId, signal.ticker)
+            save_pending_order(
+                parent_order.permId, signal.ticker,
+                confidence=signal.confidence,
+            )
         else:
             logger.warning(
                 "permId not assigned for %s order after 3s — "
@@ -238,6 +243,100 @@ def get_stale_orders(ib: IB, stale_minutes: int = 1440) -> list[dict]:
                 "age_minutes": age_minutes,
             })
     return stale
+
+
+_PENDING_ACTIVE_STATUSES = ("Submitted", "PreSubmitted")
+
+
+def get_pending_buy_reserve(ib: IB) -> float:
+    """Return the total cash committed to unfilled parent BUY LMT orders.
+
+    Needed because IBKR's ``TotalCashValue`` does not decrement until a bracket
+    entry actually fills. Without subtracting this reserve, the risk manager
+    can approve back-to-back BUYs that together exceed settled cash, and IBKR
+    rejects the second with Error 201 (seen 2026-04-22 on HPE+STLD).
+
+    Filters mirror :func:`get_stale_orders`: only parent limit orders
+    (``parentId == 0``, ``orderType == "LMT"``) with status Submitted or
+    PreSubmitted. Child TP/SL orders are excluded — their cash is already
+    counted via the parent.
+    """
+    total = 0.0
+    for trade in ib.openTrades():
+        order = trade.order
+        if order.parentId != 0 or order.orderType != "LMT":
+            continue
+        if order.action != "BUY":
+            continue
+        if trade.orderStatus.status not in _PENDING_ACTIVE_STATUSES:
+            continue
+        qty = order.totalQuantity or 0
+        price = order.lmtPrice or 0
+        total += float(qty) * float(price)
+    return total
+
+
+def get_pending_buy_orders(ib: IB) -> list[dict]:
+    """Return pending BUY parents joined with the AI confidence from the DB.
+
+    Each entry is ``{trade, perm_id, ticker, confidence, reserved_cash}``. Only
+    parent limit orders (``parentId == 0``, ``orderType == "LMT"``) with
+    status Submitted/PreSubmitted are returned. ``confidence`` is ``None`` for
+    pre-migration orders with no DB row — callers should treat that as zero for
+    ranking purposes.
+    """
+    pending = []
+    for trade in ib.openTrades():
+        order = trade.order
+        if order.parentId != 0 or order.orderType != "LMT":
+            continue
+        if order.action != "BUY":
+            continue
+        if trade.orderStatus.status not in _PENDING_ACTIVE_STATUSES:
+            continue
+        perm_id = order.permId or 0
+        confidence = None
+        if perm_id:
+            confidence = get_pending_order_confidence(perm_id, db_path=DB_PATH)
+        qty = float(order.totalQuantity or 0)
+        price = float(order.lmtPrice or 0)
+        pending.append({
+            "trade": trade,
+            "perm_id": perm_id,
+            "ticker": trade.contract.symbol,
+            "confidence": confidence,
+            "reserved_cash": qty * price,
+        })
+    return pending
+
+
+def evict_weakest_pending(
+    ib: IB,
+    new_confidence: float,
+    needed_cash: float,
+    margin: int = 5,
+) -> bool:
+    """Cancel the weakest pending BUY if it is clearly weaker and frees enough cash.
+
+    Returns True if an order was cancelled (caller should refresh account state
+    and retry placement), False otherwise. v1 only cancels a single order — if
+    one eviction doesn't free enough cash, we bail rather than chain-cancel.
+
+    The ``margin`` prevents thrashing between similarly-confident candidates.
+    """
+    candidates = get_pending_buy_orders(ib)
+    if not candidates:
+        return False
+
+    weakest = min(candidates, key=lambda c: c["confidence"] or 0)
+    weakest_conf = weakest["confidence"] or 0
+    if weakest_conf + margin >= new_confidence:
+        return False
+    if weakest["reserved_cash"] < needed_cash:
+        # A single eviction wouldn't free enough — v1 does not chain.
+        return False
+
+    return cancel_bracket_order(ib, weakest["trade"])
 
 
 def cancel_bracket_order(ib: IB, trade: IBTrade) -> bool:
@@ -569,6 +668,90 @@ def setup_exit_handler(ib: IB, signal: Signal, on_exit=None, parent_order=None) 
             ib.orderStatusEvent -= on_order_status
 
     ib.orderStatusEvent += on_order_status
+
+
+def setup_exit_close_handler(
+    ib: IB,
+    signal: Signal,
+    close_trade: IBTrade,
+    on_exit=None,
+) -> None:
+    """Attach a callback that records an AI-driven exit close in the DB.
+
+    Used when the scheduler routes an exit-signal approval through
+    place_market_order (bypassing the bracket path). The market close order
+    is the parent in this flow — no SL/TP children exist — so we match on
+    the close order's own permId or orderId rather than on parentId > 0.
+
+    Args:
+        close_trade: The ib_insync Trade returned by place_market_order.
+        on_exit: Optional callback(ticker, exit_price, "ai-exit") fired after
+                 the DB close succeeds.
+    """
+    _fired = threading.Event()
+    _close_perm_id = getattr(close_trade.order, "permId", 0)
+    _close_order_id = getattr(close_trade.order, "orderId", 0)
+
+    def _match(trade: IBTrade) -> bool:
+        if _close_perm_id and trade.order.permId == _close_perm_id:
+            return True
+        # permId may not be assigned yet — fall back to orderId + ticker
+        return (
+            trade.order.orderId == _close_order_id
+            and trade.contract.symbol == signal.ticker
+        )
+
+    def on_order_status(trade: IBTrade):
+        if _fired.is_set():
+            return
+        if trade.orderStatus.status != "Filled":
+            return
+        if not _match(trade):
+            return
+        _fired.set()
+        fill_price = trade.orderStatus.avgFillPrice
+        try:
+            trade_record = db_close_position(signal.ticker, fill_price)
+            if trade_record:
+                logger.info(
+                    "AI exit closed: %s @ $%.2f (P&L: $%.2f, %.1f%%)",
+                    signal.ticker, fill_price,
+                    trade_record.pnl, trade_record.pnl_pct,
+                )
+                if on_exit:
+                    on_exit(signal.ticker, fill_price, "ai-exit")
+            else:
+                logger.warning(
+                    "AI exit fill for %s @ $%.2f did not match a DB position",
+                    signal.ticker, fill_price,
+                )
+        finally:
+            try:
+                ib.orderStatusEvent -= on_order_status
+            except Exception:
+                pass
+
+    ib.orderStatusEvent += on_order_status
+
+    # Race guard: fast fills during order placement.
+    if close_trade.orderStatus.status == "Filled":
+        if not _fired.is_set():
+            _fired.set()
+            fill_price = close_trade.orderStatus.avgFillPrice
+            try:
+                trade_record = db_close_position(signal.ticker, fill_price)
+                if trade_record:
+                    logger.info(
+                        "AI exit closed (fast fill): %s @ $%.2f (P&L: $%.2f)",
+                        signal.ticker, fill_price, trade_record.pnl,
+                    )
+                    if on_exit:
+                        on_exit(signal.ticker, fill_price, "ai-exit")
+            finally:
+                try:
+                    ib.orderStatusEvent -= on_order_status
+                except Exception:
+                    pass
 
 
 def import_ibkr_positions(ib: IB, orphaned_tickers: list[str]) -> list[str]:

@@ -3,12 +3,13 @@
 import logging
 import threading
 import time
+import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from typing import Callable, Optional
 
 import pandas as pd
 import yfinance as yf
-from ib_insync import IB, Contract
+from ib_insync import IB, Contract, Stock
 
 from config.settings import TAVILY_API_KEY
 
@@ -561,4 +562,102 @@ def get_analyst_recommendation(ticker: str) -> dict | None:
         return result
     except Exception as e:
         logger.warning("Failed to fetch analyst recommendation for %s: %s", ticker, e)
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Analyst Recommendations (IBKR — Reuters/Refinitiv via reqFundamentalData)
+# ---------------------------------------------------------------------------
+
+def _ibkr_cons_recom_to_label(score: float) -> str:
+    """Map Reuters/Refinitiv I/B/E/S average rating to a yfinance-style label.
+
+    The cons_recom field is the mean across covering analysts on a 1.0–5.0
+    scale: 1=Strong Buy, 2=Buy, 3=Hold, 4=Underperform/Sell, 5=Sell.
+    Bucket boundaries are placed at the half-points so a 1.49 average rounds
+    to strong_buy and 1.51 rounds to buy — same convention Yahoo uses.
+    """
+    if score < 1.5:
+        return "strong_buy"
+    if score < 2.5:
+        return "buy"
+    if score < 3.5:
+        return "hold"
+    if score < 4.5:
+        return "sell"
+    return "strong_sell"
+
+
+def _parse_cons_recom(xml_text: str) -> Optional[float]:
+    """Extract the ConsRecom float from a RESC XML payload, or None if absent.
+
+    The XML schema isn't pinned across IBKR releases, so we search for the
+    first <ConsRecom> element anywhere in the tree rather than asserting a
+    fixed path. Returns None when the element is missing or non-numeric.
+    """
+    try:
+        root = ET.fromstring(xml_text)
+    except ET.ParseError:
+        return None
+    for el in root.iter("ConsRecom"):
+        text = (el.text or "").strip()
+        if not text:
+            continue
+        try:
+            return float(text)
+        except ValueError:
+            continue
+    return None
+
+
+def get_analyst_recommendation_ibkr(
+    ib: IB,
+    ticker: str,
+    exchange: str = "SMART",
+) -> Optional[dict]:
+    """Fetch IBKR analyst consensus via the Reuters/Refinitiv RESC report.
+
+    This is the second source for the two-source analyst-consensus gate. The
+    primary source is yfinance (get_analyst_recommendation). A BUY only goes
+    through when both report "buy" or "strong_buy".
+
+    Returns dict with keys:
+        consensus: "strong_buy" | "buy" | "hold" | "sell" | "strong_sell"
+        cons_recom: float — the raw 1.0–5.0 mean rating
+
+    Returns None when:
+        - The Reuters Fundamentals subscription is not available
+        - The contract has no analyst coverage
+        - The XML lacks a ConsRecom field
+        - reqFundamentalData raises (network / connection)
+
+    A None result causes check_analyst_consensus to block the BUY — we cannot
+    confirm two-source agreement without IBKR's read.
+    """
+    cache_key = f"analyst_ibkr:{ticker}"
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
+
+    try:
+        contract = Stock(ticker, exchange, "USD")
+        xml_text = ib.reqFundamentalData(contract, "RESC")
+        if not xml_text:
+            return None
+
+        cons_recom = _parse_cons_recom(xml_text)
+        if cons_recom is None:
+            logger.debug("IBKR RESC for %s had no ConsRecom field", ticker)
+            return None
+
+        consensus = _ibkr_cons_recom_to_label(cons_recom)
+        result = {"consensus": consensus, "cons_recom": cons_recom}
+        _cache_set(cache_key, result, ttl=_ANALYST_TTL)
+        logger.info(
+            "IBKR analyst recommendation for %s: %s (cons_recom=%.2f)",
+            ticker, consensus, cons_recom,
+        )
+        return result
+    except Exception as e:
+        logger.warning("Failed to fetch IBKR analyst rec for %s: %s", ticker, e)
         return None

@@ -1,6 +1,7 @@
 """Telegram bot notifications + interactive status via polling."""
 
 import asyncio
+import html as _html
 import logging
 import threading
 from datetime import datetime
@@ -44,6 +45,28 @@ def _run_async(coro):
         loop.close()
 
 
+# Tags Telegram accepts in HTML parse mode and that the codebase actually emits.
+# Everything else (e.g. <br> appearing inside IBKR error reasons) is escaped.
+_ALLOWED_HTML_TAGS = (
+    "b", "/b", "i", "/i", "u", "/u", "s", "/s",
+    "code", "/code", "pre", "/pre",
+)
+
+
+def _sanitize_html(text: str) -> str:
+    """Escape unsafe HTML while preserving Telegram-supported formatting tags.
+
+    Embedded user- or broker-supplied strings (e.g. IBKR rejection reasons) can
+    contain fragments like ``<br>`` that crash Telegram's HTML parse mode. This
+    sanitizer escapes everything through :func:`html.escape`, then restores the
+    small whitelist of tags this module uses in its notify_* helpers.
+    """
+    escaped = _html.escape(text, quote=False)
+    for tag in _ALLOWED_HTML_TAGS:
+        escaped = escaped.replace(f"&lt;{tag}&gt;", f"<{tag}>")
+    return escaped
+
+
 def _send_sync(text: str) -> bool:
     """Send a message synchronously (fire-and-forget)."""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
@@ -56,7 +79,7 @@ def _send_sync(text: str) -> bool:
         _run_async(
             bot.send_message(
                 chat_id=TELEGRAM_CHAT_ID,
-                text=text,
+                text=_sanitize_html(text),
                 parse_mode="HTML",
             )
         )
