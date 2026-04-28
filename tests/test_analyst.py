@@ -494,14 +494,22 @@ def _mock_http_response(body: bytes) -> MagicMock:
 
 @pytest.fixture
 def reset_analyst_state():
-    """Clear process-wide Gemini exhaustion flag and zero per-provider token counters.
+    """Clear process-wide Gemini state and zero per-provider token counters.
 
     Autouse-style in every provider-routing / token test — state must not leak
-    across cases because _gemini_exhausted and _daily_token_usage are module
-    globals in core.analyst.
+    across cases because _gemini_exhausted, _gemini_keys, _gemini_key_index,
+    _gemini_key_exhausted, and _daily_token_usage are all module globals.
+
+    Critically: also clears `_gemini_keys` and `_gemini_key_exhausted` so the
+    user's real ``.env`` cannot leak a real GEMINI_API_KEY into single-key
+    tests that only patch ``GEMINI_API_KEY``. Each test opts into multi-key
+    mode explicitly by ``patch("core.analyst._gemini_keys", [...])``.
     """
     from core import analyst as _a
     _a._gemini_exhausted.clear()
+    _a._gemini_keys = []
+    _a._gemini_key_index = 0
+    _a._gemini_key_exhausted.clear()
     _a._daily_token_usage["gemini"]["input"] = 0
     _a._daily_token_usage["gemini"]["output"] = 0
     _a._daily_token_usage["ollama"]["input"] = 0
@@ -509,6 +517,9 @@ def reset_analyst_state():
     _a._daily_token_usage["date"] = None
     yield
     _a._gemini_exhausted.clear()
+    _a._gemini_keys = []
+    _a._gemini_key_index = 0
+    _a._gemini_key_exhausted.clear()
 
 
 class TestProviderConfigImports:
@@ -770,6 +781,297 @@ class TestGeminiCallContract:
         payload = self._extract_payload(mu)
         action_enum = payload["generationConfig"]["responseSchema"]["properties"]["action"]["enum"]
         assert set(action_enum) == {"buy", "sell", "hold"}
+
+
+class TestGeminiExhaustionMarkers:
+    """Marker-based classification of permanent (RPD/quota/auth) vs transient
+    (RPM/per-minute) Gemini 429 errors.
+
+    The 2026-04-27 production bug: tonight's response body
+    "You exceeded your current quota" matched no marker, so the per-key
+    exhaustion flag never latched and every candidate burned a wasted
+    Gemini round-trip before falling to the slow Ollama path.
+
+    The fix is to extend `_GEMINI_EXHAUSTION_MARKERS` to capture RPD/quota
+    phrasing — but NOT to also catch per-minute (RPM) phrasing, which is a
+    transient rate limit and should let the next key in the rotation try.
+    """
+
+    def test_existing_credits_depleted_marker_still_matches(self):
+        from core.analyst import _is_permanent_gemini_exhaustion
+        assert _is_permanent_gemini_exhaustion(
+            "Your prepayment credits are depleted."
+        ) is True
+
+    def test_existing_free_tier_limit_marker_still_matches(self):
+        from core.analyst import _is_permanent_gemini_exhaustion
+        assert _is_permanent_gemini_exhaustion(
+            "Free tier limit exceeded."
+        ) is True
+
+    def test_rpd_message_exceeded_your_current_quota_matches(self):
+        """The exact 2026-04-27 production error must classify as permanent."""
+        from core.analyst import _is_permanent_gemini_exhaustion
+        body = (
+            '{"error":{"code":429,"message":"You exceeded your current quota, '
+            'please check your plan and billing details."}}'
+        )
+        assert _is_permanent_gemini_exhaustion(body) is True
+
+    def test_rpd_phrasing_requests_per_day_matches(self):
+        """Google's RPD-specific phrasing must classify as permanent."""
+        from core.analyst import _is_permanent_gemini_exhaustion
+        body = (
+            "Quota exceeded for quota metric 'GenerateRequestsPerDayPerProjectPerModel-FreeTier' "
+            "and limit 'requests per day' for service ..."
+        )
+        assert _is_permanent_gemini_exhaustion(body) is True
+
+    def test_rpm_per_minute_message_does_NOT_match(self):
+        """Per-minute rate limit is recoverable; must not latch."""
+        from core.analyst import _is_permanent_gemini_exhaustion
+        body = (
+            "Quota exceeded for quota metric 'requests' and limit "
+            "'requests per minute' for service ..."
+        )
+        assert _is_permanent_gemini_exhaustion(body) is False
+
+    def test_rpm_alternate_phrasing_does_NOT_match(self):
+        from core.analyst import _is_permanent_gemini_exhaustion
+        assert _is_permanent_gemini_exhaustion(
+            "Rate limit exceeded; retry in 30s"
+        ) is False
+
+    def test_empty_body_does_not_match(self):
+        from core.analyst import _is_permanent_gemini_exhaustion
+        assert _is_permanent_gemini_exhaustion("") is False
+        assert _is_permanent_gemini_exhaustion(None) is False
+
+    def test_case_insensitive(self):
+        from core.analyst import _is_permanent_gemini_exhaustion
+        assert _is_permanent_gemini_exhaustion(
+            "YOU EXCEEDED YOUR CURRENT QUOTA"
+        ) is True
+
+
+class TestGeminiAPIKeysParser:
+    """config/settings.py exposes a pure parser for the GEMINI_API_KEYS env var.
+
+    The parser keeps the env-var glue out of analyst tests and makes the
+    fallback rules (multi → single → empty) testable without env reloads.
+    """
+
+    def test_parses_comma_separated(self):
+        from config.settings import _parse_gemini_keys
+        assert _parse_gemini_keys("k1,k2,k3", "") == ["k1", "k2", "k3"]
+
+    def test_strips_whitespace(self):
+        from config.settings import _parse_gemini_keys
+        assert _parse_gemini_keys("k1, k2 ,  k3 ", "") == ["k1", "k2", "k3"]
+
+    def test_filters_empty_segments(self):
+        from config.settings import _parse_gemini_keys
+        assert _parse_gemini_keys("k1,,k2,", "") == ["k1", "k2"]
+
+    def test_falls_back_to_single_key_when_keys_empty(self):
+        from config.settings import _parse_gemini_keys
+        assert _parse_gemini_keys("", "legacy_only") == ["legacy_only"]
+
+    def test_keys_takes_precedence_over_single_key(self):
+        from config.settings import _parse_gemini_keys
+        assert _parse_gemini_keys("k1,k2", "ignored") == ["k1", "k2"]
+
+    def test_empty_returns_empty_list(self):
+        from config.settings import _parse_gemini_keys
+        assert _parse_gemini_keys("", "") == []
+
+
+class TestGeminiKeyRotation:
+    """Multi-key rotation:
+
+      - Round-robin per call: each successive _call_gemini uses the next key.
+      - RPD/auth 429 marks ONLY that key's exhausted flag and advances to
+        the next key. The global _gemini_exhausted is set only when ALL keys
+        are exhausted, which is what gates the Ollama fallback in _call_llm.
+      - RPM 429 (transient) advances to the next key WITHOUT latching any
+        flag — that key may recover on its next attempt.
+      - Cross-key RPM stampede (every key 429s in pass 0) sleeps once and
+        retries. After the second pass also fails, raise without latching.
+      - Single-key (legacy GEMINI_API_KEY only, no GEMINI_API_KEYS) keeps
+        the pre-rotation behavior — no extra sleep, no retry pass.
+    """
+
+    @staticmethod
+    def _make_http_error(code, body, reason="error"):
+        import io
+        import urllib.error
+        return urllib.error.HTTPError(
+            url="https://generativelanguage.googleapis.com/fake",
+            code=code, msg=reason, hdrs=None, fp=io.BytesIO(body),
+        )
+
+    @staticmethod
+    def _success_response():
+        return _mock_http_response(_gemini_success_body(_valid_llm_response_text()))
+
+    @staticmethod
+    def _key_in_request(call_args) -> str:
+        """Extract the ?key=... value from a urlopen Request call."""
+        req = call_args[0][0]
+        url = req.full_url
+        if "key=" not in url:
+            return ""
+        return url.split("key=")[-1].split("&")[0]
+
+    def test_round_robin_advances_per_call(self, reset_analyst_state):
+        """3 keys, 3 successive calls — each call uses the next key in order."""
+        from core.analyst import _call_gemini
+        with patch("core.analyst._gemini_keys", ["KEY_A", "KEY_B", "KEY_C"]), \
+             patch("core.analyst.urllib.request.urlopen") as mu:
+            mu.return_value = self._success_response()
+            for _ in range(3):
+                _call_gemini("prompt")
+                # urlopen consumes the response body, reset for the next call
+                mu.return_value = self._success_response()
+        keys_used = [self._key_in_request(c) for c in mu.call_args_list]
+        assert keys_used == ["KEY_A", "KEY_B", "KEY_C"], (
+            f"Round-robin must advance one step per call. Got {keys_used}"
+        )
+
+    def test_rpd_429_marks_only_that_key_and_falls_through(self, reset_analyst_state):
+        """key A returns RPD-marker 429 → mark A → try B → return success."""
+        from core import analyst
+        from core.analyst import _call_gemini
+        rpd_body = (
+            b'{"error":{"code":429,"message":"You exceeded your current quota."}}'
+        )
+        with patch("core.analyst._gemini_keys", ["KEY_A", "KEY_B"]), \
+             patch("core.analyst.urllib.request.urlopen") as mu:
+            mu.side_effect = [
+                self._make_http_error(429, rpd_body, "Too Many Requests"),
+                self._success_response(),
+            ]
+            result = _call_gemini("prompt")
+        assert result is not None and result.get("action") == "buy"
+        assert analyst._gemini_key_exhausted.get("KEY_A").is_set() is True
+        # KEY_B must not be marked
+        flag_b = analyst._gemini_key_exhausted.get("KEY_B")
+        assert flag_b is None or not flag_b.is_set()
+        # Global flag must not be set when at least one key remains
+        assert analyst._gemini_exhausted.is_set() is False
+
+    def test_all_keys_rpd_exhausted_latches_global_flag(self, reset_analyst_state):
+        """When every key reports RPD-marker 429, latch the global flag so the
+        router falls back to Ollama for the rest of the process.
+        """
+        from core import analyst
+        from core.analyst import _call_gemini, _GeminiTransportError
+        rpd_body = (
+            b'{"error":{"code":429,"message":"You exceeded your current quota."}}'
+        )
+        with patch("core.analyst._gemini_keys", ["KEY_A", "KEY_B"]), \
+             patch("core.analyst.urllib.request.urlopen") as mu:
+            mu.side_effect = [
+                self._make_http_error(429, rpd_body, "Too Many Requests"),
+                self._make_http_error(429, rpd_body, "Too Many Requests"),
+            ]
+            with pytest.raises(_GeminiTransportError):
+                _call_gemini("prompt")
+        assert analyst._gemini_exhausted.is_set() is True
+
+    def test_rpm_429_tries_next_key_without_latching(self, reset_analyst_state):
+        """key A returns RPM 429 (transient) → advance → key B succeeds.
+        No flags should be latched; both keys remain available for next call.
+        """
+        from core import analyst
+        from core.analyst import _call_gemini
+        rpm_body = (
+            b'{"error":{"code":429,"message":"Quota exceeded for quota metric '
+            b"'requests' and limit 'requests per minute'.\"}}"
+        )
+        with patch("core.analyst._gemini_keys", ["KEY_A", "KEY_B"]), \
+             patch("core.analyst.urllib.request.urlopen") as mu, \
+             patch("core.analyst.time.sleep") as ms:
+            mu.side_effect = [
+                self._make_http_error(429, rpm_body, "Too Many Requests"),
+                self._success_response(),
+            ]
+            result = _call_gemini("prompt")
+        assert result is not None and result.get("action") == "buy"
+        # No flag latched on either key
+        for k in ("KEY_A", "KEY_B"):
+            flag = analyst._gemini_key_exhausted.get(k)
+            assert flag is None or not flag.is_set(), (
+                f"{k} flag should not be set after a transient RPM 429"
+            )
+        assert analyst._gemini_exhausted.is_set() is False
+        # No sleep needed when the next key in the rotation succeeded
+        ms.assert_not_called()
+
+    def test_cross_key_rpm_stampede_sleeps_then_retries(self, reset_analyst_state):
+        """Both keys 429-RPM in pass 0 → sleep once → both 429-RPM in pass 1
+        → raise transport error; no flags latched (RPM is recoverable, just
+        slower than the candidate's allotted wall time).
+        """
+        from core import analyst
+        from core.analyst import _call_gemini, _GeminiTransportError
+        rpm_body = (
+            b'{"error":{"code":429,"message":"requests per minute"}}'
+        )
+        with patch("core.analyst._gemini_keys", ["KEY_A", "KEY_B"]), \
+             patch("core.analyst.urllib.request.urlopen") as mu, \
+             patch("core.analyst.time.sleep") as ms:
+            # Pass 0: A → 429, B → 429.  Pass 1 (after sleep): A → 429, B → 429.
+            mu.side_effect = [
+                self._make_http_error(429, rpm_body, "Too Many Requests"),
+                self._make_http_error(429, rpm_body, "Too Many Requests"),
+                self._make_http_error(429, rpm_body, "Too Many Requests"),
+                self._make_http_error(429, rpm_body, "Too Many Requests"),
+            ]
+            with pytest.raises(_GeminiTransportError):
+                _call_gemini("prompt")
+        # Exactly one sleep between the two passes
+        ms.assert_called_once()
+        sleep_seconds = ms.call_args[0][0]
+        assert sleep_seconds >= 10, (
+            f"Cross-key RPM stampede should sleep >=10s, got {sleep_seconds}"
+        )
+        # Flag must NOT latch on transient RPM, even after retry pass failed
+        assert analyst._gemini_exhausted.is_set() is False
+
+    def test_single_key_skips_retry_pass_to_avoid_30s_sleep(self, reset_analyst_state):
+        """When only one key is configured, the RPM-stampede retry pass MUST
+        be skipped — sleeping 30s mid-call when there's no alternate key to
+        try is pure latency. Maintains pre-rotation single-key behavior.
+        """
+        from core import analyst
+        from core.analyst import _call_gemini, _GeminiTransportError
+        rpm_body = b'{"error":{"message":"requests per minute"}}'
+        with patch("core.analyst._gemini_keys", ["ONLY_KEY"]), \
+             patch("core.analyst.urllib.request.urlopen") as mu, \
+             patch("core.analyst.time.sleep") as ms:
+            mu.side_effect = self._make_http_error(429, rpm_body, "Too Many Requests")
+            with pytest.raises(_GeminiTransportError):
+                _call_gemini("prompt")
+        # Exactly ONE HTTP attempt, no sleep
+        assert mu.call_count == 1
+        ms.assert_not_called()
+        assert analyst._gemini_exhausted.is_set() is False
+
+    def test_legacy_GEMINI_API_KEY_only_still_works(self, reset_analyst_state):
+        """Backward compat: when GEMINI_API_KEYS is empty/unset (the existing
+        single-key deployment), the GEMINI_API_KEY value is used as a one-key
+        rotation list. Existing tests already patch GEMINI_API_KEY directly.
+        """
+        from core.analyst import _call_gemini
+        with patch("core.analyst._gemini_keys", []), \
+             patch("core.analyst.GEMINI_API_KEY", "LEGACY_KEY"), \
+             patch("core.analyst.urllib.request.urlopen") as mu:
+            mu.return_value = self._success_response()
+            result = _call_gemini("prompt")
+        assert result is not None
+        # Confirm the legacy single-key was actually used in the request
+        assert "LEGACY_KEY" in mu.call_args[0][0].full_url
 
 
 class TestLLMProviderRouting:

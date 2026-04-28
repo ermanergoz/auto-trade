@@ -8,6 +8,7 @@ Tavily->YFinance exhaustion pattern in core/data.py.
 import json
 import logging
 import threading
+import time
 import urllib.error
 import urllib.request
 from datetime import datetime
@@ -21,6 +22,7 @@ from config.settings import (
     AI_CONFIDENCE_THRESHOLD,
     ALLOW_SHORT_SELLING,
     GEMINI_API_KEY,
+    GEMINI_API_KEYS,
     GEMINI_HOST,
     GEMINI_MODEL,
     OLLAMA_HOST,
@@ -47,21 +49,90 @@ _token_lock = threading.Lock()
 _gemini_exhausted = threading.Event()
 
 # Substring markers (case-insensitive) that classify a Gemini error body as
-# PERMANENT exhaustion. Tighter than the Tavily list because Gemini emits
-# "Quota exceeded per minute" for transient per-minute rate limits — a bare
-# "quota" marker would latch the flag on recoverable conditions.
+# PERMANENT exhaustion (RPD/quota/credits). Tighter than the Tavily list
+# because Gemini emits "Quota exceeded ... requests per minute" for transient
+# RPM rate limits — a bare "quota" marker would latch the flag on recoverable
+# conditions and block the rotation from advancing to a sibling key.
 _GEMINI_EXHAUSTION_MARKERS = (
     "prepayment credits are depleted",
     "usage limit",
     "limit: 0",
     "free tier limit",
     "quota metric exceeded",
+    # 2026-04-27 production: tonight's RPD-exhaustion body. Caught by neither
+    # of the older markers, so the per-key flag never latched and every
+    # candidate burned a wasted Gemini round-trip before falling to Ollama.
+    "exceeded your current quota",
+    # Google's RPD-specific phrasing returned alongside the
+    # GenerateRequestsPerDayPerProjectPerModel-FreeTier metric.
+    "requests per day",
 )
 
 
 def _is_permanent_gemini_exhaustion(body_text: str) -> bool:
     lowered = (body_text or "").lower()
     return any(marker in lowered for marker in _GEMINI_EXHAUSTION_MARKERS)
+
+
+# ---------------------------------------------------------------------------
+# Multi-key rotation state — see _call_gemini below.
+#
+# 3 free-tier keys × 1,000 RPD = 3,000 RPD pool, which fits the bot's ~2,688
+# calls/day at the current 15-min scan cadence. Rotation also raises the
+# burst RPM ceiling to 45 (3 × 15), comfortably above ~28-candidate scans.
+# ---------------------------------------------------------------------------
+_gemini_keys: list[str] = list(GEMINI_API_KEYS)  # patchable for tests
+_gemini_key_lock = threading.Lock()
+_gemini_key_index: int = 0
+# Per-key permanent-exhaustion flags. Keys are added lazily on first failure.
+# Cleared on process restart (same lifetime as _gemini_exhausted).
+_gemini_key_exhausted: dict[str, threading.Event] = {}
+
+# Sleep between the cross-key first-pass and the retry pass when EVERY key
+# returns a transient RPM 429 in a single call attempt. Bounded to one sleep
+# per call. Set to 30s — Gemini RPM windows are 60s, so a 30s wait gives a
+# real chance for the bucket to drain without doubling the candidate's wall
+# time. Single-key deployments skip this sleep (no sibling to recover).
+_GEMINI_RPM_RETRY_SLEEP = 30
+
+
+class _GeminiKeyExhausted(Exception):
+    """Internal signal: this specific key is permanently exhausted (RPD/auth).
+    Mark the per-key flag and try the next key in the rotation."""
+
+
+class _GeminiKeyTransient(Exception):
+    """Internal signal: this key returned a transient RPM 429.
+    Try the next key without latching anything."""
+
+
+def _ensure_key_event(key: str) -> threading.Event:
+    """Get-or-create the per-key exhaustion flag (thread-safe)."""
+    with _gemini_key_lock:
+        ev = _gemini_key_exhausted.get(key)
+        if ev is None:
+            ev = threading.Event()
+            _gemini_key_exhausted[key] = ev
+        return ev
+
+
+def _active_gemini_keys() -> list[str]:
+    """Current key list, freshly resolved so test patches take effect.
+
+    Precedence: ``_gemini_keys`` (multi-key list) wins when non-empty.
+    Otherwise fall back to ``GEMINI_API_KEY`` (legacy single-key path) so
+    existing tests that ``patch("core.analyst.GEMINI_API_KEY", "dummy")``
+    keep working unchanged.
+
+    Filters out keys whose RPD-exhaustion flag is set.
+    """
+    if _gemini_keys:
+        keys = list(_gemini_keys)
+    elif GEMINI_API_KEY:
+        keys = [GEMINI_API_KEY]
+    else:
+        return []
+    return [k for k in keys if not _ensure_key_event(k).is_set()]
 
 
 def _reset_daily_usage_if_needed() -> None:
@@ -275,22 +346,18 @@ def _gemini_response_schema() -> dict:
     }
 
 
-def _call_gemini(prompt: str) -> Optional[dict]:
-    """Call Gemini generateContent. Returns parsed JSON dict.
+def _call_gemini_with_key(prompt: str, key: str) -> Optional[dict]:
+    """Single Gemini attempt against ONE specific key.
 
-    Exhaustion signals that latch _gemini_exhausted for the rest of the process:
-      - HTTP 401/403 (invalid key / permissions)
-      - HTTP 429 whose body matches _GEMINI_EXHAUSTION_MARKERS (credits depleted, etc.)
-
-    Any transport failure (5xx, transient 429, network error, exhausted auth)
-    raises _GeminiTransportError so the router can fall straight through to
-    Ollama. Content issues (bad envelope, unparseable inner JSON) return None
-    so the router can retry the provider.
+    Maps HTTP 401/403 and RPD-marker 429 to ``_GeminiKeyExhausted`` so the
+    rotation can mark the key dead and advance to the next.
+    Maps non-marker 429 (RPM) to ``_GeminiKeyTransient`` so the rotation
+    can advance without latching anything.
+    Other failures (5xx, network) raise ``_GeminiTransportError`` directly
+    — those aren't key-specific, so trying a sibling won't help.
+    Content errors (bad envelope) return None so the outer router can retry.
     """
-    if not GEMINI_API_KEY or _gemini_exhausted.is_set():
-        raise _GeminiTransportError("gemini unavailable (no key or exhausted)")
-
-    url = f"{GEMINI_HOST}/v1beta/models/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
+    url = f"{GEMINI_HOST}/v1beta/models/{GEMINI_MODEL}:generateContent?key={key}"
     payload = json.dumps({
         "contents": [{"parts": [{"text": prompt}]}],
         "generationConfig": {
@@ -313,14 +380,15 @@ def _call_gemini(prompt: str) -> Optional[dict]:
     except urllib.error.HTTPError as e:
         body = e.read().decode("utf-8", errors="replace") if hasattr(e, "read") else ""
         if e.code in (401, 403):
-            logger.warning("Gemini auth failed (%d) — latching exhausted flag: %s", e.code, body[:200])
-            _gemini_exhausted.set()
-            raise _GeminiTransportError(f"auth {e.code}") from e
-        if e.code == 429 and _is_permanent_gemini_exhaustion(body):
-            logger.warning("Gemini plan exhausted — short-circuiting for process lifetime: %s", body[:200])
-            _gemini_exhausted.set()
-            raise _GeminiTransportError("429 exhausted") from e
-        logger.warning("Gemini transient HTTP %d: %s", e.code, body[:200])
+            logger.warning("Gemini auth failed (%d) — marking key exhausted: %s", e.code, body[:200])
+            raise _GeminiKeyExhausted(f"auth {e.code}") from e
+        if e.code == 429:
+            if _is_permanent_gemini_exhaustion(body):
+                logger.warning("Gemini RPD/quota exhausted for this key: %s", body[:200])
+                raise _GeminiKeyExhausted("429 RPD") from e
+            logger.warning("Gemini RPM 429 — will try next key: %s", body[:200])
+            raise _GeminiKeyTransient("429 RPM") from e
+        logger.warning("Gemini HTTP %d: %s", e.code, body[:200])
         raise _GeminiTransportError(f"http {e.code}") from e
     except urllib.error.URLError as e:
         logger.warning("Gemini network error: %s", e)
@@ -342,6 +410,81 @@ def _call_gemini(prompt: str) -> Optional[dict]:
     )
     logger.info("Gemini response OK (%s)", GEMINI_MODEL)
     return parsed
+
+
+def _call_gemini(prompt: str) -> Optional[dict]:
+    """Multi-key rotation wrapper around _call_gemini_with_key.
+
+    Each call advances a round-robin cursor by one position so successive
+    candidates spread their requests across the configured keys. Within a
+    single call:
+
+      - RPD/auth (permanent) on a key marks ONLY that key's flag and tries
+        the next key. When every key is RPD-exhausted, latch the global
+        ``_gemini_exhausted`` and raise; the router then short-circuits to
+        Ollama for the rest of the process.
+      - RPM (transient) on a key advances to the next key without marking
+        anything. If every key 429s in pass 0 *and* there is more than one
+        key, sleep ``_GEMINI_RPM_RETRY_SLEEP`` once and try a second pass.
+        Single-key deployments skip the retry pass — sleeping mid-call when
+        there is no sibling to recover is pure latency.
+
+    Content errors (bad envelope, unparseable JSON) return ``None`` so the
+    outer router can retry the same provider with a fresh prompt sample.
+    """
+    global _gemini_key_index
+
+    if _gemini_exhausted.is_set():
+        raise _GeminiTransportError("gemini unavailable (all keys exhausted)")
+
+    initial_keys = _active_gemini_keys()
+    if not initial_keys:
+        _gemini_exhausted.set()
+        raise _GeminiTransportError("gemini unavailable (no active keys)")
+
+    # Reserve a starting cursor for this call and advance for the next call.
+    with _gemini_key_lock:
+        start_cursor = _gemini_key_index
+        _gemini_key_index = (start_cursor + 1) % max(len(initial_keys), 1)
+
+    multi_key = len(initial_keys) > 1
+    passes = 2 if multi_key else 1
+
+    for pass_num in range(passes):
+        if pass_num == 1:
+            # Cross-key RPM stampede: every key 429-RPM'd in pass 0. Sleep
+            # once and try a second pass. Bounded to one sleep per call.
+            time.sleep(_GEMINI_RPM_RETRY_SLEEP)
+            logger.info(
+                "Cross-key RPM stampede — slept %ds, retrying rotation",
+                _GEMINI_RPM_RETRY_SLEEP,
+            )
+
+        keys = _active_gemini_keys()
+        if not keys:
+            _gemini_exhausted.set()
+            raise _GeminiTransportError("all keys exhausted")
+
+        # Reorder starting from this call's reserved cursor (modulo the
+        # current active-key list — some keys may have been latched in
+        # an earlier iteration of this same call).
+        offset = start_cursor % len(keys)
+        order = keys[offset:] + keys[:offset]
+
+        for key in order:
+            try:
+                return _call_gemini_with_key(prompt, key)
+            except _GeminiKeyExhausted:
+                _ensure_key_event(key).set()
+                if not _active_gemini_keys():
+                    _gemini_exhausted.set()
+                    raise _GeminiTransportError("all keys exhausted") from None
+                continue
+            except _GeminiKeyTransient:
+                continue
+        # End of this pass — fall through to retry pass if multi_key.
+
+    raise _GeminiTransportError("all keys 429 RPM after retry pass")
 
 
 # ---------------------------------------------------------------------------

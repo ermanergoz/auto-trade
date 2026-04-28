@@ -79,7 +79,37 @@ AI_PROVIDER = os.getenv("AI_PROVIDER", "gemini").lower()
 
 # Gemini (primary when AI_PROVIDER=gemini). Missing key silently falls back to
 # Ollama — matching the TAVILY_API_KEY "optional API" precedent.
+#
+# Two ways to configure keys, both checked at startup:
+#   GEMINI_API_KEYS=key1,key2,key3   ← preferred: comma-separated rotation list
+#   GEMINI_API_KEY=key1              ← legacy: single key (used only when KEYS unset)
+# Rotation triples free-tier RPD headroom — see docs/CODE-DOCUMENTATION.md.
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+
+
+def _parse_gemini_keys(api_keys_env: str, single_key_env: str) -> list[str]:
+    """Resolve the active Gemini key list.
+
+    Precedence:
+        1. GEMINI_API_KEYS (comma-separated, whitespace trimmed, empty
+           segments dropped). Wins whenever it parses to ≥1 keys.
+        2. GEMINI_API_KEY (single key) — backward-compat fallback.
+        3. Empty list — no keys configured; analyst will raise and the
+           router falls through to Ollama.
+    """
+    if api_keys_env:
+        keys = [k.strip() for k in api_keys_env.split(",") if k.strip()]
+        if keys:
+            return keys
+    if single_key_env:
+        return [single_key_env]
+    return []
+
+
+GEMINI_API_KEYS = _parse_gemini_keys(
+    os.getenv("GEMINI_API_KEYS", ""),
+    GEMINI_API_KEY,
+)
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite")
 GEMINI_HOST = os.getenv("GEMINI_HOST", "https://generativelanguage.googleapis.com")
 
@@ -105,7 +135,7 @@ MIN_RISK_REWARD_RATIO = 1.5     # Minimum reward/risk ratio
 RISK_PER_TRADE_PCT = 5.0        # Risk per trade as % of portfolio (used in sizing + cumulative risk)
 ALLOW_SHORT_SELLING = False     # Block sell signals for stocks not currently held
 VOLATILITY_BASELINE = 0.20      # Baseline annualized volatility (20%) for position scaling
-CHECK_ANALYST_CONSENSUS = True  # Block BUY when analyst consensus is sell/strong sell
+CHECK_ANALYST_CONSENSUS = True  # Block BUY unless BOTH yfinance and IBKR analyst consensus are buy/strong_buy
 CORRELATION_CAP_THRESHOLD = 0.7 # Reject candidate if return-correlation with any open position exceeds this (1.0 disables)
 
 # Circuit breaker — pause trading after consecutive losses
