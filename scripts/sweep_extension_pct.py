@@ -13,6 +13,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import sys
 import time
@@ -34,7 +35,7 @@ import backtest.engine as backtest_engine
 
 UNIVERSE_FILE = REPO_ROOT / "data" / "universe_us_2026-04-17.json"
 
-THRESHOLDS = [0.0, 10.0, 15.0, 20.0, 25.0, 30.0]  # 0 disables the filter
+THRESHOLDS = [0.0, 10.0, 12.0, 15.0, 20.0, 25.0, 30.0]  # 0 disables the filter
 
 
 def load_tickers(sample_size: int | None) -> list[str]:
@@ -158,6 +159,25 @@ def print_table(rows: list[dict]) -> None:
         print(" | ".join(c.ljust(w) for c, w in zip(line, widths)))
 
 
+def write_csv(rows: list[dict], days: int, n_tickers: int) -> Path:
+    """Persist sweep results so future runs can compare against this baseline."""
+    out_path = REPO_ROOT / "data" / f"sweep_extension_pct_{date.today().isoformat()}.csv"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fields = [
+        "threshold", "trades", "win_rate", "total_return",
+        "sharpe", "max_dd", "avg_pnl", "final_value",
+        "xndu_bought", "artv_bought",
+    ]
+    with out_path.open("w", newline="") as f:
+        f.write(f"# sweep date={date.today().isoformat()} window_days={days} tickers={n_tickers}\n")
+        writer = csv.DictWriter(f, fieldnames=fields)
+        writer.writeheader()
+        for r in rows:
+            writer.writerow({k: r.get(k) for k in fields})
+    print(f"\nResults written to {out_path}")
+    return out_path
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--sample", type=int, default=None,
@@ -172,6 +192,7 @@ def main() -> None:
 
     rows = run_sweep(tickers, args.days)
     print_table(rows)
+    write_csv(rows, days=args.days, n_tickers=len(tickers))
 
 
 if __name__ == "__main__":

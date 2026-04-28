@@ -558,3 +558,30 @@ class TestExtensionGuard:
         actions = [s.action for s in signals]
         assert Action.BUY not in actions, f"Extended stock emitted BUY: {actions}"
         assert Action.SELL not in actions, f"Extended stock emitted SELL: {actions}"
+
+    def test_default_threshold_drops_18pct_extension(self):
+        """Tightened anti-peak guard: a stock ≥18% above MA20 must be dropped.
+
+        Previously the threshold was 20% and a ticker at 18% extension would
+        slip through to the bot which then bought near the local peak. The
+        2026-04-28 6-month sweep
+        (data/sweep_extension_pct_2026-04-28.csv) showed trades in the 16–20%
+        band were systematically losers (~+$8 avg vs +$1500 at 15%), so the
+        threshold was tightened to 15%.
+        """
+        # Build a 30-day flat series at $100 then a final close at $118.
+        # MA20 ≈ $100, close=$118 → 18% above MA20.
+        closes = _flat(30, 100.0) + [118.0]
+        volumes = [500_000] * 30 + [3_000_000]
+        df = _make_df(closes, volumes)
+
+        stock_data = {"PEAKY": ("SMART", df)}
+        # Use the default max_extension_pct from settings — that's the value
+        # we want to assert behaviour against.
+        signals = screen_stocks(stock_data, min_score=0.1)
+
+        assert signals == [], (
+            "Stock at +18% above MA20 must be dropped by the default "
+            "extension guard (it is in the loss-clustered 16–20% band). "
+            f"Got: {[(s.ticker, s.action) for s in signals]}"
+        )

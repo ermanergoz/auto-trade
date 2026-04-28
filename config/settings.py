@@ -129,7 +129,7 @@ MAX_SECTOR_CONCENTRATION_PCT = 50.0
 
 # Discipline rules
 ANTI_MOMENTUM_PCT = 8.0         # Reject if price moved >8% from signal entry
-MAX_EXTENSION_OVER_MA20_PCT = 20.0  # Drop screener candidates whose close is more than this % above MA20 (anti-chase at the source). Tuned via 6-month sweep — 20% matched unfiltered return with better win rate.
+MAX_EXTENSION_OVER_MA20_PCT = 15.0  # Drop screener candidates whose close is more than this % above MA20 (anti-chase at the source). Tightened from 20% after the bot bought stocks at the local peak again. 6-month sweep on 2026-04-28 (data/sweep_extension_pct_2026-04-28.csv) shows 15% is the sweet spot: 66.7% win rate vs 50% at 20%, +8.32% return vs -0.06% at 20%, and still keeps 6 trades vs 8 at 20%. Trades in the 16–20% band were systematically losers (avg ~+$8/trade at 20%, +$1500/trade at 15%).
 TREND_CONFIRMATION = True       # Require MA5 > MA10 > MA20 alignment for buys
 MIN_RISK_REWARD_RATIO = 1.5     # Minimum reward/risk ratio
 RISK_PER_TRADE_PCT = 5.0        # Risk per trade as % of portfolio (used in sizing + cumulative risk)

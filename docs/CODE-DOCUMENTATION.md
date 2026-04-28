@@ -240,7 +240,11 @@ SCAN_INTERVAL_MINUTES = 15         # Run the full pipeline every 15 min
 AI_CONFIDENCE_THRESHOLD = 65       # AI must be 65%+ confident
 AI_MAX_CANDIDATES = 0              # Max stocks sent to AI per cycle (0 = no limit)
 AI_PROVIDER = "gemini"             # Primary LLM: "gemini" (auto-falls back to Ollama) or "ollama"
-GEMINI_API_KEY = ""                # Leave blank to skip Gemini and use Ollama only
+GEMINI_API_KEYS = []               # Comma-separated list in env (preferred). Bot round-robins
+                                   #   per call; 1, 2, or 3 keys all work. Free tier is 1,000 RPD
+                                   #   per key, so 3 keys ≈ 3,000 RPD/day, comfortably above the
+                                   #   bot's ~2,688 calls/day at 15-min cadence.
+GEMINI_API_KEY = ""                # Legacy single-key form, used only when GEMINI_API_KEYS is empty
 GEMINI_MODEL = "gemini-2.5-flash-lite"
 GEMINI_HOST = "https://generativelanguage.googleapis.com"
 AI_MODEL = "qwen3:8b"             # Ollama fallback model
@@ -260,8 +264,8 @@ MIN_RISK_REWARD_RATIO = 1.5         # Potential profit must be 1.5x potential lo
 ALLOW_SHORT_SELLING = False         # Block sells for stocks not held (no shorting)
 CIRCUIT_BREAKER_LOSSES = 3          # Pause after 3 consecutive losses
 CIRCUIT_BREAKER_WINDOW_MIN = 60     # Within this many minutes
-PDT_PROTECTION_THRESHOLD_USD = 5000 # Below this, limit day trades to avoid IBKR's 30-day lockout
-PDT_MAX_DAY_TRADES_PER_5_DAYS = 1   # Under threshold: allow at most 1 day trade per rolling 5 biz days
+PDT_PROTECTION_THRESHOLD_USD = 5000 # Below this, block DAY entries and cap accidental day trades to avoid IBKR's 30-day lockout
+PDT_MAX_DAY_TRADES_PER_5_DAYS = 1   # Under threshold: allow at most 1 accidental (SWING-bracket-fired-same-day) day trade per rolling 5 biz days
 ```
 
 These values are tuned for a small account ($500). For larger accounts, tighten them back — see [RISK-TUNING.md](RISK-TUNING.md) for a full comparison table and scaling guide.
@@ -328,7 +332,9 @@ This module fetches prices and news. It has two data sources and caching to avoi
 
 **`get_macro_news(max_results)`** — Fetches broad market political/macro headlines via Tavily (no yfinance equivalent). Called once per scan cycle and shared across all candidates.
 
-**`get_analyst_recommendation(ticker)`** — Fetches analyst consensus recommendation via yfinance's `recommendations_summary`. Returns a dict with `consensus` ("strong_buy", "buy", "hold", "sell", "strong_sell") and `details` (raw analyst counts). Cached for 24 hours. Returns None if no data available or on error. Used by the risk manager to block BUY signals when analysts recommend selling.
+**`get_analyst_recommendation(ticker)`** — Fetches analyst consensus recommendation via yfinance's `recommendations_summary`. Returns a dict with `consensus` ("strong_buy", "buy", "hold", "sell", "strong_sell") and `details` (raw analyst counts). Cached for 24 hours. Returns None if no data available or on error. First of the two analyst-consensus sources used by the risk manager.
+
+**`get_analyst_recommendation_ibkr(ib, ticker, exchange)`** — Second analyst-consensus source. Calls `ib.reqFundamentalData(Stock(ticker, exchange, 'USD'), 'RESC')` to fetch the Reuters/Refinitiv I/B/E/S report and parses the `<ConsRecom>` element — a 1.0–5.0 mean rating across all covering analysts. Mapped to the same vocabulary as yfinance via `_ibkr_cons_recom_to_label`: `<1.5` → strong_buy, `<2.5` → buy, `<3.5` → hold, `<4.5` → sell, else strong_sell. Cached 24 h. Returns None on subscription absence, network errors, missing field, or any parser exception — failures are swallowed because a missing IBKR read should block the BUY (handled at the risk layer), not crash the scan cycle. Requires the IBKR Reuters Fundamentals subscription on the connected account; without it, BUYs will be blocked because two-source agreement cannot be confirmed.
 
 ### Realtime Subscriptions
 
@@ -572,7 +578,7 @@ This was a pivot from the original cloud-only Claude/GPT design (see Challenges 
 
 `core/analyst._call_llm()` is the router:
 
-1. If `AI_PROVIDER == "gemini"`, `GEMINI_API_KEY` is set, and the process-lifetime exhaustion flag `_gemini_exhausted` is not latched — try Gemini up to `max_retries` times for content-level failures (malformed JSON, invalid response), falling straight through to Ollama on any transport failure (HTTP 5xx, network error, auth failure, credits depleted).
+1. If `AI_PROVIDER == "gemini"`, at least one Gemini key is configured (`GEMINI_API_KEYS` or `GEMINI_API_KEY`), and the process-lifetime exhaustion flag `_gemini_exhausted` is not latched — try Gemini up to `max_retries` times for content-level failures (malformed JSON, invalid response), falling straight through to Ollama on any transport failure (HTTP 5xx, network error, all-keys-exhausted).
 2. Otherwise (or after Gemini gives up) call Ollama up to `max_retries` times.
 
 Two failure modes drive routing:
@@ -580,14 +586,20 @@ Two failure modes drive routing:
 - **Transport failures** raise `_GeminiTransportError` — router breaks out of the Gemini leg immediately, no retry loop on stateless server errors.
 - **Content failures** return `None` — router retries Gemini up to `max_retries` because a re-prompt may produce a parseable response.
 
-#### Exhaustion flag (permanent vs transient)
+#### Multi-key rotation
 
-`_gemini_exhausted` is a `threading.Event` (same pattern as `_tavily_exhausted` in `core/data.py`). Once set, all future Gemini calls this process are skipped — the router goes straight to Ollama. The flag latches on:
+`_call_gemini` rotates round-robin across every key in `GEMINI_API_KEYS` so the free-tier RPD ceiling (1,000/day per key) scales linearly with the number of configured keys — three keys ≈ 3,000 RPD/day pool, comfortably above the bot's ~2,688 calls/day at 15-min cadence. Each call advances a thread-safe cursor by one position; per-call failure handling iterates from that starting index through every active key:
 
-- HTTP 401/403 — invalid key or missing permissions
-- HTTP 429 with a body matching `_GEMINI_EXHAUSTION_MARKERS` — prepayment credits depleted, free-tier `limit: 0`, usage-limit hit
+- **RPD/auth (permanent) on a key** — `_call_gemini_with_key` raises `_GeminiKeyExhausted`; the rotation latches THAT key's per-key flag and tries the next active key. The global `_gemini_exhausted` is set only when EVERY key is exhausted, which is the trigger for the Ollama fallback path.
+- **RPM (transient) on a key** — `_call_gemini_with_key` raises `_GeminiKeyTransient`; the rotation tries the next active key without latching anything. If every active key returns RPM 429 in the first pass *and* the deployment has more than one key configured, sleep `_GEMINI_RPM_RETRY_SLEEP` (30 s) once and try a second pass. Single-key deployments skip the sleep entirely — there is no sibling to recover.
 
-Markers are intentionally tighter than Tavily's: Gemini emits "Quota exceeded per minute" for transient per-minute rate limits, so a bare `"quota"` marker would false-positive and latch the flag on a recoverable condition. Transient 429s (per-minute caps) fall back for just this call; the next call tries Gemini again.
+Single-key deployments fall back to a one-element rotation, so the legacy `GEMINI_API_KEY=...` form keeps working unchanged.
+
+#### Exhaustion markers (permanent vs transient)
+
+`_GEMINI_EXHAUSTION_MARKERS` is a tuple of substring matchers (case-insensitive) that classify a 429 body as PERMANENT (RPD/quota/credits depleted) vs TRANSIENT (RPM rate limit). Permanent matches latch the per-key flag; transient ones do not. The list is intentionally tighter than Tavily's because Gemini emits "Quota exceeded per minute" for transient per-minute rate limits, so a bare `"quota"` marker would false-positive and lock out a key on a recoverable condition. The 2026-04-27 production incident — `"You exceeded your current quota"` body — was missed by every existing marker, so the flag never latched and every candidate burned a wasted Gemini round-trip; the fix is to add `"exceeded your current quota"` and `"requests per day"` to the marker list while keeping `"per minute"` *out* of it.
+
+In addition to RPD-marker 429s, HTTP 401/403 (invalid key / missing permissions) also raises `_GeminiKeyExhausted` — that key is dead for the rest of the process, but sibling keys keep working.
 
 #### Structured output (`_gemini_response_schema`)
 
@@ -794,11 +806,11 @@ Rule: If the last 3 consecutive closed trades (within a 60-minute window) are al
 Why: The daily loss limit is reactive — it triggers after you've already bled money. The circuit breaker is proactive: 3 rapid losses in a row usually signals something systemic (market regime change, stale data feed, broken model). Better to pause and review than keep firing. Think of it as a smoke detector vs. a fire extinguisher.
 
 #### 13. Analyst Consensus — `check_analyst_consensus()`
-"Do Wall Street analysts recommend selling this stock?"
+"Do Wall Street analysts agree this is a buy — across two independent sources?"
 
-Rule: Before buying, fetch the analyst consensus recommendation from yfinance. If the majority of analysts rate the stock as "sell" or "strong sell", block the BUY signal. If the consensus is "buy", "strong buy", or "hold" — proceed normally. If no analyst data is available (small-cap, newly listed), the buy is still allowed.
+Rule: Before buying, fetch the analyst consensus from **two** sources: yfinance's `recommendations_summary` (Yahoo's republished sell-side ratings) and IBKR's Reuters/Refinitiv RESC report (`reqFundamentalData(contract, 'RESC')`, the `ConsRecom` 1.0–5.0 mean rating mapped to the same `strong_buy`/`buy`/`hold`/`sell`/`strong_sell` vocabulary). The BUY is allowed **only when both sources agree on `buy` or `strong_buy`**. Anything else — `hold` or worse from either side, *or* missing data on either side — blocks the BUY. SELL and HOLD signals always pass (we don't want to gate exits on analyst data). Controlled by `CHECK_ANALYST_CONSENSUS` setting (default: True).
 
-Why: The bot once bought a stock that was at its all-time high while IBKR's analyst consensus showed "sell". Even though it turned a profit, it was unnecessarily risky. This check acts as a sanity filter — if professional analysts are bearish, the bot shouldn't be buying. The data comes from yfinance (free, no IBKR subscription needed) and is cached for 24 hours since analyst ratings change infrequently. Controlled by `CHECK_ANALYST_CONSENSUS` setting (default: True).
+Why: The previous rule allowed `hold` and "no data" to pass, which let too many marginal trades through. Tightening to "buy/strong_buy from both sources" trades trade-frequency for win-rate: if Yahoo and Refinitiv both lean bullish, the entry has a much higher chance of working. Treating missing data as a block is deliberate — when only one source has an opinion, we can't confirm two-source agreement, and small-cap/newly-listed coverage is exactly where the worst losing entries live. Both sources are cached for 24 hours since analyst ratings change infrequently.
 
 #### 14. Correlation Cap — `check_correlation()`
 "Is this new position really independent, or is it just another copy of something we already hold?"
@@ -810,21 +822,34 @@ Why: If you already own NVDA and buy AMD, both semiconductor stocks move togethe
 #### 15. PDT Restriction — `check_pdt_restriction()`
 "Are we about to trip IBKR's sub-$5K day-trade lockout?"
 
-Rule: When `portfolio_value >= PDT_PROTECTION_THRESHOLD_USD` (default $5,000), the check is a pass-through — unconstrained. Below the threshold, count same-calendar-day round-trip trades in the last 5 business days. If the count is already at `PDT_MAX_DAY_TRADES_PER_5_DAYS` (default 1), block any new entry (could become a day trade if the stop fires same-day) and any same-day exit (definitively completes a day trade). Exits of positions opened on a prior day are **always** allowed — they are not day trades by definition, and blocking them would trap the trader in a losing swing position. Setting `PDT_MAX_DAY_TRADES_PER_5_DAYS=0` disables the check.
+Rule: When `portfolio_value >= PDT_PROTECTION_THRESHOLD_USD` (default $5,000), the check is a pass-through — unconstrained. Below the threshold, two guards run:
 
-Why: IBKR flags accounts with Liquid Net Worth < $5,000 and restricts them to closing-orders-only for 30 days once 2 day trades occur within a rolling 5-business-day window. The bot reads the current portfolio value at evaluation time, so as soon as the account clears the threshold the brakes come off automatically — no manual config change needed. This is a pragmatic guard, not a perfect replica of IBKR's internal accounting: the bot counts from its own completed-trades table, which means positions filled while the bot was offline (auto-reconciled at startup) participate in the count once they're recorded.
+1. **DAY-type guard (new entries only).** Any new entry with `signal.trade_type == TradeType.DAY` is rejected outright. DAY entries are declared same-day round-trips — the scheduler's `close_all_day_trades` forces them flat at the end of the session, so the day-trade outcome is guaranteed. A sub-threshold account has at most one day-trade slot remaining before IBKR's 30-day lockout fires; spending it on a guaranteed round-trip leaves zero margin for an accidental bracket-fire from a SWING position. This guard is independent of historical count — it fires even with `day_trade_count == 0`.
+2. **Rolling-count cap (SWING entries + same-day exits).** Count same-calendar-day round-trip trades in the last 5 business days. If the count is already at `PDT_MAX_DAY_TRADES_PER_5_DAYS` (default 1), block any new SWING entry (bracket SL/TP could still fire same-day) and any same-day exit (definitively completes a day trade). Setting `PDT_MAX_DAY_TRADES_PER_5_DAYS=0` disables this count-based ceiling; the DAY-type guard above still fires.
+
+Exits of positions opened on a prior day are **always** allowed — they are not day trades by definition, and blocking them would trap the trader in a losing swing position.
+
+Why: IBKR flags accounts with Liquid Net Worth < $5,000 and restricts them to closing-orders-only for 30 days once 2 day trades occur within a rolling 5-business-day window. Counting historical day trades is necessary but not sufficient: a DAY-typed signal on a sub-$5K account is a *declaration* that we intend to round-trip today, and `close_all_day_trades` enforces that intent — so the signal itself is the risk, not its outcome. Blocking DAY entries at the risk layer prevents the bot from burning its only slot on a guaranteed loss of flexibility. The bot reads the current portfolio value at evaluation time, so as soon as the account clears the threshold the brakes come off automatically — no manual config change needed. This is a pragmatic guard, not a perfect replica of IBKR's internal accounting: the bot counts from its own completed-trades table, which means positions filled while the bot was offline (auto-reconciled at startup) participate in the count once they're recorded.
 
 ### Exit Signal Bypass
 
-The `evaluate()` function detects whether a signal is an **exit** (closing an existing position) rather than a new entry. When a SELL signal targets a held long position, or a BUY signal targets a held short position, the following discipline checks are **skipped**:
+The `evaluate()` function detects whether a signal is an **exit** (closing an existing position) rather than a new entry. When a SELL signal targets a held long position, or a BUY signal targets a held short position, the following checks are **skipped**:
 
+- Position Size (`check_position_size`) — we're not opening, just closing
+- Cumulative Risk (`check_cumulative_risk`) — exits REDUCE total open risk, not add to it
+- Sector Concentration (`check_sector_concentration`) — exits REDUCE concentration, not add to it
+- Excluded Sector / Ticker (`check_excluded_sector`) — legacy positions must remain exitable even after the ticker/sector is added to an exclusion list
 - Anti-Momentum (`check_anti_momentum`)
 - Trend Confirmation (`check_trend_confirmation`)
 - Risk/Reward Ratio (`check_risk_reward`)
 - Analyst Consensus (`check_analyst_consensus`)
 - Correlation Cap (`check_correlation`)
 
-Why: These checks gate on market conditions and only make sense for deciding whether to **enter** a new position. Applying them to exits creates a dangerous trap — if the market moves against you, the very conditions that make you want to exit (price dropped, trend reversed) are the same conditions these checks reject. Without this bypass, a losing position could never be closed because the anti-momentum check would say "price already dropped too far" and the trend check would say "trend is down, can't sell." Core safety checks (position size, daily loss, stop-loss, duplicates, etc.) still apply to all signals.
+Why: Most of these checks gate on market conditions and only make sense for deciding whether to **enter** a new position. Applying them to exits creates a dangerous trap — if the market moves against you, the very conditions that make you want to exit (price dropped, trend reversed, sector now crowded) are the same conditions these checks reject. Without this bypass, a losing position could never be closed because the anti-momentum check would say "price already dropped too far", the cumulative-risk check would see the existing position PLUS phantom new risk, and the excluded-sector check would keep the trader trapped in legacy financial-sector holdings.
+
+Core safety checks (daily loss limit, stop-loss coherence, max positions, no-duplicate, circuit breaker, PDT) still apply to all signals.
+
+For exits, `evaluate()` also sizes the order using the **existing position's absolute quantity** rather than a freshly-calculated new-entry size. If we re-calculated, the "risk-budget" sizing could produce a quantity LARGER than the holding and flip the position to a net short — a position inversion that violates `ALLOW_SHORT_SELLING=False` and is never the user's intent.
 
 ### Position Sizing
 
@@ -862,8 +887,11 @@ The output is a simple object:
 RiskResult:
   approved: True/False
   reasons: ["Daily loss limit breached", ...]  # empty if approved
-  position_size: 45  # shares to buy
+  position_size: 45  # shares (existing quantity for exits, calculated for entries)
+  is_exit: True/False  # True when signal closes an existing position
 ```
+
+The `is_exit` flag lets the executor route exits to a plain close order rather than a bracket. A bracket's SL/TP children would stay live at IBKR after the parent closes our position — those orders could later re-enter the ticker when price crossed the child's trigger.
 
 ---
 
@@ -894,6 +922,10 @@ This is **atomic** — all three orders are placed as a unit. You never end up w
 
 **`close_position_market(ib, position, dry_run)`** — Immediately close a position with a market order. Derives the closing action from the position's quantity sign (SELL for long, BUY for short). Used when day-trade positions need to be closed before market close.
 
+**Exit signals bypass `place_order` entirely.** When `RiskResult.is_exit` is true, the scheduler calls `place_market_order()` (no bracket) and attaches a `setup_exit_close_handler()`. Reason: `place_order`'s bracket attaches TP/SL children with `transmit=True` on the stop-loss leg, and IBKR keeps those children alive after the parent fills. If the parent is a SELL-to-close-long, the TP/SL are BUY orders; when price later crosses either child's trigger, IBKR re-enters the ticker as a fresh long. Routing exits through a single market order eliminates the tail.
+
+**`setup_exit_close_handler(ib, signal, close_trade, on_exit)`** — Attaches a fill handler for the AI-driven market close. Matches on the close order's `permId` (or `orderId` + ticker as a fallback), not `parentId > 0`, because the market close is the parent itself with no children. On fill, calls `db_close_position` to record the exit at the actual fill price, fires the optional `on_exit` callback, and deregisters. Includes a fast-fill race guard: if the close is already "Filled" at handler attachment time (rare but possible on very liquid names during IBKR's permId poll), the handler fires synchronously with `_fired` flag protection to prevent double-processing.
+
 **`close_all_day_trades(ib, positions, dry_run)`** — Called 15 minutes before market close. Finds all positions marked as DAY trades, cancels ALL open orders for those tickers at IBKR (unfilled parents AND orphaned TP/SL children from already-filled brackets) to prevent race conditions, then closes each position with a market order. After fill verification via `monitor_orders()` (30-second timeout), records each close in the portfolio DB via `db_close_position()` at the actual fill price. Logs at ERROR level for any unfilled orders — critical because unfilled orders mean positions stay open overnight.
 
 **`handle_fill(signal, quantity, fill_price)`** — Records a filled order in the SQLite database. Returns `None` if the fill quantity is zero or negative, preventing phantom positions from being recorded. IBKR always reports filled quantity as a positive integer regardless of trade direction. For short entries (SELL side), the stored quantity is negated so that P&L math `(exit − entry) × qty`, position reconciliation, and close-side selection all work correctly without special-casing shorts.
@@ -915,6 +947,14 @@ This is **atomic** — all three orders are placed as a unit. You never end up w
 **`cancel_bracket_order(ib, trade)`** — Cancels a parent entry order. IBKR automatically cancels the attached child orders (take-profit and stop-loss) when the parent is cancelled. Also removes the `pending_orders` DB record for the cancelled order. Follows the same try/except pattern as `cancel_order()`.
 
 The scheduler's `check_stale_orders()` orchestrates the full flow: for each stale order, it fetches fresh historical data, re-runs the screener, and cancels orders where the stock no longer passes technical screening. This runs at the beginning of every scan cycle to free up capital and position slots before new candidates are evaluated. In dry-run mode, the cancelled-order counter only increments when orders are actually cancelled, not when they merely fail screening.
+
+### Cash-Reserve Accounting and Eviction
+
+**`get_pending_buy_reserve(ib)`** — Returns the total cash committed to unfilled parent BUY limit orders (`parentId == 0`, `orderType == "LMT"`, status `Submitted`/`PreSubmitted`). Sums `totalQuantity * lmtPrice` per qualifying order. Needed because IBKR's `TotalCashValue` does not reflect bracket reserves until a fill lands; without this subtraction the risk manager can greenlight a second BUY that IBKR then rejects with Error 201 ("Cash needed for this order and other pending orders").
+
+**`get_pending_buy_orders(ib)`** — Like `get_pending_buy_reserve` but returns a list of dicts (`trade`, `perm_id`, `ticker`, `confidence`, `reserved_cash`) — the DB join exposes the AI confidence that approved each order. Pre-migration orders with no DB row come back with `confidence=None`, treated as zero for ranking.
+
+**`evict_weakest_pending(ib, new_confidence, needed_cash, margin=5)`** — Cancels the lowest-confidence pending BUY only when the new candidate beats it by at least `margin` (default 5 points) AND cancelling it frees enough cash to cover the new order. v1 cancels at most one order — if a single eviction wouldn't free enough cash, it declines rather than chain-cancelling. Returns `True` when an order was cancelled. The scheduler calls this from `_on_signal` immediately after detecting a cash shortfall and retries the cash check before placement; if eviction declines, the candidate is logged and skipped. Short entries and exit signals bypass the entire gate because they don't consume settled cash.
 
 ### Dry-Run Mode
 
@@ -1064,7 +1104,10 @@ signals (every signal ever generated — audit trail):
 pending_orders (tracks unfilled order placement times):
   - perm_id (IBKR permanent order ID, primary key)
   - ticker, placed_at
+  - confidence (AI confidence 0-100, nullable for legacy/manual orders)
   - Cleaned up on fill or cancellation
+  - Legacy DBs missing the confidence column are migrated in place by
+    init_db() via ALTER TABLE guarded by PRAGMA table_info.
 ```
 
 ### Key Operations
@@ -1089,9 +1132,11 @@ pending_orders (tracks unfilled order placement times):
 
 **`record_signal(signal)`** — Save every signal for audit trail. Even rejected ones. Useful for backtesting analysis: "How often did we reject signals that would have been profitable?"
 
-**`save_pending_order(perm_id, ticker)`** — Records when a parent order was placed. Called from `place_order()` after the bracket is submitted. Uses `INSERT OR IGNORE` so duplicate calls are safe.
+**`save_pending_order(perm_id, ticker, db_path=DB_PATH, *, confidence=None)`** — Records when a parent order was placed. Called from `place_order()` after the bracket is submitted, with the AI confidence that approved the signal. Uses `INSERT OR IGNORE` so duplicate calls are safe. `confidence` is keyword-only to preserve the long-standing `(perm_id, ticker, db_path)` positional call sites.
 
 **`get_pending_order_time(perm_id)`** — Returns the original placement datetime for a pending order, or `None` if not found. Used by `get_stale_orders()` to calculate accurate order age across reconnections.
+
+**`get_pending_order_confidence(perm_id)`** — Returns the AI confidence (0-100) recorded at placement time, or `None` for pre-migration rows and non-AI orders. Used by the executor's eviction logic to rank the weakest pending BUY.
 
 **`remove_pending_order(perm_id)`** — Deletes a pending order record. Called from `cancel_bracket_order()`, `cancel_order()`, and `setup_fill_handler()` when orders are cancelled or filled.
 
@@ -1190,6 +1235,10 @@ The status data is served from an in-memory cache (`_system_status`) updated at 
 ### Design
 
 Notifications are fire-and-forget. If Telegram is down or the token is missing, the error is logged but the system keeps trading. Notifications are nice-to-have, not critical path.
+
+### HTML Sanitization
+
+All messages are sent through `_send_sync()` with `parse_mode="HTML"`. Before each send, `_sanitize_html()` runs `html.escape()` on the body and then restores a small whitelist of tags that the `notify_*` helpers actually emit (`<b>`, `<i>`, `<code>`, `<pre>`, `<u>`, `<s>`). Anything else — notably the `<br>` fragments IBKR embeds in rejection reasons — is escaped rather than interpreted, which prevents the "Can't parse entities" failure that previously dropped order-rejection alerts.
 
 ---
 
@@ -1569,7 +1618,7 @@ pytest tests/test_risk.py::test_daily_loss_limit -v
 
 **The problem**: On stocks that had just ripped vertically (e.g. XNDU from ~$9 to $32 in a handful of sessions), every BUY-side screener indicator fired at once — RSI overbought flipped into a "momentum confirmation" reading, volume spike, Bollinger breakout, MA crossover. The AI analyst, seeing a wall of confluent signals and positive news headlines, could override an otherwise-SELL ranked candidate into a BUY and hand the order to the executor. The stop-loss inevitably fired on the first pullback.
 
-**The solution**: Added an **extension guard** at the screener level. A ticker whose latest close sits more than `MAX_EXTENSION_OVER_MA20_PCT` (default 20%, tuned by a 6-month parameter sweep) above its 20-day SMA is dropped from the candidate pool *before* scoring and *before* the AI ever sees it. Filtering at the source is the only robust fix — any later layer (AI, risk manager) can be overridden by the same confluent-signal pattern that produced the problem in the first place.
+**The solution**: Added an **extension guard** at the screener level. A ticker whose latest close sits more than `MAX_EXTENSION_OVER_MA20_PCT` (default **15%**) above its 20-day SMA is dropped from the candidate pool *before* scoring and *before* the AI ever sees it. Filtering at the source is the only robust fix — any later layer (AI, risk manager) can be overridden by the same confluent-signal pattern that produced the problem in the first place. The original 6-month sweep landed on 20%, but the bot kept buying near the local peak in the 16–20% band; the 2026-04-28 sweep (`data/sweep_extension_pct_2026-04-28.csv`) lifted win rate to 66.7% (vs 50% at 20%) and total return to +8.32% (vs ~breakeven) by tightening to 15%. Trades that fall in the 16–20% band are systematically losers (~+$8 avg per trade at 20% vs +$1500/trade at 15%), so 15% is the empirical sweet spot — defensive enough to cut the loss-clustered tail, but loose enough to keep ~75% of the trade frequency.
 
 ### Challenge 17: PDT Protection Silently Truncated to Today Only
 

@@ -36,7 +36,7 @@ Financial sector stocks (banks, insurance, lending companies) and defense/milita
 - **US market focus**: Trades US (NYSE/NASDAQ) equities through IBKR with 10 different scanner types for broad market coverage
 - **Two-stage screening pipeline**: Technical screener (fast, free) filters hundreds of stocks, then AI analyst performs deep analysis on all qualifying candidates
 - **AI-powered analysis**: Gemini (primary) for fast, capable cloud-based reasoning; Ollama + Qwen 2.5 7B (fallback) for resilience when Gemini is unavailable, rate-limited, or unconfigured
-- **Comprehensive risk management**: 14 risk checks including position sizing, daily loss limits, sector concentration limits, mandatory stop-losses, duplicate position prevention, defense/financial sector exclusion, circuit breaker, and analyst consensus. Exit signals bypass discipline checks so positions can always be closed
+- **Comprehensive risk management**: 14 risk checks including position sizing, daily loss limits, sector concentration limits, mandatory stop-losses, duplicate position prevention, defense/financial sector exclusion, circuit breaker, and a two-source analyst consensus gate (yfinance + IBKR Reuters) that requires both to agree on buy/strong_buy. Exit signals bypass discipline checks so positions can always be closed
 - **Bracket order execution**: Automatic stop-loss and take-profit orders attached to every trade via IBKR bracket orders
 - **Day and swing trading**: Automatic end-of-day position closing for day trades, trailing stops for swing trades
 - **Backtesting engine**: Replay historical data through the exact same strategy code with configurable slippage and commission modeling
@@ -250,7 +250,7 @@ Edit `~/ibc/config.ini` and set your IBKR credentials (`IbLoginId`, `IbPassword`
 
 The AI analyst routes through **Gemini** (primary) with **Ollama** as an automatic fallback. At least one of them must be reachable:
 
-- **Gemini (recommended)** — set `GEMINI_API_KEY` in `.env`. Get a key at https://aistudio.google.com/apikey. On any Gemini error, rate limit, or credit exhaustion the bot transparently continues on Ollama for the rest of the process.
+- **Gemini (recommended)** — set `GEMINI_API_KEYS=key1,key2,key3` (comma-separated, 1–N keys) in `.env`. Get keys at https://aistudio.google.com/apikey. The bot round-robins across the keys per call so the free-tier RPD cap (1,000/day per key) scales linearly: 3 keys ≈ 3,000 RPD/day, comfortably above the bot's ~2,688 calls/day at 15-min cadence. When a key returns a per-day quota 429 ("RPD exhausted") only that key's process-lifetime flag latches; the rotation keeps using the remaining keys. When ALL keys are RPD-exhausted, the bot falls back to Ollama for the rest of the process. Per-minute (RPM) 429s simply advance to the next key without latching anything. The legacy single-key form `GEMINI_API_KEY=...` still works as a fallback when `GEMINI_API_KEYS` is unset.
 - **Ollama (fallback / legacy)** — runs locally, no API key. Install and pull the model:
 
 ```bash
@@ -319,7 +319,9 @@ IBKR_CLIENT_ID=1
 # LLM provider — "gemini" (primary, auto-falls back to Ollama on error) or "ollama"
 AI_PROVIDER=gemini
 
-# Gemini (primary) — leave GEMINI_API_KEY blank to skip Gemini entirely
+# Gemini (primary) — comma-separated rotation list (preferred) or legacy single key.
+# Leave both blank to skip Gemini entirely. Free tier: 15 RPM, 1,000 RPD per key.
+GEMINI_API_KEYS=
 GEMINI_API_KEY=
 GEMINI_MODEL=gemini-2.5-flash-lite
 GEMINI_HOST=https://generativelanguage.googleapis.com
@@ -535,7 +537,7 @@ Stop-loss and take-profit levels are calculated using ATR (Average True Range) f
 
 ### Extension Guard
 
-Before scoring, the screener drops any ticker whose latest close sits more than `MAX_EXTENSION_OVER_MA20_PCT` (default 20%) above its 20-day simple moving average. This prevents parabolic breakouts (e.g. XNDU ripping $9 → $32 in a handful of sessions) from reaching the AI analyst, where confluent BUY indicators could otherwise override into a late entry. Set the config to `0` or negative to disable. The backtest exposes the same threshold as `BacktestConfig.max_extension_pct`; `scripts/sweep_extension_pct.py` runs a parameter sweep for tuning.
+Before scoring, the screener drops any ticker whose latest close sits more than `MAX_EXTENSION_OVER_MA20_PCT` (default **15%**) above its 20-day simple moving average. This prevents parabolic breakouts (e.g. XNDU ripping $9 → $32 in a handful of sessions) — and smaller late-stage rallies in the 16–20% extension band where the bot kept buying at the local peak — from reaching the AI analyst, where confluent BUY indicators could otherwise override into a late entry. The 15% value comes from a 6-month sweep on 2026-04-28 (`data/sweep_extension_pct_2026-04-28.csv`): 15% delivered 66.7% win rate vs 50% at the previous 20% setting, +8.32% return vs ~breakeven, and trades in the 16–20% band were systematically losers (avg ~+$8/trade at 20% vs +$1500/trade at 15%). Set the config to `0` or negative to disable. The backtest exposes the same threshold as `BacktestConfig.max_extension_pct`; `scripts/sweep_extension_pct.py` reruns the sweep against fresh data.
 
 ---
 
@@ -600,7 +602,7 @@ Every trade must pass through **all 15 risk checks** before execution (10 core c
 | **Risk/Reward Ratio** | Take-profit/stop-loss ratio must exceed minimum (new entries only) | 1.5:1 |
 | **Anti-Momentum** | Reject if price already moved >X% from signal entry (new entries only) | 8% |
 | **Trend Confirmation** | Moving averages must align with trade direction (new entries only) | MA5 > MA10 > MA20 |
-| **Analyst Consensus** | Block BUY when analysts rate sell/strong sell (new entries only) | Enabled |
+| **Analyst Consensus** | BUY only when **both** yfinance and IBKR (Reuters) analysts rate buy/strong_buy. Hold/sell/missing data on either source blocks. (new entries only) | Enabled |
 | **Correlation Cap** | Reject a new entry whose daily-return correlation with any open position exceeds threshold (new entries only) | 0.7 |
 
 > **Exit signals** (selling a held long, or buying back a held short) skip the discipline checks (risk/reward, anti-momentum, trend confirmation, analyst consensus, correlation cap) so positions can always be closed regardless of market conditions. This prevents the dangerous situation of being trapped in a losing position.
@@ -611,7 +613,11 @@ Every trade must pass through **all 15 risk checks** before execution (10 core c
 
 Unfilled limit orders are re-evaluated at the start of every scan cycle. If an order has been pending longer than `STALE_ORDER_MINUTES` (default: 24 hours), the system fetches fresh data and re-runs the technical screener on that stock. Orders that no longer pass screening are automatically cancelled (cancelling the parent entry order also cancels its attached stop-loss and take-profit children). Orders that still pass are kept alive. Telegram notifications are sent for each cancellation. In dry-run mode, the cancelled-order counter only increments for actual cancellations.
 
-Order placement timestamps are persisted in the `pending_orders` database table to survive IBKR reconnections (the `ib_insync` trade log resets on every reconnect, which would otherwise make all orders appear brand new). Records are cleaned up automatically when orders fill or are cancelled.
+Order placement timestamps are persisted in the `pending_orders` database table to survive IBKR reconnections (the `ib_insync` trade log resets on every reconnect, which would otherwise make all orders appear brand new). Records are cleaned up automatically when orders fill or are cancelled. Each pending parent BUY also persists the AI confidence that approved it so the eviction logic (below) can rank weakest-first.
+
+### Cash-Reserve Gate and Eviction
+
+IBKR's `TotalCashValue` does not decrement while parent BUY orders are unfilled, so two rapid risk-approvals can over-commit available cash and trigger broker rejection (Error 201 — "Cash needed for this order and other pending orders"). Before placing a new BUY, the scheduler subtracts the reserved cash of every unfilled parent BUY order from `TotalCashValue`. If the new order's cost exceeds what's left, the scheduler tries to evict the weakest pending BUY — the one with the lowest AI confidence — and only when the new candidate beats it by at least 5 confidence points and cancelling that one order frees enough cash. Otherwise, the new candidate is skipped. This prevents chasing and avoids the thrashing that a lower threshold would produce. Exit signals (closing an existing position) and short entries bypass this gate because they don't consume settled cash.
 
 ### Position Sizing
 
@@ -652,7 +658,7 @@ IBKR and yfinance use different share-class symbol formats (IBKR: `BRK B` with a
 | Warmup period | 60 days | Days skipped for indicator stabilization |
 | Indicator weights | Equal (1.0) | Per-indicator weight multipliers for scoring |
 | Volatility scaling | Off | Scale position sizes inversely to realized volatility (per-candidate) |
-| Max extension | 20% | Drop candidates whose close is more than this % above MA20 (0 disables) |
+| Max extension | 15% | Drop candidates whose close is more than this % above MA20 (0 disables). Tightened from 20% — see `data/sweep_extension_pct_2026-04-28.csv`. |
 
 ### Walk-Forward Validation
 
@@ -942,11 +948,15 @@ This system is designed with multiple layers of safety:
 
 15. **Macro/political awareness** -- The AI analyst evaluates broad market political, regulatory, and macroeconomic conditions (elections, trade wars, sanctions, Fed policy) as part of its 7-point checklist. Macro headlines are fetched once per scan cycle via Tavily and shared across all candidates.
 
-16. **Analyst consensus gate** -- Before buying, the bot fetches analyst consensus recommendations from yfinance. If the majority of analysts rate the stock as "sell" or "strong sell", the BUY signal is blocked. Stocks rated "buy", "strong buy", or "hold" pass through. If no analyst data is available (small-cap, newly listed), the buy is still allowed. Data is cached for 24 hours. Controlled by `CHECK_ANALYST_CONSENSUS` setting.
+16. **Two-source analyst consensus gate** -- Before buying, the bot fetches analyst consensus from **two independent sources** and requires both to agree on `buy` or `strong_buy` before letting the trade through. Source one: yfinance's `recommendations_summary` (Yahoo's republished sell-side ratings). Source two: IBKR's Reuters/Refinitiv RESC report (`reqFundamentalData(stock, 'RESC')`, the `<ConsRecom>` 1.0–5.0 mean rating mapped to the same vocabulary — `<1.5` strong_buy, `<2.5` buy, `<3.5` hold, `<4.5` sell, else strong_sell). If either source returns `hold`/`sell`/`strong_sell` — or returns no data at all — the BUY is blocked. Both sources cached 24 h. Controlled by `CHECK_ANALYST_CONSENSUS` setting. Treating "missing data" as a block is intentional: when only one source has an opinion, two-source agreement cannot be confirmed, and small-cap/newly-listed coverage is exactly where the worst losing entries cluster. Requires the IBKR Reuters Fundamentals subscription on the connected account; without it, BUYs will be blocked.
 
-17. **PDT (Pattern Day Trader) protection** -- IBKR restricts accounts with Liquid Net Worth below `PDT_PROTECTION_THRESHOLD_USD` (default $5,000) to closing-orders-only for 30 days once 2 day trades occur within a rolling 5-business-day window. When the portfolio is at or above the threshold, this check is a pass-through. Below it, the bot counts same-calendar-day round-trip trades in the last 5 business days and blocks any new entry or same-day exit that would push the count to `PDT_MAX_DAY_TRADES_PER_5_DAYS` (default 1 — one less than IBKR's trigger of 2). Exits of positions opened on a prior day are never blocked so swing positions can always be closed. The scheduler queries the full 7-calendar-day window when fetching trades so the rolling count reflects day trades from earlier in the week, not just today.
+17. **PDT (Pattern Day Trader) protection** -- IBKR restricts accounts with Liquid Net Worth below `PDT_PROTECTION_THRESHOLD_USD` (default $5,000) to closing-orders-only for 30 days once 2 day trades occur within a rolling 5-business-day window. When the portfolio is at or above the threshold, this check is a pass-through. Below it, two guards run in sequence: (a) any new entry with `trade_type=DAY` is rejected outright because `close_all_day_trades` will force-close it at market close, guaranteeing a day trade — sub-threshold accounts cannot afford a guaranteed round-trip when only one day-trade slot separates them from IBKR's 30-day lockout; (b) for SWING entries and same-day exits, the bot counts same-calendar-day round-trip trades in the last 5 business days and blocks any signal that would push the count to `PDT_MAX_DAY_TRADES_PER_5_DAYS` (default 1 — one less than IBKR's trigger of 2). Exits of positions opened on a prior day are never blocked so swing positions can always be closed. The scheduler queries the full 7-calendar-day window when fetching trades so the rolling count reflects day trades from earlier in the week, not just today.
 
-18. **Parabolic breakout filter** -- Tickers whose latest close is more than `MAX_EXTENSION_OVER_MA20_PCT` (default 20%) above their 20-day moving average are dropped from the screener candidate pool before scoring. This prevents late entries into already-extended moves where confluent BUY indicators would otherwise convince the AI analyst to approve the trade.
+18. **Parabolic breakout filter** -- Tickers whose latest close is more than `MAX_EXTENSION_OVER_MA20_PCT` (default **15%**, tightened from 20%) above their 20-day moving average are dropped from the screener candidate pool before scoring. This prevents late entries into already-extended moves where confluent BUY indicators would otherwise convince the AI analyst to approve the trade. 15% comes from the 2026-04-28 6-month sweep (`data/sweep_extension_pct_2026-04-28.csv`): 66.7% win rate at 15% vs 50% at 20%, +8.32% return vs ~breakeven, max drawdown unchanged. Trades in the 16–20% band were systematically losers (avg ~+$8/trade at 20% vs +$1500/trade at 15%).
+
+19. **Exit-signal routing** -- When the risk manager approves a signal that closes an existing position (SELL on held long, BUY on held short), the executor places a single market close order instead of a bracket. A bracket's take-profit and stop-loss children stay live at IBKR after the parent closes the position — when price later crosses either child's trigger, those orders re-enter the ticker in the opposite direction. Routing exits through a plain market close eliminates this tail risk. Exits also size to the existing holding's absolute quantity, never to a freshly-calculated new-entry size (which could flip a long into a net short).
+
+20. **Entry-only risk gates for exits** -- Cumulative risk, sector concentration, and excluded-sector/ticker checks apply only to new entries. An exit REDUCES open risk, sector exposure, and excluded-ticker exposure — blocking it because the existing position trips those gates would trap the trader in a losing position or in legacy holdings in newly-excluded sectors. Safety gates that apply to BOTH entries and exits: daily loss limit, stop-loss coherence, max positions, no-duplicate, circuit breaker, and PDT.
 
 ---
 
