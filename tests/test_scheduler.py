@@ -424,7 +424,7 @@ class TestNewsSkip:
         self.m["analyze_batch"].assert_called_once()
         ai_input = self.m["analyze_batch"].call_args[0][0]
         assert len(ai_input) == 1
-        assert ai_input[0]["ticker"] == "HASNEWS"
+        assert ai_input[0]["screener_signal"].ticker == "HASNEWS"
         assert ai_input[0]["news"] == ["headline 1"]
 
     def test_mixed_news_drops_only_empty_candidates(self):
@@ -441,7 +441,7 @@ class TestNewsSkip:
         _run_cycle(self.m)
 
         ai_input = self.m["analyze_batch"].call_args[0][0]
-        tickers_in_input = [item["ticker"] for item in ai_input]
+        tickers_in_input = [item["screener_signal"].ticker for item in ai_input]
         assert tickers_in_input == ["HAS"]
 
 

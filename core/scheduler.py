@@ -267,11 +267,15 @@ def run_scan_cycle(
             if not news:
                 logger.info("Skipping %s: no news from Tavily or yfinance", ticker)
                 continue
+            # Pass the screener-built Signal through unchanged. The analyst
+            # only votes (buy/hold) plus tags confidence/trade_type/reasoning;
+            # entry_price/stop_loss/take_profit are taken from the screener's
+            # deterministic ATR computation in core/screener.py:_build_signal,
+            # not from the LLM. This blocks hallucinated chart-readings from
+            # propagating into bracket-order levels.
             ai_input.append({
-                "ticker": ticker,
-                "exchange": exchange,
+                "screener_signal": sig_obj,
                 "df": df,
-                "indicator_values": sig_obj.indicator_values,
                 "news": news,
             })
 

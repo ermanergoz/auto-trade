@@ -175,8 +175,9 @@ auto-trade/
 │   ├── portfolio.db             # SQLite database
 │   └── universe_*.json          # Cached stock universes
 ├── logs/                        # Runtime logs (gitignored)
-│   ├── trader_YYYY-MM-DD.log    # Daily log files
-│   └── trades_YYYY-MM-DD.csv    # Daily trade journals
+│   ├── trader_YYYY-MM-DD.log         # Daily structured log
+│   ├── trades_YYYY-MM-DD.csv         # Daily trade journal
+│   └── llm_traffic_YYYY-MM-DD.jsonl  # Per-call LLM I/O (toggle: LLM_TRAFFIC_LOG)
 ├── main.py                      # Entry point
 ├── requirements.txt             # Python dependencies
 ├── .env.example                 # Environment variable template
@@ -250,7 +251,7 @@ Edit `~/ibc/config.ini` and set your IBKR credentials (`IbLoginId`, `IbPassword`
 
 The AI analyst routes through **Gemini** (primary) with **Ollama** as an automatic fallback. At least one of them must be reachable:
 
-- **Gemini (recommended)** — set `GEMINI_API_KEYS=key1,key2,key3` (comma-separated, 1–N keys) in `.env`. Get keys at https://aistudio.google.com/apikey. The bot round-robins across the keys per call so the free-tier RPD cap (1,000/day per key) scales linearly: 3 keys ≈ 3,000 RPD/day, comfortably above the bot's ~2,688 calls/day at 15-min cadence. When a key returns a per-day quota 429 ("RPD exhausted") only that key's process-lifetime flag latches; the rotation keeps using the remaining keys. When ALL keys are RPD-exhausted, the bot falls back to Ollama for the rest of the process. Per-minute (RPM) 429s simply advance to the next key without latching anything. The legacy single-key form `GEMINI_API_KEY=...` still works as a fallback when `GEMINI_API_KEYS` is unset.
+- **Gemini (recommended)** — set `GEMINI_API_KEYS=key1[,key2,key3]` (comma-separated, 1–N keys) in `.env`. Get keys at https://aistudio.google.com/apikey. The bot round-robins across the keys per call so the free-tier RPD cap (1,000/day per key) scales linearly: 3 keys ≈ 3,000 RPD/day, comfortably above the bot's ~2,688 calls/day at 15-min cadence. When a key returns a per-day quota 429 ("RPD exhausted") only that key's process-lifetime flag latches; the rotation keeps using the remaining keys. When ALL keys are RPD-exhausted, the bot falls back to Ollama for the rest of the process. Per-minute (RPM) 429s simply advance to the next key without latching anything. A single key configured as `GEMINI_API_KEYS=onekey` is just a one-element rotation — same code path as multi-key, no rotation overhead.
 - **Ollama (fallback / legacy)** — runs locally, no API key. Install and pull the model:
 
 ```bash
@@ -319,16 +320,19 @@ IBKR_CLIENT_ID=1
 # LLM provider — "gemini" (primary, auto-falls back to Ollama on error) or "ollama"
 AI_PROVIDER=gemini
 
-# Gemini (primary) — comma-separated rotation list (preferred) or legacy single key.
-# Leave both blank to skip Gemini entirely. Free tier: 15 RPM, 1,000 RPD per key.
+# Gemini (primary) — comma-separated rotation list (1 key = single-key behavior,
+# 2-3 keys = round-robin rotation). Leave blank to skip Gemini entirely.
+# Free tier: 15 RPM, 1,000 RPD per key.
 GEMINI_API_KEYS=
-GEMINI_API_KEY=
 GEMINI_MODEL=gemini-2.5-flash-lite
 GEMINI_HOST=https://generativelanguage.googleapis.com
 
 # Ollama (fallback) — no API key needed
 AI_MODEL=qwen3:8b
 OLLAMA_HOST=http://localhost:11434
+
+# Diagnostic JSONL log of every LLM round-trip (1=on, 0=off; on by default)
+LLM_TRAFFIC_LOG=1
 
 # Telegram Notifications
 TELEGRAM_BOT_TOKEN=123456:ABC-DEF...
@@ -543,7 +547,19 @@ Before scoring, the screener drops any ticker whose latest close sits more than 
 
 ## AI Analyst
 
-The AI analyst performs deep analysis on each screener candidate. It routes through **Gemini** (`gemini-2.5-flash-lite` by default) when `GEMINI_API_KEY` is set; on any Gemini transport failure (HTTP 5xx, network error, auth failure, or credits depleted) it transparently falls back to a local Ollama model (Qwen 2.5 7B by default) for this call. Permanent failures (invalid key, depleted prepayment credits) latch a process-lifetime flag so Gemini is skipped entirely until the process restarts — mirroring the Tavily→yfinance news-fallback pattern elsewhere in this codebase.
+The AI analyst performs deep analysis on each screener candidate. It routes through **Gemini** (`gemini-2.5-flash-lite` by default) when `GEMINI_API_KEYS` has at least one key; on any Gemini transport failure (HTTP 5xx, network error, auth failure, or credits depleted) it transparently falls back to a local Ollama model (Qwen 2.5 7B by default) for this call. Permanent failures (invalid key, depleted prepayment credits) latch a process-lifetime flag so Gemini is skipped entirely until the process restarts — mirroring the Tavily→yfinance news-fallback pattern elsewhere in this codebase.
+
+### Traffic Log (Diagnostic)
+
+Every LLM round-trip (Gemini and Ollama, success and failure) appends one JSON record to `logs/llm_traffic_YYYY-MM-DD.jsonl` — full prompt, parsed response, raw body, error classification, timing, tokens. Lets you correlate confidence outcomes with the actual reasoning text and see exactly what each provider returned (and why) when something looks off. Toggle with `LLM_TRAFFIC_LOG=0` in `.env`; on by default. Each record includes `kind` (`trading` for analyst calls, `sector` for universe sector classification), `ticker`, `key_idx`/`key_suffix` (Gemini rotation diagnostics), and `error` (e.g. `rpm_429`, `auth_401`, `rpd_quota`, `malformed_envelope`).
+
+```bash
+# Compare Gemini vs Ollama confidence distribution since 2026-04-29:
+.venv/bin/python scripts/analyze_confidence.py --since 2026-04-29
+
+# With a sample of the actual reasoning strings the model returned:
+.venv/bin/python scripts/analyze_confidence.py --since 2026-04-29 --reasoning
+```
 
 ### Context Provided to the LLM
 
@@ -985,10 +1001,10 @@ This system is designed with multiple layers of safety:
 
 ### AI Analyst Issues
 
-**"Gemini auth failed (401/403) -- latching exhausted flag"**
-- The `GEMINI_API_KEY` is invalid, revoked, or lacks permissions for the selected model
+**"Gemini auth failed (401/403) -- marking key exhausted"**
+- The offending entry in `GEMINI_API_KEYS` is invalid, revoked, or lacks permissions for the selected model
 - Check the key at https://aistudio.google.com/apikey; generate a fresh one and update `.env`
-- The flag clears on process restart; after fixing the key, restart the bot
+- That key's per-process flag is set so the rotation skips it; the global flag latches only once every key in the list is exhausted. Restart the bot to clear all flags after fixing the key
 
 **"Gemini plan exhausted -- short-circuiting for process lifetime"**
 - Free-tier quota or prepaid credits are depleted on the Gemini project

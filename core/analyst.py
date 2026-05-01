@@ -11,7 +11,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 
 import pandas as pd
@@ -21,10 +21,11 @@ from config.settings import (
     AI_PROVIDER,
     AI_CONFIDENCE_THRESHOLD,
     ALLOW_SHORT_SELLING,
-    GEMINI_API_KEY,
     GEMINI_API_KEYS,
     GEMINI_HOST,
     GEMINI_MODEL,
+    LLM_TRAFFIC_LOG_ENABLED,
+    LOG_DIR,
     OLLAMA_HOST,
     MIN_RISK_REWARD_RATIO,
 )
@@ -75,7 +76,7 @@ def _is_permanent_gemini_exhaustion(body_text: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Multi-key rotation state — see _call_gemini below.
+# Multi-key rotation state — see _call_gemini_payload below.
 #
 # 3 free-tier keys × 1,000 RPD = 3,000 RPD pool, which fits the bot's ~2,688
 # calls/day at the current 15-min scan cadence. Rotation also raises the
@@ -119,20 +120,51 @@ def _ensure_key_event(key: str) -> threading.Event:
 def _active_gemini_keys() -> list[str]:
     """Current key list, freshly resolved so test patches take effect.
 
-    Precedence: ``_gemini_keys`` (multi-key list) wins when non-empty.
-    Otherwise fall back to ``GEMINI_API_KEY`` (legacy single-key path) so
-    existing tests that ``patch("core.analyst.GEMINI_API_KEY", "dummy")``
-    keep working unchanged.
-
-    Filters out keys whose RPD-exhaustion flag is set.
+    Reads `_gemini_keys` (the live rotation list, populated from
+    `GEMINI_API_KEYS` at module load) and filters out keys whose
+    RPD-exhaustion flag is set.
     """
-    if _gemini_keys:
-        keys = list(_gemini_keys)
-    elif GEMINI_API_KEY:
-        keys = [GEMINI_API_KEY]
-    else:
-        return []
-    return [k for k in keys if not _ensure_key_event(k).is_set()]
+    return [k for k in _gemini_keys if not _ensure_key_event(k).is_set()]
+
+
+# ---------------------------------------------------------------------------
+# Diagnostic JSONL traffic log — one record per LLM round-trip.
+#
+# Captures full prompt + parsed response + raw body + error classification so
+# the confidence-distribution analysis (scripts/analyze_confidence.py) can
+# correlate Gemini-vs-Ollama outcomes with the actual reasoning text. Best-
+# effort by design: a write failure must NEVER break the analyst path.
+# ---------------------------------------------------------------------------
+_traffic_lock = threading.Lock()
+
+
+def _log_llm_traffic(record: dict) -> None:
+    """Append one LLM round-trip record to logs/llm_traffic_YYYY-MM-DD.jsonl.
+
+    Disabled when LLM_TRAFFIC_LOG_ENABLED is False. Any IO failure (disk
+    full, permission denied, LOG_DIR is a regular file) is swallowed —
+    diagnostic logging must never block a trade decision.
+    """
+    if not LLM_TRAFFIC_LOG_ENABLED:
+        return
+    try:
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        path = LOG_DIR / f"llm_traffic_{datetime.now().date().isoformat()}.jsonl"
+        line = json.dumps(record, default=str)
+        with _traffic_lock:
+            with open(path, "a") as f:
+                f.write(line + "\n")
+    except Exception as e:
+        # Don't even log this at WARNING — the analyst is in the hot path
+        # and we don't want a disk failure to spam the trader log every
+        # candidate. Debug is enough for forensic post-mortem.
+        logger.debug("Traffic log write failed: %s", e)
+
+
+def _key_suffix(key: str) -> str:
+    """Last 4 chars of a Gemini key — enough to identify which key was
+    used in a multi-key rotation without leaking the secret."""
+    return f"...{key[-4:]}" if key and len(key) >= 4 else "<short>"
 
 
 def _reset_daily_usage_if_needed() -> None:
@@ -156,7 +188,7 @@ def _record_tokens(provider: str, input_tokens: int, output_tokens: int) -> None
 # Prompt construction
 # ---------------------------------------------------------------------------
 
-ANALYSIS_PROMPT = """You are a disciplined stock trader making real money decisions. Analyze this stock using a strict checklist approach.
+ANALYSIS_PROMPT = """You are a disciplined stock trader making real money decisions. Your job is to vote on whether to enter this trade. Trade levels (entry, stop-loss, take-profit) are set deterministically by the technical screener — you do not pick them. Focus on whether the overall setup justifies entering.
 
 ## Stock: {ticker} ({exchange})
 
@@ -177,27 +209,22 @@ ANALYSIS_PROMPT = """You are a disciplined stock trader making real money decisi
 1. TREND: Is the stock in a clear uptrend (for buy) or downtrend (for sell)? Are moving averages aligned (MA5 > MA10 > MA20 for uptrend)?
 2. MOMENTUM: Is momentum confirming the move? Check RSI direction and MACD alignment. Reject if RSI is already extreme (>80 for buy, <20 for sell).
 3. VOLUME: Is there volume confirmation? Moves without volume are unreliable.
-4. RISK/REWARD: Is the reward at least 1.5x the risk? Calculate: (take_profit - entry) / (entry - stop_loss) >= 1.5
-5. NEWS SENTIMENT: Do recent headlines support or contradict the technical signal?
-6. ANTI-CHASE RULE: Has the stock already moved more than 5% in the signal direction recently? If yes, you missed the move — say "hold".
-7. MACRO/POLITICAL RISK: Do current political, regulatory, or macroeconomic conditions (elections, trade wars, sanctions, Fed policy, sector regulation) create risk or opportunity for this stock? Consider how macro headlines might override or reinforce the technical picture.
+4. NEWS SENTIMENT: Do recent headlines support or contradict the technical signal?
+5. ANTI-CHASE RULE: Has the stock already moved more than 5% in the signal direction recently? If yes, you missed the move — say "hold".
+6. MACRO/POLITICAL RISK: Do current political, regulatory, or macroeconomic conditions (elections, trade wars, sanctions, Fed policy, sector regulation) create risk or opportunity for this stock? Consider how macro headlines might override or reinforce the technical picture.
 
 ## Response Format
 Return a JSON object with these exact fields:
 - "action": {actions}
 - "confidence": integer 0-100
-- "entry_price": specific entry price (float)
-- "stop_loss": stop-loss price (float) — place below recent support for buys, above resistance for sells
-- "take_profit": take-profit price (float) — must give at least 1.5:1 reward/risk
 - "trade_type": "day" (close before market end) or "swing" (hold overnight)
 - "reasoning": 2-3 sentences covering your checklist assessment
 
 ## Discipline Rules
-- Default to "hold" unless at least 5 of 7 checklist items are clearly favorable
+- Default to "hold" unless at least 4 of 6 checklist items are clearly favorable
 - Never chase: if the stock already ran >5% toward the signal, say "hold"
 - Confidence above 65 only when trend + momentum + volume all align and macro environment is not hostile
-- Be honest about uncertainty — a confident "hold" is better than a shaky "buy"
-- Set stop-loss at a technical level (support/resistance), not an arbitrary percentage{short_rule}"""
+- Be honest about uncertainty — a confident "hold" is better than a shaky "buy"{short_rule}"""
 
 
 _ACTIONS_WITH_SHORTS = '"buy", "sell", or "hold"'
@@ -267,7 +294,7 @@ def _build_prompt(
 # Ollama LLM call
 # ---------------------------------------------------------------------------
 
-def _call_ollama(prompt: str) -> Optional[dict]:
+def _call_ollama(prompt: str, ctx: Optional[dict] = None) -> Optional[dict]:
     """Call a local model via Ollama HTTP API with JSON output."""
     payload = json.dumps({
         "model": AI_MODEL,
@@ -283,29 +310,67 @@ def _call_ollama(prompt: str) -> Optional[dict]:
         headers={"Content-Type": "application/json"},
     )
 
-    response = urllib.request.urlopen(req, timeout=1800)
-    result = json.loads(response.read())
+    ctx = ctx or {}
+    started = time.monotonic()
+
+    def _record(error: Optional[str], response: Optional[dict] = None,
+                response_raw: Optional[str] = None,
+                tokens: Optional[dict] = None) -> None:
+        _log_llm_traffic({
+            "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "provider": "ollama",
+            "kind": ctx.get("kind"),
+            "ticker": ctx.get("ticker"),
+            "model": AI_MODEL,
+            "elapsed_ms": int((time.monotonic() - started) * 1000),
+            "tokens": tokens,
+            "prompt": prompt,
+            "response": response,
+            "response_raw": response_raw,
+            "error": error,
+        })
+
+    try:
+        response = urllib.request.urlopen(req, timeout=1800)
+        raw = response.read()
+    except (urllib.error.URLError, urllib.error.HTTPError) as e:
+        _record(error=f"network: {e}")
+        raise
+
+    raw_text = raw.decode("utf-8", errors="replace") if isinstance(raw, bytes) else str(raw)
+    try:
+        result = json.loads(raw)
+    except json.JSONDecodeError as e:
+        _record(error="malformed_envelope", response_raw=raw_text)
+        logger.warning("Ollama response not JSON: %s", e)
+        return None
 
     # Check for errors BEFORE tracking usage — error responses should
     # not count toward daily token limits
     if "error" in result:
         logger.warning("Ollama error: %s", result["error"])
+        _record(error="ollama_error", response_raw=raw_text)
         return None
 
-    _record_tokens(
-        "ollama",
-        result.get("prompt_eval_count", 0),
-        result.get("eval_count", 0),
-    )
+    in_tokens = result.get("prompt_eval_count", 0) or 0
+    out_tokens = result.get("eval_count", 0) or 0
+    _record_tokens("ollama", in_tokens, out_tokens)
 
     duration = result.get("total_duration", 0) / 1e9
     logger.info("Ollama response in %.1fs (%s)", duration, AI_MODEL)
 
     try:
-        return json.loads(result["response"])
+        parsed = json.loads(result["response"])
     except (KeyError, json.JSONDecodeError) as e:
         logger.warning("Ollama response malformed (missing 'response' key or invalid JSON): %s", e)
+        _record(error="malformed_response_field", response_raw=raw_text)
         return None
+
+    _record(
+        error=None, response=parsed, response_raw=raw_text,
+        tokens={"input": int(in_tokens), "output": int(out_tokens)},
+    )
+    return parsed
 
 
 # ---------------------------------------------------------------------------
@@ -322,10 +387,10 @@ class _GeminiTransportError(Exception):
 def _gemini_response_schema() -> dict:
     """JSON schema for Gemini structured output.
 
-    Forces every required field including trade_type — observed in production
-    on 2026-04-21 that Gemini 2.5 Flash-Lite was silently omitting trade_type,
-    triggering validator-driven retries that burned our free-tier RPM budget.
-    The schema makes the field mandatory at the model level.
+    The LLM only votes (buy/hold) + tags confidence/trade_type/reasoning. Trade
+    levels are set deterministically by the screener (ATR-based) and carried
+    through analyze_candidate; asking the LLM for them invited hallucinated
+    chart-readings to propagate into entry/stop/take-profit picks.
     """
     action_enum = ["buy", "sell", "hold"] if ALLOW_SHORT_SELLING else ["buy", "hold"]
     return {
@@ -333,21 +398,22 @@ def _gemini_response_schema() -> dict:
         "properties": {
             "action": {"type": "string", "enum": action_enum},
             "confidence": {"type": "integer"},
-            "entry_price": {"type": "number"},
-            "stop_loss": {"type": "number"},
-            "take_profit": {"type": "number"},
             "trade_type": {"type": "string", "enum": ["day", "swing"]},
             "reasoning": {"type": "string"},
         },
-        "required": [
-            "action", "confidence", "entry_price",
-            "stop_loss", "take_profit", "trade_type", "reasoning",
-        ],
+        "required": ["action", "confidence", "trade_type", "reasoning"],
     }
 
 
-def _call_gemini_with_key(prompt: str, key: str) -> Optional[dict]:
-    """Single Gemini attempt against ONE specific key.
+def _post_gemini_payload(
+    payload: dict, key: str, *, timeout: int = 120,
+    ctx: Optional[dict] = None, key_idx: Optional[int] = None,
+) -> Optional[dict]:
+    """Single Gemini POST against ONE specific key. Generic over payload.
+
+    Used by the rotation in ``_call_gemini_payload`` for both the analyst's
+    trading prompt and the universe's sector-classification prompt — only
+    the payload (and timeout) differ between them.
 
     Maps HTTP 401/403 and RPD-marker 429 to ``_GeminiKeyExhausted`` so the
     rotation can mark the key dead and advance to the next.
@@ -356,64 +422,113 @@ def _call_gemini_with_key(prompt: str, key: str) -> Optional[dict]:
     Other failures (5xx, network) raise ``_GeminiTransportError`` directly
     — those aren't key-specific, so trying a sibling won't help.
     Content errors (bad envelope) return None so the outer router can retry.
+
+    ``ctx`` carries optional caller context (ticker, kind="trading"/"sector")
+    for the diagnostic JSONL traffic log; ``key_idx`` is the rotation index
+    of this key, also for diagnostics.
     """
     url = f"{GEMINI_HOST}/v1beta/models/{GEMINI_MODEL}:generateContent?key={key}"
-    payload = json.dumps({
-        "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {
-            "responseMimeType": "application/json",
-            "responseSchema": _gemini_response_schema(),
-            "maxOutputTokens": 1024,
-            # thinkingBudget:0 disables thinking for 2.5-series models (avoids
-            # latency blowup); ignored by 2.0 models.
-            "thinkingConfig": {"thinkingBudget": 0},
-        },
-    }).encode()
+    encoded = json.dumps(payload).encode()
+    prompt_text = _extract_prompt_text(payload)
+    ctx = ctx or {}
+    started = time.monotonic()
+
+    def _record(error: Optional[str], response: Optional[dict] = None,
+                response_raw: Optional[str] = None,
+                tokens: Optional[dict] = None) -> None:
+        _log_llm_traffic({
+            "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "provider": "gemini",
+            "kind": ctx.get("kind"),
+            "ticker": ctx.get("ticker"),
+            "key_idx": key_idx,
+            "key_suffix": _key_suffix(key),
+            "elapsed_ms": int((time.monotonic() - started) * 1000),
+            "tokens": tokens,
+            "prompt": prompt_text,
+            "response": response,
+            "response_raw": response_raw,
+            "error": error,
+        })
 
     req = urllib.request.Request(
-        url, data=payload, headers={"Content-Type": "application/json"},
+        url, data=encoded, headers={"Content-Type": "application/json"},
     )
 
     try:
-        response = urllib.request.urlopen(req, timeout=120)
+        response = urllib.request.urlopen(req, timeout=timeout)
         raw = response.read()
     except urllib.error.HTTPError as e:
         body = e.read().decode("utf-8", errors="replace") if hasattr(e, "read") else ""
         if e.code in (401, 403):
             logger.warning("Gemini auth failed (%d) — marking key exhausted: %s", e.code, body[:200])
+            _record(error=f"auth_{e.code}", response_raw=body)
             raise _GeminiKeyExhausted(f"auth {e.code}") from e
         if e.code == 429:
             if _is_permanent_gemini_exhaustion(body):
                 logger.warning("Gemini RPD/quota exhausted for this key: %s", body[:200])
+                _record(error="rpd_quota", response_raw=body)
                 raise _GeminiKeyExhausted("429 RPD") from e
             logger.warning("Gemini RPM 429 — will try next key: %s", body[:200])
+            _record(error="rpm_429", response_raw=body)
             raise _GeminiKeyTransient("429 RPM") from e
         logger.warning("Gemini HTTP %d: %s", e.code, body[:200])
+        _record(error=f"http_{e.code}", response_raw=body)
         raise _GeminiTransportError(f"http {e.code}") from e
     except urllib.error.URLError as e:
         logger.warning("Gemini network error: %s", e)
+        _record(error=f"network: {e}")
         raise _GeminiTransportError(f"network: {e}") from e
+    except TimeoutError as e:
+        # socket-level read timeout from inside ssl.recv_into. urllib does
+        # not wrap this in URLError when the urlopen call itself times out
+        # mid-handshake/read, so the bare TimeoutError would otherwise
+        # propagate up and kill the bot mid-scan. Treat as transport error
+        # so the router falls back to Ollama.
+        logger.warning("Gemini read timeout: %s", e)
+        _record(error=f"timeout: {e}")
+        raise _GeminiTransportError(f"timeout: {e}") from e
 
+    raw_text = raw.decode("utf-8", errors="replace") if isinstance(raw, bytes) else str(raw)
     try:
         envelope = json.loads(raw)
         text = envelope["candidates"][0]["content"]["parts"][0]["text"]
         parsed = json.loads(text)
     except (KeyError, IndexError, TypeError, json.JSONDecodeError) as e:
         logger.warning("Gemini response malformed: %s", e)
+        _record(error="malformed_envelope", response_raw=raw_text)
         return None
 
     usage = envelope.get("usageMetadata") or {}
-    _record_tokens(
-        "gemini",
-        usage.get("promptTokenCount", 0),
-        usage.get("candidatesTokenCount", 0),
+    in_tokens = usage.get("promptTokenCount", 0) or 0
+    out_tokens = usage.get("candidatesTokenCount", 0) or 0
+    _record_tokens("gemini", in_tokens, out_tokens)
+    _record(
+        error=None, response=parsed, response_raw=raw_text,
+        tokens={"input": int(in_tokens), "output": int(out_tokens)},
     )
     logger.info("Gemini response OK (%s)", GEMINI_MODEL)
     return parsed
 
 
-def _call_gemini(prompt: str) -> Optional[dict]:
-    """Multi-key rotation wrapper around _call_gemini_with_key.
+def _extract_prompt_text(payload: dict) -> str:
+    """Pull the user-prompt text out of a Gemini generateContent payload."""
+    try:
+        return payload["contents"][0]["parts"][0]["text"]
+    except (KeyError, IndexError, TypeError):
+        return ""
+
+
+def _call_gemini_payload(
+    payload: dict, *, timeout: int = 120, ctx: Optional[dict] = None,
+) -> Optional[dict]:
+    """Multi-key rotation wrapper around ``_post_gemini_payload``.
+
+    Generic entry point for any module that needs to call Gemini through
+    the shared rotation/exhaustion infrastructure. The analyst-side
+    wrapper ``_call_gemini`` builds the trading payload and delegates here;
+    ``core.universe._classify_sector_gemini`` passes its own sector-prompt
+    payload (with a shorter timeout).
 
     Each call advances a round-robin cursor by one position so successive
     candidates spread their requests across the configured keys. Within a
@@ -471,9 +586,18 @@ def _call_gemini(prompt: str) -> Optional[dict]:
         offset = start_cursor % len(keys)
         order = keys[offset:] + keys[:offset]
 
-        for key in order:
+        for i, key in enumerate(order):
+            # key_idx is the position in the FULL configured list (not the
+            # filtered active list) so the JSONL log records a stable index
+            # even as keys get latched within a single call.
             try:
-                return _call_gemini_with_key(prompt, key)
+                key_idx = _gemini_keys.index(key)
+            except ValueError:
+                key_idx = (offset + i) % len(_gemini_keys) if _gemini_keys else None
+            try:
+                return _post_gemini_payload(
+                    payload, key, timeout=timeout, ctx=ctx, key_idx=key_idx,
+                )
             except _GeminiKeyExhausted:
                 _ensure_key_event(key).set()
                 if not _active_gemini_keys():
@@ -487,11 +611,27 @@ def _call_gemini(prompt: str) -> Optional[dict]:
     raise _GeminiTransportError("all keys 429 RPM after retry pass")
 
 
+def _call_gemini(prompt: str, ctx: Optional[dict] = None) -> Optional[dict]:
+    """Analyst-side Gemini call: build trading payload, dispatch through rotation."""
+    payload = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {
+            "responseMimeType": "application/json",
+            "responseSchema": _gemini_response_schema(),
+            "maxOutputTokens": 1024,
+            # thinkingBudget:0 disables thinking for 2.5-series models (avoids
+            # latency blowup); ignored by 2.0 models.
+            "thinkingConfig": {"thinkingBudget": 0},
+        },
+    }
+    return _call_gemini_payload(payload, timeout=120, ctx=ctx)
+
+
 # ---------------------------------------------------------------------------
 # Provider router
 # ---------------------------------------------------------------------------
 
-def _call_llm(prompt: str, max_retries: int = 3) -> Optional[dict]:
+def _call_llm(prompt: str, max_retries: int = 3, ctx: Optional[dict] = None) -> Optional[dict]:
     """Route to Gemini first, fall back to Ollama.
 
     Gemini is attempted only when AI_PROVIDER == "gemini", a key is set, and the
@@ -510,14 +650,14 @@ def _call_llm(prompt: str, max_retries: int = 3) -> Optional[dict]:
     """
     use_gemini = (
         AI_PROVIDER == "gemini"
-        and bool(GEMINI_API_KEY)
+        and bool(_active_gemini_keys())
         and not _gemini_exhausted.is_set()
     )
 
     if use_gemini:
         for attempt in range(1, max_retries + 1):
             try:
-                result = _call_gemini(prompt)
+                result = _call_gemini(prompt, ctx=ctx)
             except _GeminiTransportError as e:
                 logger.warning("Gemini transport failure — falling back to Ollama: %s", e)
                 break
@@ -530,7 +670,7 @@ def _call_llm(prompt: str, max_retries: int = 3) -> Optional[dict]:
 
     for attempt in range(1, max_retries + 1):
         try:
-            result = _call_ollama(prompt)
+            result = _call_ollama(prompt, ctx=ctx)
             if result and _validate_response(result):
                 return result
             logger.warning("Ollama invalid response on attempt %d: %s", attempt, result)
@@ -541,8 +681,15 @@ def _call_llm(prompt: str, max_retries: int = 3) -> Optional[dict]:
 
 
 def _validate_response(data: dict) -> bool:
-    """Validate LLM response has all required fields with valid values."""
-    required = ["action", "confidence", "entry_price", "stop_loss", "take_profit", "reasoning", "trade_type"]
+    """Validate LLM response has all required fields with valid values.
+
+    The LLM contract is buy/hold + confidence + trade_type + reasoning. Trade
+    levels (entry_price, stop_loss, take_profit) come from the screener's
+    deterministic ATR computation in core/screener.py — the LLM never picks
+    them. Price-relationship and R:R checks live in core/risk.py, where they
+    operate on the screener-set levels.
+    """
+    required = ["action", "confidence", "reasoning", "trade_type"]
     missing = [f for f in required if f not in data]
     if missing:
         logger.warning("LLM response missing fields: %s. Keys present: %s", missing, list(data.keys()))
@@ -553,53 +700,13 @@ def _validate_response(data: dict) -> bool:
         return False
     # The short-selling gate lives in risk.check_short_selling, which knows
     # whether the user holds the stock. Rejecting every SELL here would block
-    # AI-driven exits on held longs (a legitimate signal shape). The prompt
-    # also steers the LLM away from "sell" when shorts are disabled; this
-    # validator used to fight the prompt redundantly.
+    # AI-driven exits on held longs (a legitimate signal shape).
     if data.get("trade_type") not in ("day", "swing"):
         logger.warning("LLM response invalid trade_type: %r", data.get("trade_type"))
         return False
     if not isinstance(data["confidence"], (int, float)) or not (0 <= data["confidence"] <= 100):
         logger.warning("LLM response invalid confidence: %r", data["confidence"])
         return False
-    # Price fields are only required for buy/sell — holds legitimately have no prices
-    if data["action"] in ("buy", "sell"):
-        for price_field in ("entry_price", "stop_loss", "take_profit"):
-            if not isinstance(data[price_field], (int, float)) or data[price_field] <= 0:
-                logger.warning("LLM response invalid %s: %r", price_field, data[price_field])
-                return False
-
-        # Validate price relationships
-        entry = data["entry_price"]
-        sl = data["stop_loss"]
-        tp = data["take_profit"]
-
-        if data["action"] == "buy":
-            if sl >= entry:
-                logger.warning("BUY stop_loss %.2f must be below entry %.2f", sl, entry)
-                return False
-            if tp <= entry:
-                logger.warning("BUY take_profit %.2f must be above entry %.2f", tp, entry)
-                return False
-            risk = entry - sl
-            reward = tp - entry
-            rr = reward / risk if risk > 0 else 0
-            if risk > 0 and round(rr, 2) < MIN_RISK_REWARD_RATIO:
-                logger.warning("BUY R:R %.2f below minimum %.2f", rr, MIN_RISK_REWARD_RATIO)
-                return False
-        elif data["action"] == "sell":
-            if sl <= entry:
-                logger.warning("SELL stop_loss %.2f must be above entry %.2f", sl, entry)
-                return False
-            if tp >= entry:
-                logger.warning("SELL take_profit %.2f must be below entry %.2f", tp, entry)
-                return False
-            risk = sl - entry
-            reward = entry - tp
-            rr = reward / risk if risk > 0 else 0
-            if risk > 0 and round(rr, 2) < MIN_RISK_REWARD_RATIO:
-                logger.warning("SELL R:R %.2f below minimum %.2f", rr, MIN_RISK_REWARD_RATIO)
-                return False
 
     return True
 
@@ -609,10 +716,8 @@ def _validate_response(data: dict) -> bool:
 # ---------------------------------------------------------------------------
 
 def analyze_candidate(
-    ticker: str,
-    exchange: str,
+    screener_signal: Signal,
     df: pd.DataFrame,
-    indicator_values: dict,
     news: list[str],
     macro_news: list[str] | None = None,
 ) -> Optional[Signal]:
@@ -620,10 +725,19 @@ def analyze_candidate(
 
     Pure function — receives all data, doesn't fetch anything.
 
-    Returns a Signal if confidence >= threshold, else None.
+    The LLM is restricted to a buy/hold vote plus confidence/trade_type/reasoning.
+    Trade levels (entry_price, stop_loss, take_profit) are carried through from
+    the screener's deterministic ATR computation, NOT picked by the LLM. This
+    blocks hallucinated chart-readings from propagating into the bracket order.
+
+    Returns a Signal if action is buy/sell and confidence >= threshold, else None.
     """
-    prompt = _build_prompt(ticker, exchange, df, indicator_values, news, macro_news=macro_news)
-    result = _call_llm(prompt)
+    ticker = screener_signal.ticker
+    exchange = screener_signal.exchange
+    prompt = _build_prompt(
+        ticker, exchange, df, screener_signal.indicator_values, news, macro_news=macro_news,
+    )
+    result = _call_llm(prompt, ctx={"ticker": ticker, "kind": "trading"})
 
     if not result:
         logger.warning("No valid LLM response for %s", ticker)
@@ -649,14 +763,14 @@ def analyze_candidate(
         ticker=ticker,
         action=action,
         confidence=float(result["confidence"]),
-        entry_price=float(result["entry_price"]),
-        stop_loss=float(result["stop_loss"]),
-        take_profit=float(result["take_profit"]),
+        entry_price=screener_signal.entry_price,
+        stop_loss=screener_signal.stop_loss,
+        take_profit=screener_signal.take_profit,
         reasoning=result.get("reasoning", ""),
         source="ai",
         exchange=exchange,
         trade_type=trade_type,
-        indicator_values=indicator_values,
+        indicator_values=screener_signal.indicator_values,
     )
 
 
@@ -670,7 +784,7 @@ def analyze_batch(
 
     Args:
         candidates: List of dicts with keys:
-            ticker, exchange, df, indicator_values, news
+            screener_signal (Signal), df, news
         on_signal: Optional callback called immediately when a signal is approved.
         on_progress: Optional callback(current, total) called after each candidate.
         macro_news: Broad market/political headlines shared across all candidates.
@@ -682,17 +796,16 @@ def analyze_batch(
 
     for i, c in enumerate(candidates, 1):
         try:
-            ticker = c["ticker"]
+            screener_signal = c["screener_signal"]
         except KeyError as e:
             logger.error("Skipping malformed candidate (missing key %s)", e)
             continue
+        ticker = screener_signal.ticker
         logger.info("Analyzing candidate %d/%d: %s", i, total, ticker)
         try:
             signal = analyze_candidate(
-                ticker=ticker,
-                exchange=c["exchange"],
+                screener_signal=screener_signal,
                 df=c["df"],
-                indicator_values=c.get("indicator_values", {}),
                 news=c.get("news", []),
                 macro_news=macro_news,
             )

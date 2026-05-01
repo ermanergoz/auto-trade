@@ -431,11 +431,18 @@ class TestGeminiSectorFallback:
 
     @pytest.fixture
     def reset_gemini_state(self):
-        """Clear the process-wide Gemini exhaustion flag before and after each test."""
-        from core.analyst import _gemini_exhausted
-        _gemini_exhausted.clear()
+        """Clear every piece of process-wide Gemini rotation state before and
+        after each test. The per-key exhaustion flag and rotation cursor live
+        in module globals; without clearing them, state from one test (e.g.
+        a 401 that latches the per-key flag) leaks into the next."""
+        from core import analyst as _a
+        _a._gemini_exhausted.clear()
+        _a._gemini_key_index = 0
+        _a._gemini_key_exhausted.clear()
         yield
-        _gemini_exhausted.clear()
+        _a._gemini_exhausted.clear()
+        _a._gemini_key_index = 0
+        _a._gemini_key_exhausted.clear()
 
     def _gemini_body(self, json_text: str) -> bytes:
         """Build a successful Gemini generateContent response envelope."""
@@ -444,8 +451,8 @@ class TestGeminiSectorFallback:
             "usageMetadata": {"promptTokenCount": 40, "candidatesTokenCount": 20},
         }).encode()
 
-    @patch("core.universe.GEMINI_API_KEY", "fake-key")
-    @patch("core.universe.urllib.request.urlopen")
+    @patch("core.analyst._gemini_keys", ["fake-key"])
+    @patch("core.analyst.urllib.request.urlopen")
     def test_classify_sector_gemini_returns_sector_and_country(
         self, mock_urlopen, reset_gemini_state,
     ):
@@ -459,7 +466,7 @@ class TestGeminiSectorFallback:
         assert sector == "Technology"
         assert country == "United States"
 
-    @patch("core.universe.GEMINI_API_KEY", "")
+    @patch("core.analyst._gemini_keys", [])
     def test_classify_sector_gemini_returns_none_without_api_key(
         self, reset_gemini_state,
     ):
@@ -467,8 +474,8 @@ class TestGeminiSectorFallback:
         assert sector is None
         assert country is None
 
-    @patch("core.universe.GEMINI_API_KEY", "fake-key")
-    @patch("core.universe.urllib.request.urlopen")
+    @patch("core.analyst._gemini_keys", ["fake-key"])
+    @patch("core.analyst.urllib.request.urlopen")
     def test_classify_sector_gemini_returns_none_when_exhausted(
         self, mock_urlopen, reset_gemini_state,
     ):
@@ -481,8 +488,8 @@ class TestGeminiSectorFallback:
         assert country is None
         mock_urlopen.assert_not_called()
 
-    @patch("core.universe.GEMINI_API_KEY", "fake-key")
-    @patch("core.universe.urllib.request.urlopen")
+    @patch("core.analyst._gemini_keys", ["fake-key"])
+    @patch("core.analyst.urllib.request.urlopen")
     def test_classify_sector_gemini_returns_none_on_transient_http_error(
         self, mock_urlopen, reset_gemini_state,
     ):
@@ -498,8 +505,8 @@ class TestGeminiSectorFallback:
         assert country is None
         assert not _gemini_exhausted.is_set(), "500 must not latch exhaustion"
 
-    @patch("core.universe.GEMINI_API_KEY", "fake-key")
-    @patch("core.universe.urllib.request.urlopen")
+    @patch("core.analyst._gemini_keys", ["fake-key"])
+    @patch("core.analyst.urllib.request.urlopen")
     def test_classify_sector_gemini_latches_exhausted_on_auth_failure(
         self, mock_urlopen, reset_gemini_state,
     ):
@@ -517,8 +524,8 @@ class TestGeminiSectorFallback:
         assert country is None
         assert _gemini_exhausted.is_set(), "401 must latch exhaustion"
 
-    @patch("core.universe.GEMINI_API_KEY", "fake-key")
-    @patch("core.universe.urllib.request.urlopen")
+    @patch("core.analyst._gemini_keys", ["fake-key"])
+    @patch("core.analyst.urllib.request.urlopen")
     def test_classify_sector_gemini_latches_exhausted_on_quota_depletion(
         self, mock_urlopen, reset_gemini_state,
     ):
@@ -536,8 +543,8 @@ class TestGeminiSectorFallback:
         assert country is None
         assert _gemini_exhausted.is_set(), "permanent 429 must latch exhaustion"
 
-    @patch("core.universe.GEMINI_API_KEY", "fake-key")
-    @patch("core.universe.urllib.request.urlopen")
+    @patch("core.analyst._gemini_keys", ["fake-key"])
+    @patch("core.analyst.urllib.request.urlopen")
     def test_classify_sector_gemini_transient_429_does_not_latch(
         self, mock_urlopen, reset_gemini_state,
     ):
@@ -595,6 +602,95 @@ class TestGeminiSectorFallback:
         assert result[0].sector == "Energy"
         mock_gemini.assert_called_once()
         mock_ollama.assert_called_once()
+
+
+class TestSectorLookupRoutesThroughRotation:
+    """Regression for the 2026-04-28 production bug.
+
+    Before the API-key consolidation, `_classify_sector_gemini` issued
+    its own `urllib.request.urlopen` call against a single key
+    (`?key={GEMINI_API_KEY}`), bypassing the multi-key rotation that
+    `core.analyst._call_gemini_payload` implements. Combined with the
+    singular-var gate, sector lookups silently fell through to Ollama
+    for every cache miss in the universe scan ("0 via Gemini, 13 via
+    Ollama" in the 04-28 log).
+
+    Contract after the fix: sector lookups must go through
+    `core.analyst._call_gemini_payload`, picking up rotation, RPM 429
+    fallthrough, and the global `_gemini_exhausted` short-circuit
+    automatically.
+    """
+
+    @pytest.fixture
+    def reset_full_gemini_state(self):
+        """Clear every piece of process-wide rotation state so tests can
+        not leak the cursor or per-key flags into each other."""
+        from core import analyst as _a
+        _a._gemini_exhausted.clear()
+        _a._gemini_key_index = 0
+        _a._gemini_key_exhausted.clear()
+        yield
+        _a._gemini_exhausted.clear()
+        _a._gemini_key_index = 0
+        _a._gemini_key_exhausted.clear()
+
+    def test_sector_lookup_routes_through_call_gemini_payload(
+        self, reset_full_gemini_state,
+    ):
+        """The sector helper must call analyst._call_gemini_payload once per
+        lookup rather than building a one-key URL itself."""
+        with patch("core.universe.AI_PROVIDER", "gemini"), \
+             patch("core.analyst._gemini_keys", ["KEY_A"]), \
+             patch("core.analyst._call_gemini_payload") as mock_call:
+            mock_call.return_value = {
+                "sector": "Technology", "country": "United States",
+            }
+            sector, country = _classify_sector_gemini("AAPL", "APPLE INC")
+        assert sector == "Technology"
+        assert country == "United States"
+        assert mock_call.call_count == 1, (
+            "Sector lookup must dispatch through _call_gemini_payload "
+            "(rotation wrapper). Direct urlopen calls bypass multi-key rotation."
+        )
+
+    def test_sector_lookup_rotates_keys_on_rpm_429(self, reset_full_gemini_state):
+        """When key A returns RPM 429, the rotation in _call_gemini_payload
+        must advance to key B and the sector lookup must succeed."""
+        import io
+        import urllib.error
+        from core import analyst as _a
+
+        rpm_body = b'{"error":{"code":429,"message":"requests per minute"}}'
+        rpm_err = urllib.error.HTTPError(
+            url="x", code=429, msg="rate", hdrs=None, fp=io.BytesIO(rpm_body),
+        )
+        success_body = json.dumps({
+            "candidates": [{"content": {"parts": [{"text":
+                json.dumps({"sector": "Technology", "country": "US"})
+            }]}}],
+            "usageMetadata": {"promptTokenCount": 40, "candidatesTokenCount": 20},
+        }).encode()
+        success_resp = MagicMock()
+        success_resp.read.return_value = success_body
+
+        # Patch urlopen on the analyst module — that's where _call_gemini
+        # lives after the consolidation. Pre-fix, universe.py owns its own
+        # urlopen import and this patch site won't intercept anything.
+        with patch("core.universe.AI_PROVIDER", "gemini"), \
+             patch("core.analyst._gemini_keys", ["KEY_A", "KEY_B"]), \
+             patch("core.analyst.urllib.request.urlopen") as mu:
+            mu.side_effect = [rpm_err, success_resp]
+            sector, country = _classify_sector_gemini("AAPL", "APPLE INC")
+
+        assert sector == "Technology"
+        assert mu.call_count == 2, (
+            "Must retry on second key after first 429 RPM"
+        )
+        urls = [mu.call_args_list[i][0][0].full_url for i in range(2)]
+        assert "KEY_A" in urls[0], f"first attempt should use KEY_A, got {urls[0]}"
+        assert "KEY_B" in urls[1], f"second attempt should use KEY_B, got {urls[1]}"
+        # No flags latched on transient RPM
+        assert not _a._gemini_exhausted.is_set()
 
 
 class TestGetTickersForMarket:

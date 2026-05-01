@@ -112,8 +112,9 @@ Deep analysis on screener candidates only.
 
 For each candidate:
 - Gathers: technical indicator values, recent price action, news headlines, sector performance
-- Sends structured prompt through the provider router (`core/analyst._call_llm`): Gemini (`gemini-2.5-flash-lite` by default) when `GEMINI_API_KEY` is set and the process-lifetime exhaustion flag is clear, otherwise (or on Gemini transport failure / credits depleted) Ollama + Qwen 2.5 7B locally
-- Receives structured response: `{action: buy|sell|hold, confidence: 0-100, entry_price, stop_loss, take_profit, trade_type, reasoning}`
+- Sends structured prompt through the provider router (`core/analyst._call_llm`): Gemini (`gemini-2.5-flash-lite` by default) when `GEMINI_API_KEYS` has at least one key and the process-lifetime exhaustion flag is clear, otherwise (or on Gemini transport failure / credits depleted) Ollama + Qwen 2.5 7B locally
+- Receives structured response: `{action: buy|sell|hold, confidence: 0-100, trade_type, reasoning}`
+- Trade levels (`entry_price`, `stop_loss`, `take_profit`) are NOT in the LLM contract — they come from the screener's deterministic ATR computation in `core/screener.py:_build_signal` and carry through `analyze_candidate` unchanged. The LLM is restricted to a buy/hold vote so that hallucinated chart-readings cannot propagate into bracket-order levels.
 - Confidence threshold: only act on signals with confidence >= 65 (configurable)
 - Fallback semantics mirror the Tavily→yfinance news path: permanent exhaustion (401/403, depleted credits) latches a process-wide flag; transient failures (5xx, network, per-minute 429) fall back for just this call
 
@@ -236,7 +237,7 @@ MIN_MARKET_CAP = 50_000_000  # $50M
 SCAN_INTERVAL_MINUTES = 15
 AI_CONFIDENCE_THRESHOLD = 65
 AI_PROVIDER = "gemini"                  # "gemini" (auto-falls back to Ollama) or "ollama"
-GEMINI_API_KEY = ""                     # leave blank to disable Gemini and use Ollama only
+GEMINI_API_KEYS = []                    # comma-separated env list; 1 key = single, 2-3 = rotation; empty = use Ollama only
 GEMINI_MODEL = "gemini-2.5-flash-lite"
 GEMINI_HOST = "https://generativelanguage.googleapis.com"
 AI_MODEL = "qwen2.5:7b"                 # Ollama fallback model

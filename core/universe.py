@@ -14,8 +14,8 @@ from ib_insync import IB, Stock, ScannerSubscription, util
 
 from config.settings import (
     AI_MODEL, AI_PROVIDER, DATA_DIR, EXCLUDED_COUNTRIES, EXCLUDED_SECTORS,
-    EXCLUDED_TICKERS, FINANCIAL_KEYWORDS, DEFENSE_KEYWORDS, GEMINI_API_KEY,
-    GEMINI_HOST, GEMINI_MODEL, MIN_DAILY_VOLUME, MIN_MARKET_CAP, OLLAMA_HOST,
+    EXCLUDED_TICKERS, FINANCIAL_KEYWORDS, DEFENSE_KEYWORDS,
+    MIN_DAILY_VOLUME, MIN_MARKET_CAP, OLLAMA_HOST,
 )
 from core.models import StockInfo
 
@@ -280,67 +280,47 @@ def _classify_sector_gemini(
 ) -> tuple[Optional[str], Optional[str]]:
     """Use Gemini to classify sector and country for a ticker.
 
-    Short-circuits without an HTTP call if no key is configured or if the
-    process-wide _gemini_exhausted flag (shared with core.analyst) is latched.
-    Latches the flag on 401/403 and on 429 responses whose body matches the
-    permanent-exhaustion markers — matches the contract in core.analyst so a
-    single Gemini outage turns off all Gemini calls in the process.
+    Routes through ``core.analyst._call_gemini_payload`` so sector lookups
+    share the multi-key rotation, the per-key RPD exhaustion flags, and the
+    process-wide ``_gemini_exhausted`` short-circuit with the analyst path.
+    A single Gemini outage therefore turns off all Gemini calls in the
+    process; recovery requires a process restart, mirroring the analyst.
 
     Returns (sector, country) or (None, None) on failure.
     """
-    # Import here to avoid a circular-import risk and to always observe the
-    # current state of the shared flag.
-    from core.analyst import _gemini_exhausted, _is_permanent_gemini_exhaustion
+    # Import here to avoid a circular-import risk and to always observe
+    # the current state of the shared rotation/exhaustion flags.
+    from core.analyst import (
+        _active_gemini_keys, _call_gemini_payload, _GeminiTransportError,
+        _gemini_exhausted,
+    )
 
-    if not GEMINI_API_KEY or AI_PROVIDER != "gemini" or _gemini_exhausted.is_set():
+    if (
+        AI_PROVIDER != "gemini"
+        or not _active_gemini_keys()
+        or _gemini_exhausted.is_set()
+    ):
         return None, None
 
-    url = f"{GEMINI_HOST}/v1beta/models/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
-    payload = json.dumps({
+    payload = {
         "contents": [{"parts": [{"text": _sector_prompt(ticker, name)}]}],
         "generationConfig": {
             "responseMimeType": "application/json",
             "maxOutputTokens": 128,
             "thinkingConfig": {"thinkingBudget": 0},
         },
-    }).encode()
-
-    req = urllib.request.Request(
-        url, data=payload, headers={"Content-Type": "application/json"},
-    )
+    }
 
     try:
-        response = urllib.request.urlopen(req, timeout=30)
-        raw = response.read()
-    except urllib.error.HTTPError as e:
-        body = e.read().decode("utf-8", errors="replace") if hasattr(e, "read") else ""
-        if e.code in (401, 403):
-            logger.warning(
-                "Gemini sector lookup auth failed (%d) — latching exhausted: %s",
-                e.code, body[:200],
-            )
-            _gemini_exhausted.set()
-        elif e.code == 429 and _is_permanent_gemini_exhaustion(body):
-            logger.warning(
-                "Gemini sector lookup plan exhausted — latching: %s", body[:200],
-            )
-            _gemini_exhausted.set()
-        else:
-            logger.debug(
-                "Gemini sector lookup transient HTTP %d for %s: %s",
-                e.code, ticker, body[:200],
-            )
-        return None, None
-    except urllib.error.URLError as e:
-        logger.debug("Gemini sector lookup network error for %s: %s", ticker, e)
+        data = _call_gemini_payload(
+            payload, timeout=30,
+            ctx={"ticker": ticker, "kind": "sector"},
+        )
+    except _GeminiTransportError as e:
+        logger.debug("Gemini sector lookup transport error for %s: %s", ticker, e)
         return None, None
 
-    try:
-        envelope = json.loads(raw)
-        text = envelope["candidates"][0]["content"]["parts"][0]["text"]
-        data = json.loads(text)
-    except (KeyError, IndexError, TypeError, json.JSONDecodeError) as e:
-        logger.debug("Gemini sector response malformed for %s: %s", ticker, e)
+    if not data:
         return None, None
 
     sector = data.get("sector") or None
@@ -357,8 +337,14 @@ def _classify_sector_ollama(
 
     Returns (sector, country) or (None, None) on failure.
     """
+    import time
+    from datetime import datetime, timezone
+    from core.analyst import _log_llm_traffic
+
     prompt = _sector_prompt(ticker, name)
     for attempt in range(1, max_retries + 1):
+        started = time.monotonic()
+        raw_text = None
         try:
             payload = json.dumps({
                 "model": AI_MODEL,
@@ -374,11 +360,29 @@ def _classify_sector_ollama(
                 headers={"Content-Type": "application/json"},
             )
             response = urllib.request.urlopen(req, timeout=30)
-            result = json.loads(response.read())
+            raw = response.read()
+            raw_text = raw.decode("utf-8", errors="replace") if isinstance(raw, bytes) else str(raw)
+            result = json.loads(raw)
             data = json.loads(result["response"])
 
             sector = data.get("sector") or None
             country = data.get("country") or None
+            _log_llm_traffic({
+                "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "provider": "ollama",
+                "kind": "sector",
+                "ticker": ticker,
+                "model": AI_MODEL,
+                "elapsed_ms": int((time.monotonic() - started) * 1000),
+                "tokens": {
+                    "input": int(result.get("prompt_eval_count", 0) or 0),
+                    "output": int(result.get("eval_count", 0) or 0),
+                },
+                "prompt": prompt,
+                "response": data,
+                "response_raw": raw_text,
+                "error": None,
+            })
             if sector:
                 return sector, country
         except Exception as e:
@@ -386,6 +390,19 @@ def _classify_sector_ollama(
                 "Ollama sector lookup failed for %s (attempt %d): %s",
                 ticker, attempt, e,
             )
+            _log_llm_traffic({
+                "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "provider": "ollama",
+                "kind": "sector",
+                "ticker": ticker,
+                "model": AI_MODEL,
+                "elapsed_ms": int((time.monotonic() - started) * 1000),
+                "tokens": None,
+                "prompt": prompt,
+                "response": None,
+                "response_raw": raw_text,
+                "error": f"{type(e).__name__}: {e}",
+            })
     return None, None
 
 

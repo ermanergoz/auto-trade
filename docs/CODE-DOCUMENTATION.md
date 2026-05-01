@@ -70,7 +70,11 @@ Every 15 minutes during market hours:
               - Recent price action (last 5 days)
               - Indicator values (RSI, MACD, etc.)
               - News headlines
-              The AI returns: BUY/SELL/HOLD + confidence + prices + reasoning
+              The AI returns: BUY/SELL/HOLD + confidence + trade_type + reasoning
+              Trade levels (entry, stop-loss, take-profit) come from the
+              screener's deterministic ATR computation — the LLM does not
+              pick them, so hallucinated chart-readings cannot propagate
+              into bracket-order levels.
               Only signals with confidence >= 65 pass through
                     ↓
   6. RISK CHECK — For each AI-approved signal, run 11 safety checks:
@@ -240,11 +244,11 @@ SCAN_INTERVAL_MINUTES = 15         # Run the full pipeline every 15 min
 AI_CONFIDENCE_THRESHOLD = 65       # AI must be 65%+ confident
 AI_MAX_CANDIDATES = 0              # Max stocks sent to AI per cycle (0 = no limit)
 AI_PROVIDER = "gemini"             # Primary LLM: "gemini" (auto-falls back to Ollama) or "ollama"
-GEMINI_API_KEYS = []               # Comma-separated list in env (preferred). Bot round-robins
-                                   #   per call; 1, 2, or 3 keys all work. Free tier is 1,000 RPD
-                                   #   per key, so 3 keys ≈ 3,000 RPD/day, comfortably above the
-                                   #   bot's ~2,688 calls/day at 15-min cadence.
-GEMINI_API_KEY = ""                # Legacy single-key form, used only when GEMINI_API_KEYS is empty
+GEMINI_API_KEYS = []               # Comma-separated list in env. Bot round-robins per call;
+                                   #   1, 2, or 3 keys all work — single-key is just a one-element
+                                   #   rotation. Free tier is 1,000 RPD per key, so 3 keys ≈ 3,000
+                                   #   RPD/day, comfortably above the bot's ~2,688 calls/day at
+                                   #   15-min cadence.
 GEMINI_MODEL = "gemini-2.5-flash-lite"
 GEMINI_HOST = "https://generativelanguage.googleapis.com"
 AI_MODEL = "qwen3:8b"             # Ollama fallback model
@@ -444,7 +448,7 @@ Step 5: Cache the result as a JSON file for the rest of the day
 **Sector classification fallback** — what if IBKR doesn't know the sector?
 1. **IBKR contract details** — `reqContractDetails` returns `category` for most stocks
 2. **yfinance** — `yf.Ticker().info["sector"]` for stocks, `.info["category"]` for ETFs
-3. **Gemini** — `gemini-2.5-flash-lite` classifies the ticker by sector and country (~1s, ~128 tokens). Skipped without an HTTP call when `GEMINI_API_KEY` is unset, `AI_PROVIDER != "gemini"`, or the shared `_gemini_exhausted` flag is latched.
+3. **Gemini** — `gemini-2.5-flash-lite` classifies the ticker by sector and country (~1s, ~128 tokens). Routes through the shared `core.analyst._call_gemini_payload` rotation so sector lookups inherit the multi-key round-robin and the per-key/global exhaustion flags. Skipped without an HTTP call when `GEMINI_API_KEYS` is empty, `AI_PROVIDER != "gemini"`, or the shared `_gemini_exhausted` flag is latched.
 4. **Ollama LLM** — asks the local AI model to classify by sector and country when Gemini is unavailable or returned nothing
 5. **Exclude** — unclassifiable stocks are dropped (can't safely filter financials)
 
@@ -569,7 +573,7 @@ The AI analyst is the "smart filter." It takes candidates from the screener and 
 
 The analyst routes through **Gemini** (primary) with **Ollama + Qwen 2.5 7B** as an automatic fallback:
 
-- **Gemini (primary)** — cloud, fast (~2-5s per analysis), capable. Gemini Flash-Lite is cheap-to-free on light workloads. Works when `GEMINI_API_KEY` is set.
+- **Gemini (primary)** — cloud, fast (~2-5s per analysis), capable. Gemini Flash-Lite is cheap-to-free on light workloads. Works when `GEMINI_API_KEYS` has at least one key.
 - **Ollama (fallback)** — local, slower (~30-60s on CPU, 5-10x faster on GPU), free, works offline. Kicks in automatically when Gemini is unreachable, rate-limited, has depleted credits, or is not configured.
 
 This was a pivot from the original cloud-only Claude/GPT design (see Challenges section). Keeping Ollama as the fallback preserves offline-capable, zero-cost resilience, while Gemini as the primary gives us significantly lower latency per scan cycle and higher-quality reasoning without the old cost-per-analysis anxiety.
@@ -578,7 +582,7 @@ This was a pivot from the original cloud-only Claude/GPT design (see Challenges 
 
 `core/analyst._call_llm()` is the router:
 
-1. If `AI_PROVIDER == "gemini"`, at least one Gemini key is configured (`GEMINI_API_KEYS` or `GEMINI_API_KEY`), and the process-lifetime exhaustion flag `_gemini_exhausted` is not latched — try Gemini up to `max_retries` times for content-level failures (malformed JSON, invalid response), falling straight through to Ollama on any transport failure (HTTP 5xx, network error, all-keys-exhausted).
+1. If `AI_PROVIDER == "gemini"`, `GEMINI_API_KEYS` has at least one active (non-exhausted) key, and the process-lifetime exhaustion flag `_gemini_exhausted` is not latched — try Gemini up to `max_retries` times for content-level failures (malformed JSON, invalid response), falling straight through to Ollama on any transport failure (HTTP 5xx, network error, all-keys-exhausted).
 2. Otherwise (or after Gemini gives up) call Ollama up to `max_retries` times.
 
 Two failure modes drive routing:
@@ -588,12 +592,50 @@ Two failure modes drive routing:
 
 #### Multi-key rotation
 
-`_call_gemini` rotates round-robin across every key in `GEMINI_API_KEYS` so the free-tier RPD ceiling (1,000/day per key) scales linearly with the number of configured keys — three keys ≈ 3,000 RPD/day pool, comfortably above the bot's ~2,688 calls/day at 15-min cadence. Each call advances a thread-safe cursor by one position; per-call failure handling iterates from that starting index through every active key:
+`_call_gemini_payload` rotates round-robin across every key in `GEMINI_API_KEYS` so the free-tier RPD ceiling (1,000/day per key) scales linearly with the number of configured keys — three keys ≈ 3,000 RPD/day pool, comfortably above the bot's ~2,688 calls/day at 15-min cadence. Both the analyst trading prompt (`_call_gemini`) and the universe sector lookup (`core.universe._classify_sector_gemini`) dispatch through this single rotation. Each call advances a thread-safe cursor by one position; per-call failure handling iterates from that starting index through every active key:
 
-- **RPD/auth (permanent) on a key** — `_call_gemini_with_key` raises `_GeminiKeyExhausted`; the rotation latches THAT key's per-key flag and tries the next active key. The global `_gemini_exhausted` is set only when EVERY key is exhausted, which is the trigger for the Ollama fallback path.
-- **RPM (transient) on a key** — `_call_gemini_with_key` raises `_GeminiKeyTransient`; the rotation tries the next active key without latching anything. If every active key returns RPM 429 in the first pass *and* the deployment has more than one key configured, sleep `_GEMINI_RPM_RETRY_SLEEP` (30 s) once and try a second pass. Single-key deployments skip the sleep entirely — there is no sibling to recover.
+- **RPD/auth (permanent) on a key** — `_post_gemini_payload` raises `_GeminiKeyExhausted`; the rotation latches THAT key's per-key flag and tries the next active key. The global `_gemini_exhausted` is set only when EVERY key is exhausted, which is the trigger for the Ollama fallback path.
+- **RPM (transient) on a key** — `_post_gemini_payload` raises `_GeminiKeyTransient`; the rotation tries the next active key without latching anything. If every active key returns RPM 429 in the first pass *and* the deployment has more than one key configured, sleep `_GEMINI_RPM_RETRY_SLEEP` (30 s) once and try a second pass. Single-key deployments skip the sleep entirely — there is no sibling to recover.
 
-Single-key deployments fall back to a one-element rotation, so the legacy `GEMINI_API_KEY=...` form keeps working unchanged.
+A single key configured as `GEMINI_API_KEYS=onekey` is just a one-element rotation — same code path as multi-key, no separate "single-key" branch.
+
+#### Diagnostic JSONL traffic log
+
+`_log_llm_traffic` appends one JSON record per LLM round-trip to `logs/llm_traffic_YYYY-MM-DD.jsonl` (success **and** failure). Hooked into both `_post_gemini_payload` (every error branch + success) and `_call_ollama` (analyst path) and the universe sector-Ollama path. Ctx is plumbed from `analyze_candidate` (`{"ticker": ..., "kind": "trading"}`) and `_classify_sector_gemini` (`{"ticker": ..., "kind": "sector"}`) so per-symbol and per-purpose breakdowns are exact.
+
+Schema:
+
+```json
+{
+  "ts": "2026-04-29T18:42:00Z",
+  "provider": "gemini" | "ollama",
+  "kind": "trading" | "sector",
+  "ticker": "AAPL",
+  "key_idx": 0,             // gemini only: rotation index
+  "key_suffix": "...xyz9",  // gemini only: last 4 chars (no secret leakage)
+  "elapsed_ms": 2840,
+  "tokens": {"input": 845, "output": 130},
+  "prompt": "<full prompt text>",
+  "response": {"action": "buy", "confidence": 75, ...} | null,
+  "response_raw": "<raw envelope or error body>",
+  "error": null | "rpm_429" | "rpd_quota" | "auth_401" | "auth_403" |
+                  "http_500" | "network: ..." | "malformed_envelope" |
+                  "ollama_error" | "malformed_response_field"
+}
+```
+
+Toggle via `LLM_TRAFFIC_LOG=0` in `.env`; on by default. The helper is best-effort — disk failure (full, perms, LOG_DIR is a regular file) is swallowed at DEBUG level so the analyst path is never blocked.
+
+`scripts/analyze_confidence.py` parses both the JSONL stream and the legacy text trader logs to produce side-by-side Gemini-vs-Ollama confidence distributions:
+
+```text
+gemini: n=34  mean=42.9  >=65: 6 (18%)  >=70: 6 (18%)  <40: 15 (44%)
+  [0-39]:15 [40-49]:4 [50-59]:9 [60-64]:0 [65-69]:0 [70-79]:5 [80-100]:1
+ollama: n=53  mean=55.8  >=65: 0 (0%)   >=70: 0 (0%)   <40: 1 (2%)
+  [0-39]:1  [40-49]:9 [50-59]:5 [60-64]:38 [65-69]:0 [70-79]:0 [80-100]:0
+```
+
+The Ollama mid-band-clustering pattern (35+ samples in [60-64], zero approvals) was the original motivation for the dual-provider gate.
 
 #### Exhaustion markers (permanent vs transient)
 

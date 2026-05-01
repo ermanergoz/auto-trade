@@ -474,6 +474,7 @@ class TestNewsAnalystIntegration:
         """When analyzing multiple stocks, each prompt must contain only
         that stock's news, not another stock's headlines."""
         from core.analyst import analyze_batch
+        from core.models import Action, Signal
 
         mock_yf.side_effect = lambda t, max_results=5: {
             "AAPL": ["Apple beats earnings"],
@@ -482,7 +483,6 @@ class TestNewsAnalystIntegration:
 
         mock_llm.return_value = {
             "action": "buy", "confidence": 85,
-            "entry_price": 150.0, "stop_loss": 145.0, "take_profit": 160.0,
             "trade_type": "day", "reasoning": "Strong",
         }
 
@@ -498,11 +498,19 @@ class TestNewsAnalystIntegration:
         aapl_news = get_news("AAPL")
         msft_news = get_news("MSFT")
 
+        def _screener_sig(ticker, indicators):
+            return Signal(
+                ticker=ticker, action=Action.BUY, confidence=70.0,
+                entry_price=150.0, stop_loss=145.0, take_profit=160.0,
+                reasoning="screener", source="screener", exchange="SMART",
+                indicator_values=indicators,
+            )
+
         candidates = [
-            {"ticker": "AAPL", "exchange": "SMART", "df": df,
-             "indicator_values": {"RSI": 28}, "news": aapl_news},
-            {"ticker": "MSFT", "exchange": "SMART", "df": df,
-             "indicator_values": {"RSI": 32}, "news": msft_news},
+            {"screener_signal": _screener_sig("AAPL", {"RSI": 28}),
+             "df": df, "news": aapl_news},
+            {"screener_signal": _screener_sig("MSFT", {"RSI": 32}),
+             "df": df, "news": msft_news},
         ]
 
         analyze_batch(candidates, macro_news=["Fed holds rates"])

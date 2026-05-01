@@ -22,7 +22,7 @@ import urllib.error
 import pandas as pd
 import pytest
 
-from config.settings import AI_PROVIDER, GEMINI_API_KEY, OLLAMA_HOST
+from config.settings import AI_PROVIDER, GEMINI_API_KEYS, OLLAMA_HOST
 
 
 LIVE_ENABLED = os.getenv("RUN_LIVE_LLM_TESTS") == "1"
@@ -38,8 +38,8 @@ def _ollama_reachable() -> bool:
 
 
 skip_no_gemini = pytest.mark.skipif(
-    not LIVE_ENABLED or not GEMINI_API_KEY or AI_PROVIDER != "gemini",
-    reason="set RUN_LIVE_LLM_TESTS=1 and configure GEMINI_API_KEY / AI_PROVIDER=gemini",
+    not LIVE_ENABLED or not GEMINI_API_KEYS or AI_PROVIDER != "gemini",
+    reason="set RUN_LIVE_LLM_TESTS=1 and configure GEMINI_API_KEYS / AI_PROVIDER=gemini",
 )
 
 skip_no_ollama = pytest.mark.skipif(

@@ -24,6 +24,29 @@ def _make_df(n=30):
     }, index=dates)
 
 
+def _make_screener_signal(
+    ticker="AAPL",
+    exchange="SMART",
+    entry=150.0,
+    sl=145.0,
+    tp=160.0,
+    indicators=None,
+) -> Signal:
+    """Build a screener-source Signal fixture with deterministic ATR-style levels."""
+    return Signal(
+        ticker=ticker,
+        action=Action.BUY,
+        confidence=70.0,
+        entry_price=entry,
+        stop_loss=sl,
+        take_profit=tp,
+        reasoning="screener: triggered indicators",
+        source="screener",
+        exchange=exchange,
+        indicator_values=indicators or {},
+    )
+
+
 class TestPromptBuilding:
     def test_builds_prompt(self):
         df = _make_df()
@@ -68,7 +91,8 @@ class TestPromptBuilding:
         df = _make_df()
         prompt = _build_prompt("AAPL", "SMART", df, {}, [])
         assert "MACRO/POLITICAL RISK" in prompt
-        assert "5 of 7" in prompt
+        # Checklist now has 6 items (R:R item removed — LLM no longer picks levels)
+        assert "4 of 6" in prompt
 
 
 class TestValidation:
@@ -76,9 +100,6 @@ class TestValidation:
         data = {
             "action": "buy",
             "confidence": 80,
-            "entry_price": 150.0,
-            "stop_loss": 145.0,
-            "take_profit": 160.0,
             "trade_type": "day",
             "reasoning": "Strong bullish pattern",
         }
@@ -92,9 +113,6 @@ class TestValidation:
         data = {
             "action": "yolo",
             "confidence": 80,
-            "entry_price": 150.0,
-            "stop_loss": 145.0,
-            "take_profit": 160.0,
             "trade_type": "day",
             "reasoning": "test",
         }
@@ -104,9 +122,6 @@ class TestValidation:
         data = {
             "action": "buy",
             "confidence": 80,
-            "entry_price": 150.0,
-            "stop_loss": 145.0,
-            "take_profit": 160.0,
             "trade_type": "overnight",
             "reasoning": "test",
         }
@@ -116,85 +131,21 @@ class TestValidation:
         data = {
             "action": "buy",
             "confidence": 150,
-            "entry_price": 150.0,
-            "stop_loss": 145.0,
-            "take_profit": 160.0,
             "trade_type": "day",
             "reasoning": "test",
         }
         assert _validate_response(data) is False
 
-    def test_negative_price(self):
-        data = {
-            "action": "buy",
-            "confidence": 80,
-            "entry_price": -10.0,
-            "stop_loss": 145.0,
-            "take_profit": 160.0,
-            "trade_type": "day",
-            "reasoning": "test",
-        }
-        assert _validate_response(data) is False
-
-    def test_rr_exact_minimum_passes(self):
-        """R:R exactly equal to MIN_RISK_REWARD_RATIO (default 1.5) must PASS.
-
-        Seen in production on 2026-04-21: "BUY R:R 1.50 below minimum 1.50"
-        — the log-format rounds to 2dp but the underlying float was slightly
-        under 1.5 due to floating-point math. The validator should tolerate
-        boundary R:R values within a small epsilon.
+    def test_buy_does_not_require_prices(self):
+        """LLM no longer picks entry/stop/TP — validator must accept buy/hold
+        responses that omit those fields entirely. Levels come from the
+        screener's deterministic ATR computation, carried through analyze_candidate.
         """
         data = {
             "action": "buy",
             "confidence": 80,
-            "entry_price": 100.0,
-            "stop_loss": 90.0,       # risk = 10
-            "take_profit": 115.0,    # reward = 15 -> rr = 1.5 exactly
             "trade_type": "day",
-            "reasoning": "test",
-        }
-        assert _validate_response(data) is True
-
-    def test_rr_floating_point_just_under_minimum_passes(self):
-        """A computed R:R of ~1.49999... (logs as 1.50) must PASS.
-
-        Common case when reward/risk isn't a clean decimal.
-        """
-        data = {
-            "action": "buy",
-            "confidence": 80,
-            "entry_price": 100.0,
-            "stop_loss": 93.33,      # risk = 6.67
-            "take_profit": 110.0,    # reward = 10.0 -> rr = 1.49925...
-            "trade_type": "day",
-            "reasoning": "test",
-        }
-        # Currently fails with "BUY R:R 1.50 below minimum 1.50" in prod.
-        assert _validate_response(data) is True
-
-    def test_rr_meaningfully_below_minimum_rejects(self):
-        """R:R of 1.4 (clearly below 1.5) still rejects — epsilon must be tight."""
-        data = {
-            "action": "buy",
-            "confidence": 80,
-            "entry_price": 100.0,
-            "stop_loss": 90.0,       # risk = 10
-            "take_profit": 114.0,    # reward = 14 -> rr = 1.40
-            "trade_type": "day",
-            "reasoning": "test",
-        }
-        assert _validate_response(data) is False
-
-    def test_rr_sell_at_exact_minimum_passes(self):
-        """Same boundary tolerance applies to SELL."""
-        data = {
-            "action": "sell",
-            "confidence": 80,
-            "entry_price": 100.0,
-            "stop_loss": 110.0,      # risk = 10
-            "take_profit": 85.0,     # reward = 15 -> rr = 1.5 exactly
-            "trade_type": "day",
-            "reasoning": "test",
+            "reasoning": "Strong bullish setup with macro tailwind",
         }
         assert _validate_response(data) is True
 
@@ -207,13 +158,9 @@ class TestShortSellingGate:
     """
 
     def _valid_sell(self):
-        """A well-formed sell response (direction-correct for a short)."""
         return {
             "action": "sell",
             "confidence": 80,
-            "entry_price": 100.0,
-            "stop_loss": 105.0,   # above entry for short
-            "take_profit": 90.0,  # below entry for short
             "trade_type": "day",
             "reasoning": "Bearish setup",
         }
@@ -222,9 +169,6 @@ class TestShortSellingGate:
         return {
             "action": "buy",
             "confidence": 80,
-            "entry_price": 100.0,
-            "stop_loss": 95.0,
-            "take_profit": 110.0,
             "trade_type": "day",
             "reasoning": "Bullish setup",
         }
@@ -233,9 +177,6 @@ class TestShortSellingGate:
         return {
             "action": "hold",
             "confidence": 70,
-            "entry_price": 100.0,
-            "stop_loss": 95.0,
-            "take_profit": 110.0,
             "trade_type": "day",
             "reasoning": "Wait",
         }
@@ -299,14 +240,14 @@ class TestAnalyzeCandidate:
         mock_llm.return_value = {
             "action": "buy",
             "confidence": 85,
-            "entry_price": 150.0,
-            "stop_loss": 145.0,
-            "take_profit": 160.0,
             "trade_type": "day",
             "reasoning": "Strong bullish divergence",
         }
         df = _make_df()
-        signal = analyze_candidate("AAPL", "SMART", df, {"RSI": 28}, ["Good earnings"])
+        screener_signal = _make_screener_signal(ticker="AAPL", indicators={"RSI": 28})
+        signal = analyze_candidate(
+            screener_signal=screener_signal, df=df, news=["Good earnings"],
+        )
         assert signal is not None
         assert signal.ticker == "AAPL"
         assert signal.action == Action.BUY
@@ -318,14 +259,12 @@ class TestAnalyzeCandidate:
         mock_llm.return_value = {
             "action": "buy",
             "confidence": 50,
-            "entry_price": 150.0,
-            "stop_loss": 145.0,
-            "take_profit": 160.0,
             "trade_type": "day",
             "reasoning": "Weak signal",
         }
         df = _make_df()
-        signal = analyze_candidate("AAPL", "SMART", df, {}, [])
+        screener_signal = _make_screener_signal()
+        signal = analyze_candidate(screener_signal=screener_signal, df=df, news=[])
         assert signal is None
 
     @patch("core.analyst._call_llm")
@@ -333,21 +272,20 @@ class TestAnalyzeCandidate:
         mock_llm.return_value = {
             "action": "hold",
             "confidence": 90,
-            "entry_price": 150.0,
-            "stop_loss": 145.0,
-            "take_profit": 160.0,
             "trade_type": "day",
             "reasoning": "Unclear direction",
         }
         df = _make_df()
-        signal = analyze_candidate("AAPL", "SMART", df, {}, [])
+        screener_signal = _make_screener_signal()
+        signal = analyze_candidate(screener_signal=screener_signal, df=df, news=[])
         assert signal is None
 
     @patch("core.analyst._call_llm")
     def test_handles_llm_failure(self, mock_llm):
         mock_llm.return_value = None
         df = _make_df()
-        signal = analyze_candidate("AAPL", "SMART", df, {}, [])
+        screener_signal = _make_screener_signal()
+        signal = analyze_candidate(screener_signal=screener_signal, df=df, news=[])
         assert signal is None
 
     @patch("core.analyst._call_llm")
@@ -355,73 +293,62 @@ class TestAnalyzeCandidate:
         mock_llm.return_value = {
             "action": "buy",
             "confidence": 85,
-            "entry_price": 150.0,
-            "stop_loss": 145.0,
-            "take_profit": 160.0,
             "trade_type": "day",
             "reasoning": "Strong with favorable macro",
         }
         df = _make_df()
+        screener_signal = _make_screener_signal(ticker="AAPL", indicators={"RSI": 28})
         signal = analyze_candidate(
-            "AAPL", "SMART", df, {"RSI": 28}, ["Good earnings"],
+            screener_signal=screener_signal,
+            df=df,
+            news=["Good earnings"],
             macro_news=["Fed cuts rates"],
         )
         assert signal is not None
         prompt_arg = mock_llm.call_args[0][0]
         assert "Fed cuts rates" in prompt_arg
 
-
-class TestPriceRelationshipValidation:
-    """Verify LLM response validation catches invalid price relationships."""
-
-    def test_buy_stop_above_entry_rejected(self):
-        data = {
-            "action": "buy", "confidence": 80,
-            "entry_price": 150.0, "stop_loss": 160.0, "take_profit": 170.0,
-            "trade_type": "day", "reasoning": "test",
+    @patch("core.analyst._call_llm")
+    def test_uses_screener_levels_not_llm_picks(self, mock_llm):
+        """analyze_candidate must copy entry_price/stop_loss/take_profit from
+        the screener Signal, ignoring whatever the LLM might suggest. Hallucinated
+        chart-readings cannot propagate into the bracket order this way.
+        """
+        # LLM returns only the new contract — no price fields at all
+        mock_llm.return_value = {
+            "action": "buy",
+            "confidence": 85,
+            "trade_type": "swing",
+            "reasoning": "Macro tailwind plus positive earnings catalyst",
         }
-        assert _validate_response(data) is False
-
-    def test_buy_tp_below_entry_rejected(self):
-        data = {
-            "action": "buy", "confidence": 80,
-            "entry_price": 150.0, "stop_loss": 145.0, "take_profit": 140.0,
-            "trade_type": "day", "reasoning": "test",
-        }
-        assert _validate_response(data) is False
-
-    def test_sell_stop_below_entry_rejected(self):
-        data = {
-            "action": "sell", "confidence": 80,
-            "entry_price": 150.0, "stop_loss": 140.0, "take_profit": 130.0,
-            "trade_type": "day", "reasoning": "test",
-        }
-        assert _validate_response(data) is False
-
-    def test_sell_tp_above_entry_rejected(self):
-        data = {
-            "action": "sell", "confidence": 80,
-            "entry_price": 150.0, "stop_loss": 160.0, "take_profit": 155.0,
-            "trade_type": "day", "reasoning": "test",
-        }
-        assert _validate_response(data) is False
-
-    def test_valid_buy_passes(self):
-        data = {
-            "action": "buy", "confidence": 80,
-            "entry_price": 150.0, "stop_loss": 145.0, "take_profit": 160.0,
-            "trade_type": "day", "reasoning": "test",
-        }
-        assert _validate_response(data) is True
-
-    @patch("core.analyst.ALLOW_SHORT_SELLING", True)
-    def test_valid_sell_passes(self):
-        data = {
-            "action": "sell", "confidence": 80,
-            "entry_price": 150.0, "stop_loss": 155.0, "take_profit": 140.0,
-            "trade_type": "day", "reasoning": "test",
-        }
-        assert _validate_response(data) is True
+        screener_signal = _make_screener_signal(
+            ticker="AAPL",
+            entry=200.0,
+            sl=180.0,
+            tp=240.0,
+            indicators={"RSI": 28, "MA5": 198.0, "MA10": 195.0, "MA20": 190.0},
+        )
+        df = _make_df()
+        signal = analyze_candidate(
+            screener_signal=screener_signal,
+            df=df,
+            news=["Apple beats estimates"],
+        )
+        assert signal is not None
+        # Levels come from the screener, not the LLM
+        assert signal.entry_price == 200.0
+        assert signal.stop_loss == 180.0
+        assert signal.take_profit == 240.0
+        # LLM still drives action/confidence/trade_type/reasoning
+        assert signal.action == Action.BUY
+        assert signal.confidence == 85
+        assert "Macro tailwind" in signal.reasoning
+        # Source remains "ai" because the buy decision is LLM-driven
+        assert signal.source == "ai"
+        # Ticker/exchange/indicators threaded through from screener_signal
+        assert signal.ticker == "AAPL"
+        assert signal.exchange == "SMART"
+        assert signal.indicator_values["RSI"] == 28
 
 
 class TestOllamaTimeout:
@@ -453,13 +380,14 @@ class TestOllamaTimeout:
 # ---------------------------------------------------------------------------
 
 def _valid_llm_response_text() -> str:
-    """Canonical valid JSON response used by both provider mocks."""
+    """Canonical valid JSON response used by both provider mocks.
+
+    Trade levels are NOT in the LLM contract anymore — they come from the
+    screener's deterministic ATR computation in core/screener.py.
+    """
     return json.dumps({
         "action": "buy",
         "confidence": 85,
-        "entry_price": 150.0,
-        "stop_loss": 145.0,
-        "take_profit": 160.0,
         "trade_type": "day",
         "reasoning": "Strong bullish pattern",
     })
@@ -501,9 +429,9 @@ def reset_analyst_state():
     _gemini_key_exhausted, and _daily_token_usage are all module globals.
 
     Critically: also clears `_gemini_keys` and `_gemini_key_exhausted` so the
-    user's real ``.env`` cannot leak a real GEMINI_API_KEY into single-key
-    tests that only patch ``GEMINI_API_KEY``. Each test opts into multi-key
-    mode explicitly by ``patch("core.analyst._gemini_keys", [...])``.
+    user's real ``.env`` cannot leak a real key into tests. Each test opts
+    in to a populated rotation list explicitly via
+    ``patch("core.analyst._gemini_keys", [...])``.
     """
     from core import analyst as _a
     _a._gemini_exhausted.clear()
@@ -528,7 +456,7 @@ class TestProviderConfigImports:
     def test_settings_exposes_provider_switches(self):
         from config import settings
         assert hasattr(settings, "AI_PROVIDER")
-        assert hasattr(settings, "GEMINI_API_KEY")
+        assert hasattr(settings, "GEMINI_API_KEYS")
         assert hasattr(settings, "GEMINI_MODEL")
         assert hasattr(settings, "GEMINI_HOST")
         # Default provider is gemini (user wants Gemini-first); Ollama is the fallback.
@@ -597,7 +525,7 @@ class TestGeminiCallContract:
     def test_gemini_success_parses_nested_json_and_records_tokens(self, reset_analyst_state):
         from core.analyst import _call_gemini, get_daily_token_usage
         with patch("core.analyst.urllib.request.urlopen") as mu, \
-             patch("core.analyst.GEMINI_API_KEY", "dummy"):
+             patch("core.analyst._gemini_keys", ["dummy"]):
             mu.return_value = _mock_http_response(_gemini_success_body(
                 _valid_llm_response_text(), prompt_tokens=120, output_tokens=80,
             ))
@@ -612,7 +540,7 @@ class TestGeminiCallContract:
     def test_gemini_missing_api_key_raises_transport_error_without_http(self, reset_analyst_state):
         from core.analyst import _call_gemini, _GeminiTransportError
         with patch("core.analyst.urllib.request.urlopen") as mu, \
-             patch("core.analyst.GEMINI_API_KEY", ""):
+             patch("core.analyst._gemini_keys", []):
             with pytest.raises(_GeminiTransportError):
                 _call_gemini("prompt")
         assert mu.call_count == 0
@@ -621,7 +549,7 @@ class TestGeminiCallContract:
         from core import analyst
         from core.analyst import _call_gemini, _GeminiTransportError
         with patch("core.analyst.urllib.request.urlopen") as mu, \
-             patch("core.analyst.GEMINI_API_KEY", "dummy"):
+             patch("core.analyst._gemini_keys", ["dummy"]):
             mu.side_effect = self._make_http_error(401, b'{"error":"invalid key"}', "Unauthorized")
             with pytest.raises(_GeminiTransportError):
                 _call_gemini("prompt")
@@ -631,7 +559,7 @@ class TestGeminiCallContract:
         from core import analyst
         from core.analyst import _call_gemini, _GeminiTransportError
         with patch("core.analyst.urllib.request.urlopen") as mu, \
-             patch("core.analyst.GEMINI_API_KEY", "dummy"):
+             patch("core.analyst._gemini_keys", ["dummy"]):
             mu.side_effect = self._make_http_error(403, b'{"error":"forbidden"}', "Forbidden")
             with pytest.raises(_GeminiTransportError):
                 _call_gemini("prompt")
@@ -642,7 +570,7 @@ class TestGeminiCallContract:
         from core.analyst import _call_gemini, _GeminiTransportError
         body = b'{"error":{"message":"Your prepayment credits are depleted."}}'
         with patch("core.analyst.urllib.request.urlopen") as mu, \
-             patch("core.analyst.GEMINI_API_KEY", "dummy"):
+             patch("core.analyst._gemini_keys", ["dummy"]):
             mu.side_effect = self._make_http_error(429, body, "Too Many Requests")
             with pytest.raises(_GeminiTransportError):
                 _call_gemini("prompt")
@@ -653,7 +581,7 @@ class TestGeminiCallContract:
         from core.analyst import _call_gemini, _GeminiTransportError
         body = b'{"error":{"message":"Quota exceeded per minute; retry in 30s"}}'
         with patch("core.analyst.urllib.request.urlopen") as mu, \
-             patch("core.analyst.GEMINI_API_KEY", "dummy"):
+             patch("core.analyst._gemini_keys", ["dummy"]):
             mu.side_effect = self._make_http_error(429, body, "Too Many Requests")
             with pytest.raises(_GeminiTransportError):
                 _call_gemini("prompt")
@@ -663,7 +591,7 @@ class TestGeminiCallContract:
         from core import analyst
         from core.analyst import _call_gemini, _GeminiTransportError
         with patch("core.analyst.urllib.request.urlopen") as mu, \
-             patch("core.analyst.GEMINI_API_KEY", "dummy"):
+             patch("core.analyst._gemini_keys", ["dummy"]):
             mu.side_effect = self._make_http_error(503, b"service unavailable", "Service Unavailable")
             with pytest.raises(_GeminiTransportError):
                 _call_gemini("prompt")
@@ -674,8 +602,29 @@ class TestGeminiCallContract:
         from core import analyst
         from core.analyst import _call_gemini, _GeminiTransportError
         with patch("core.analyst.urllib.request.urlopen") as mu, \
-             patch("core.analyst.GEMINI_API_KEY", "dummy"):
+             patch("core.analyst._gemini_keys", ["dummy"]):
             mu.side_effect = urllib.error.URLError("connection refused")
+            with pytest.raises(_GeminiTransportError):
+                _call_gemini("prompt")
+        assert analyst._gemini_exhausted.is_set() is False
+
+    def test_gemini_socket_timeout_raises_transport_error_not_bare_TimeoutError(self, reset_analyst_state):
+        """A read timeout from inside ssl/socket must not bubble out raw.
+
+        Production crash 2026-05-01: urllib.request.urlopen() succeeded but
+        the subsequent read() raised `TimeoutError: The read operation
+        timed out` from ssl.recv_into. _post_gemini_payload caught
+        HTTPError + URLError but not TimeoutError, so the bare exception
+        propagated up through _call_gemini_payload → universe sector
+        classifier → build_universe → run_scan_cycle, killing the bot
+        mid-scan. Must be classified as transport failure so the router
+        falls back to Ollama (and doesn't latch _gemini_exhausted).
+        """
+        from core import analyst
+        from core.analyst import _call_gemini, _GeminiTransportError
+        with patch("core.analyst.urllib.request.urlopen") as mu, \
+             patch("core.analyst._gemini_keys", ["dummy"]):
+            mu.side_effect = TimeoutError("The read operation timed out")
             with pytest.raises(_GeminiTransportError):
                 _call_gemini("prompt")
         assert analyst._gemini_exhausted.is_set() is False
@@ -685,7 +634,7 @@ class TestGeminiCallContract:
         from core import analyst
         from core.analyst import _call_gemini
         with patch("core.analyst.urllib.request.urlopen") as mu, \
-             patch("core.analyst.GEMINI_API_KEY", "dummy"):
+             patch("core.analyst._gemini_keys", ["dummy"]):
             mu.return_value = _mock_http_response(b"<html>Gateway Timeout</html>")
             result = _call_gemini("prompt")
         assert result is None
@@ -696,7 +645,7 @@ class TestGeminiCallContract:
         from core.analyst import _call_gemini, _GeminiTransportError
         analyst._gemini_exhausted.set()
         with patch("core.analyst.urllib.request.urlopen") as mu, \
-             patch("core.analyst.GEMINI_API_KEY", "dummy"):
+             patch("core.analyst._gemini_keys", ["dummy"]):
             with pytest.raises(_GeminiTransportError):
                 _call_gemini("prompt")
         assert mu.call_count == 0
@@ -714,10 +663,16 @@ class TestGeminiCallContract:
         return json.loads(request.data.decode())
 
     def test_gemini_payload_includes_response_schema(self, reset_analyst_state):
-        """generationConfig must carry a responseSchema with required fields."""
+        """generationConfig must carry a responseSchema with required fields.
+
+        The LLM contract is buy/hold + confidence + trade_type + reasoning.
+        Trade levels are screener-deterministic (core/screener.py) and not
+        requested from the model, so entry_price/stop_loss/take_profit are
+        intentionally absent from the schema.
+        """
         from core.analyst import _call_gemini
         with patch("core.analyst.urllib.request.urlopen") as mu, \
-             patch("core.analyst.GEMINI_API_KEY", "dummy"):
+             patch("core.analyst._gemini_keys", ["dummy"]):
             mu.return_value = _mock_http_response(_gemini_success_body(
                 _valid_llm_response_text(),
             ))
@@ -729,16 +684,21 @@ class TestGeminiCallContract:
         schema = gc["responseSchema"]
         assert schema["type"].lower() == "object"
         required = schema.get("required", [])
-        for field in (
-            "action", "confidence", "entry_price",
-            "stop_loss", "take_profit", "trade_type", "reasoning",
-        ):
+        for field in ("action", "confidence", "trade_type", "reasoning"):
             assert field in required, f"{field} not in schema.required: {required}"
+        # Price fields must NOT be in the schema — the LLM no longer picks levels
+        for field in ("entry_price", "stop_loss", "take_profit"):
+            assert field not in required, (
+                f"{field} should be absent from schema after the analyst-veto refactor"
+            )
+            assert field not in schema.get("properties", {}), (
+                f"{field} should be absent from schema.properties"
+            )
 
     def test_gemini_schema_trade_type_enum_is_day_or_swing(self, reset_analyst_state):
         from core.analyst import _call_gemini
         with patch("core.analyst.urllib.request.urlopen") as mu, \
-             patch("core.analyst.GEMINI_API_KEY", "dummy"):
+             patch("core.analyst._gemini_keys", ["dummy"]):
             mu.return_value = _mock_http_response(_gemini_success_body(
                 _valid_llm_response_text(),
             ))
@@ -754,7 +714,7 @@ class TestGeminiCallContract:
         """When shorts are disabled, the schema must not offer 'sell' as an action."""
         from core.analyst import _call_gemini
         with patch("core.analyst.urllib.request.urlopen") as mu, \
-             patch("core.analyst.GEMINI_API_KEY", "dummy"), \
+             patch("core.analyst._gemini_keys", ["dummy"]), \
              patch("core.analyst.ALLOW_SHORT_SELLING", False):
             mu.return_value = _mock_http_response(_gemini_success_body(
                 _valid_llm_response_text(),
@@ -771,7 +731,7 @@ class TestGeminiCallContract:
     ):
         from core.analyst import _call_gemini
         with patch("core.analyst.urllib.request.urlopen") as mu, \
-             patch("core.analyst.GEMINI_API_KEY", "dummy"), \
+             patch("core.analyst._gemini_keys", ["dummy"]), \
              patch("core.analyst.ALLOW_SHORT_SELLING", True):
             mu.return_value = _mock_http_response(_gemini_success_body(
                 _valid_llm_response_text(),
@@ -857,33 +817,29 @@ class TestGeminiExhaustionMarkers:
 class TestGeminiAPIKeysParser:
     """config/settings.py exposes a pure parser for the GEMINI_API_KEYS env var.
 
-    The parser keeps the env-var glue out of analyst tests and makes the
-    fallback rules (multi → single → empty) testable without env reloads.
+    Comma-separated, whitespace-trimmed, empty segments dropped. A single
+    key is just a one-element rotation list — same code path as multi-key.
     """
 
     def test_parses_comma_separated(self):
         from config.settings import _parse_gemini_keys
-        assert _parse_gemini_keys("k1,k2,k3", "") == ["k1", "k2", "k3"]
+        assert _parse_gemini_keys("k1,k2,k3") == ["k1", "k2", "k3"]
 
     def test_strips_whitespace(self):
         from config.settings import _parse_gemini_keys
-        assert _parse_gemini_keys("k1, k2 ,  k3 ", "") == ["k1", "k2", "k3"]
+        assert _parse_gemini_keys("k1, k2 ,  k3 ") == ["k1", "k2", "k3"]
 
     def test_filters_empty_segments(self):
         from config.settings import _parse_gemini_keys
-        assert _parse_gemini_keys("k1,,k2,", "") == ["k1", "k2"]
+        assert _parse_gemini_keys("k1,,k2,") == ["k1", "k2"]
 
-    def test_falls_back_to_single_key_when_keys_empty(self):
+    def test_single_key_returns_one_element_list(self):
         from config.settings import _parse_gemini_keys
-        assert _parse_gemini_keys("", "legacy_only") == ["legacy_only"]
-
-    def test_keys_takes_precedence_over_single_key(self):
-        from config.settings import _parse_gemini_keys
-        assert _parse_gemini_keys("k1,k2", "ignored") == ["k1", "k2"]
+        assert _parse_gemini_keys("just_one_key") == ["just_one_key"]
 
     def test_empty_returns_empty_list(self):
         from config.settings import _parse_gemini_keys
-        assert _parse_gemini_keys("", "") == []
+        assert _parse_gemini_keys("") == []
 
 
 class TestGeminiKeyRotation:
@@ -897,8 +853,8 @@ class TestGeminiKeyRotation:
         flag — that key may recover on its next attempt.
       - Cross-key RPM stampede (every key 429s in pass 0) sleeps once and
         retries. After the second pass also fails, raise without latching.
-      - Single-key (legacy GEMINI_API_KEY only, no GEMINI_API_KEYS) keeps
-        the pre-rotation behavior — no extra sleep, no retry pass.
+      - Single-key (one entry in GEMINI_API_KEYS) keeps the pre-rotation
+        behavior — no extra sleep, no retry pass.
     """
 
     @staticmethod
@@ -1058,21 +1014,6 @@ class TestGeminiKeyRotation:
         ms.assert_not_called()
         assert analyst._gemini_exhausted.is_set() is False
 
-    def test_legacy_GEMINI_API_KEY_only_still_works(self, reset_analyst_state):
-        """Backward compat: when GEMINI_API_KEYS is empty/unset (the existing
-        single-key deployment), the GEMINI_API_KEY value is used as a one-key
-        rotation list. Existing tests already patch GEMINI_API_KEY directly.
-        """
-        from core.analyst import _call_gemini
-        with patch("core.analyst._gemini_keys", []), \
-             patch("core.analyst.GEMINI_API_KEY", "LEGACY_KEY"), \
-             patch("core.analyst.urllib.request.urlopen") as mu:
-            mu.return_value = self._success_response()
-            result = _call_gemini("prompt")
-        assert result is not None
-        # Confirm the legacy single-key was actually used in the request
-        assert "LEGACY_KEY" in mu.call_args[0][0].full_url
-
 
 class TestLLMProviderRouting:
     """_call_llm routes: Gemini first (if enabled), Ollama as fallback."""
@@ -1081,11 +1022,11 @@ class TestLLMProviderRouting:
         from core.analyst import analyze_candidate
         df = _make_df()
         with patch("core.analyst.AI_PROVIDER", "gemini"), \
-             patch("core.analyst.GEMINI_API_KEY", "dummy"), \
+             patch("core.analyst._gemini_keys", ["dummy"]), \
              patch("core.analyst._call_gemini") as mock_gemini, \
              patch("core.analyst._call_ollama") as mock_ollama:
             mock_gemini.return_value = json.loads(_valid_llm_response_text())
-            signal = analyze_candidate("AAPL", "SMART", df, {"RSI": 28}, ["news"])
+            signal = analyze_candidate(_make_screener_signal(ticker="AAPL", indicators={"RSI": 28}), df, ["news"])
         assert signal is not None
         assert signal.ticker == "AAPL"
         assert mock_ollama.call_count == 0
@@ -1095,11 +1036,11 @@ class TestLLMProviderRouting:
         from core.analyst import analyze_candidate
         df = _make_df()
         with patch("core.analyst.AI_PROVIDER", "ollama"), \
-             patch("core.analyst.GEMINI_API_KEY", "real-looking-key"), \
+             patch("core.analyst._gemini_keys", ["real-looking-key"]), \
              patch("core.analyst._call_gemini") as mock_gemini, \
              patch("core.analyst._call_ollama") as mock_ollama:
             mock_ollama.return_value = json.loads(_valid_llm_response_text())
-            signal = analyze_candidate("AAPL", "SMART", df, {"RSI": 28}, ["news"])
+            signal = analyze_candidate(_make_screener_signal(ticker="AAPL", indicators={"RSI": 28}), df, ["news"])
         assert signal is not None
         assert mock_gemini.call_count == 0
         assert mock_ollama.call_count >= 1
@@ -1108,10 +1049,10 @@ class TestLLMProviderRouting:
         from core.analyst import analyze_candidate
         df = _make_df()
         with patch("core.analyst.AI_PROVIDER", "gemini"), \
-             patch("core.analyst.GEMINI_API_KEY", ""), \
+             patch("core.analyst._gemini_keys", []), \
              patch("core.analyst.urllib.request.urlopen") as mu:
             mu.return_value = _mock_http_response(_ollama_success_body(_valid_llm_response_text()))
-            signal = analyze_candidate("AAPL", "SMART", df, {"RSI": 28}, ["news"])
+            signal = analyze_candidate(_make_screener_signal(ticker="AAPL", indicators={"RSI": 28}), df, ["news"])
         assert signal is not None
         urls = [str(call.args[0].full_url) for call in mu.call_args_list]
         assert not any("generativelanguage" in u for u in urls)
@@ -1128,13 +1069,13 @@ class TestLLMProviderRouting:
             fp=io.BytesIO(b"service unavailable"),
         )
         with patch("core.analyst.AI_PROVIDER", "gemini"), \
-             patch("core.analyst.GEMINI_API_KEY", "dummy"), \
+             patch("core.analyst._gemini_keys", ["dummy"]), \
              patch("core.analyst.urllib.request.urlopen") as mu:
             mu.side_effect = [
                 http503,
                 _mock_http_response(_ollama_success_body(_valid_llm_response_text())),
             ]
-            signal = analyze_candidate("AAPL", "SMART", df, {"RSI": 28}, ["news"])
+            signal = analyze_candidate(_make_screener_signal(ticker="AAPL", indicators={"RSI": 28}), df, ["news"])
         assert signal is not None
         assert analyst._gemini_exhausted.is_set() is False
         # First call Gemini, second call Ollama.
@@ -1154,22 +1095,22 @@ class TestLLMProviderRouting:
             fp=io.BytesIO(b'{"error":{"message":"Your prepayment credits are depleted."}}'),
         )
         with patch("core.analyst.AI_PROVIDER", "gemini"), \
-             patch("core.analyst.GEMINI_API_KEY", "dummy"), \
+             patch("core.analyst._gemini_keys", ["dummy"]), \
              patch("core.analyst.urllib.request.urlopen") as mu:
             mu.side_effect = [
                 http429_permanent,
                 _mock_http_response(_ollama_success_body(_valid_llm_response_text())),
             ]
-            signal = analyze_candidate("AAPL", "SMART", df, {"RSI": 28}, ["news"])
+            signal = analyze_candidate(_make_screener_signal(ticker="AAPL", indicators={"RSI": 28}), df, ["news"])
         assert signal is not None
         assert analyst._gemini_exhausted.is_set() is True
 
         # Second call: Gemini must NOT be hit — flag is latched.
         with patch("core.analyst.AI_PROVIDER", "gemini"), \
-             patch("core.analyst.GEMINI_API_KEY", "dummy"), \
+             patch("core.analyst._gemini_keys", ["dummy"]), \
              patch("core.analyst.urllib.request.urlopen") as mu2:
             mu2.return_value = _mock_http_response(_ollama_success_body(_valid_llm_response_text()))
-            signal2 = analyze_candidate("MSFT", "SMART", df, {"RSI": 28}, ["news"])
+            signal2 = analyze_candidate(_make_screener_signal(ticker="MSFT", indicators={"RSI": 28}), df, ["news"])
         assert signal2 is not None
         urls2 = [str(call.args[0].full_url) for call in mu2.call_args_list]
         assert not any("generativelanguage" in u for u in urls2)
@@ -1189,22 +1130,22 @@ class TestLLMProviderRouting:
             fp=io.BytesIO(b"busy"),
         )
         with patch("core.analyst.AI_PROVIDER", "gemini"), \
-             patch("core.analyst.GEMINI_API_KEY", "dummy"), \
+             patch("core.analyst._gemini_keys", ["dummy"]), \
              patch("core.analyst.urllib.request.urlopen") as mu:
             mu.side_effect = [
                 http503,
                 _mock_http_response(_ollama_success_body(_valid_llm_response_text())),
             ]
-            s1 = analyze_candidate("AAPL", "SMART", df, {"RSI": 28}, ["news"])
+            s1 = analyze_candidate(_make_screener_signal(ticker="AAPL", indicators={"RSI": 28}), df, ["news"])
         assert s1 is not None
         assert analyst._gemini_exhausted.is_set() is False
 
         # Call 2: Gemini succeeds on first try, Ollama must not be touched.
         with patch("core.analyst.AI_PROVIDER", "gemini"), \
-             patch("core.analyst.GEMINI_API_KEY", "dummy"), \
+             patch("core.analyst._gemini_keys", ["dummy"]), \
              patch("core.analyst.urllib.request.urlopen") as mu2:
             mu2.return_value = _mock_http_response(_gemini_success_body(_valid_llm_response_text()))
-            s2 = analyze_candidate("MSFT", "SMART", df, {"RSI": 28}, ["news"])
+            s2 = analyze_candidate(_make_screener_signal(ticker="MSFT", indicators={"RSI": 28}), df, ["news"])
         assert s2 is not None
         urls2 = [str(call.args[0].full_url) for call in mu2.call_args_list]
         assert any("generativelanguage" in u for u in urls2)
@@ -1215,12 +1156,12 @@ class TestLLMProviderRouting:
         from core.analyst import analyze_candidate
         df = _make_df()
         with patch("core.analyst.AI_PROVIDER", "gemini"), \
-             patch("core.analyst.GEMINI_API_KEY", "dummy"), \
+             patch("core.analyst._gemini_keys", ["dummy"]), \
              patch("core.analyst._call_gemini") as mock_gemini, \
              patch("core.analyst._call_ollama") as mock_ollama:
             mock_gemini.return_value = None  # simulates malformed JSON / validation fail
             mock_ollama.return_value = json.loads(_valid_llm_response_text())
-            signal = analyze_candidate("AAPL", "SMART", df, {"RSI": 28}, ["news"])
+            signal = analyze_candidate(_make_screener_signal(ticker="AAPL", indicators={"RSI": 28}), df, ["news"])
         assert signal is not None
         assert mock_gemini.call_count == 3
         assert mock_ollama.call_count == 1
@@ -1237,7 +1178,7 @@ class TestLLMProviderRouting:
             fp=io.BytesIO(b"busy"),
         )
         with patch("core.analyst.AI_PROVIDER", "gemini"), \
-             patch("core.analyst.GEMINI_API_KEY", "dummy"), \
+             patch("core.analyst._gemini_keys", ["dummy"]), \
              patch("core.analyst.urllib.request.urlopen") as mu:
             mu.side_effect = [
                 _mock_http_response(_gemini_success_body(_valid_llm_response_text(), 110, 70)),
@@ -1245,9 +1186,236 @@ class TestLLMProviderRouting:
                 _mock_http_response(_ollama_success_body(_valid_llm_response_text(), 200, 90)),
                 _mock_http_response(_gemini_success_body(_valid_llm_response_text(), 130, 80)),
             ]
-            analyze_candidate("AAPL", "SMART", df, {"RSI": 28}, ["news"])
-            analyze_candidate("MSFT", "SMART", df, {"RSI": 28}, ["news"])
-            analyze_candidate("GOOG", "SMART", df, {"RSI": 28}, ["news"])
+            analyze_candidate(_make_screener_signal(ticker="AAPL", indicators={"RSI": 28}), df, ["news"])
+            analyze_candidate(_make_screener_signal(ticker="MSFT", indicators={"RSI": 28}), df, ["news"])
+            analyze_candidate(_make_screener_signal(ticker="GOOG", indicators={"RSI": 28}), df, ["news"])
         usage = get_daily_token_usage()
         assert usage["gemini"] == {"input": 110 + 130, "output": 70 + 80}
         assert usage["ollama"] == {"input": 200, "output": 90}
+
+
+class TestPluralKeyOnlyRouting:
+    """Regression for the 2026-04-28 production bug.
+
+    Symptom: an entire 14-hour run never made a single Gemini call —
+    every analyst response was Ollama, every sector lookup logged
+    "0 via Gemini, 13 via Ollama". The user's `.env` only set the
+    plural rotation list (`GEMINI_API_KEYS=k1,k2,k3`), not the legacy
+    singular `GEMINI_API_KEY`.
+
+    Root cause: `_call_llm` gated the Gemini path on
+    `bool(GEMINI_API_KEY)` (singular), which was empty, so the router
+    skipped Gemini regardless of the plural list. The multi-key
+    rotation that `_call_gemini` implemented was unreachable code.
+
+    Contract after the fix: the router gate must read the same
+    source of truth that the rotation does — the configured key
+    list, exposed via `_active_gemini_keys()`. With the plural list
+    populated and the singular empty, Gemini must be tried first.
+    """
+
+    def test_router_takes_gemini_path_when_only_plural_list_is_set(
+        self, reset_analyst_state,
+    ):
+        from core.analyst import analyze_candidate
+        df = _make_df()
+        # `_gemini_keys` is the live rotation list (populated from
+        # GEMINI_API_KEYS at module load); patching it directly expresses
+        # "user has configured keys via GEMINI_API_KEYS".
+        with patch("core.analyst.AI_PROVIDER", "gemini"), \
+             patch("core.analyst._gemini_keys", ["KEY_FROM_PLURAL_LIST"]), \
+             patch("core.analyst._call_gemini") as mock_gemini, \
+             patch("core.analyst._call_ollama") as mock_ollama:
+            mock_gemini.return_value = json.loads(_valid_llm_response_text())
+            signal = analyze_candidate(_make_screener_signal(ticker="AAPL", indicators={"RSI": 28}), df, ["news"])
+        assert signal is not None, "Router must produce a signal"
+        assert mock_gemini.call_count >= 1, (
+            "Router must enter the Gemini path when GEMINI_API_KEYS has keys"
+        )
+        assert mock_ollama.call_count == 0, (
+            "Ollama must NOT be called when Gemini succeeds"
+        )
+
+
+class TestLLMTrafficLog:
+    """Diagnostic JSONL traffic log: every Gemini and Ollama round-trip
+    appends one record to logs/llm_traffic_YYYY-MM-DD.jsonl.
+
+    Lets us correlate the confidence-distribution analysis with the actual
+    prompts and responses — including failures (auth, RPM, malformed
+    envelope) so we can see exactly what each provider returned and why.
+    """
+
+    def _read_jsonl(self, path):
+        with open(path) as f:
+            return [json.loads(line) for line in f if line.strip()]
+
+    def test_gemini_success_writes_record_with_prompt_response_tokens(
+        self, reset_analyst_state, tmp_path,
+    ):
+        from core.analyst import _call_gemini
+        with patch("core.analyst.LOG_DIR", tmp_path), \
+             patch("core.analyst.LLM_TRAFFIC_LOG_ENABLED", True), \
+             patch("core.analyst._gemini_keys", ["KEY_FROM_TEST"]), \
+             patch("core.analyst.urllib.request.urlopen") as mu:
+            mu.return_value = _mock_http_response(_gemini_success_body(
+                _valid_llm_response_text(), prompt_tokens=120, output_tokens=80,
+            ))
+            _call_gemini("the actual prompt body sent to gemini")
+
+        files = list(tmp_path.glob("llm_traffic_*.jsonl"))
+        assert len(files) == 1, f"expected 1 traffic log file, got {files}"
+        records = self._read_jsonl(files[0])
+        assert len(records) == 1, "exactly one record per call"
+        rec = records[0]
+        assert rec["provider"] == "gemini"
+        assert rec["error"] is None
+        assert rec["prompt"] == "the actual prompt body sent to gemini"
+        assert rec["response"]["action"] == "buy"
+        assert rec["response"]["confidence"] == 85
+        assert rec["tokens"] == {"input": 120, "output": 80}
+        assert isinstance(rec["elapsed_ms"], (int, float))
+        assert "ts" in rec
+
+    def test_gemini_429_rpm_writes_error_record_with_body(
+        self, reset_analyst_state, tmp_path,
+    ):
+        """RPM 429 must produce a record so we can see exactly what Gemini said."""
+        import io
+        import urllib.error
+        from core.analyst import _call_gemini, _GeminiTransportError
+        rpm_body = b'{"error":{"message":"requests per minute"}}'
+        with patch("core.analyst.LOG_DIR", tmp_path), \
+             patch("core.analyst.LLM_TRAFFIC_LOG_ENABLED", True), \
+             patch("core.analyst._gemini_keys", ["ONLY_KEY"]), \
+             patch("core.analyst.urllib.request.urlopen") as mu:
+            mu.side_effect = urllib.error.HTTPError(
+                url="x", code=429, msg="rate", hdrs=None, fp=io.BytesIO(rpm_body),
+            )
+            with pytest.raises(_GeminiTransportError):
+                _call_gemini("prompt")
+
+        files = list(tmp_path.glob("llm_traffic_*.jsonl"))
+        records = self._read_jsonl(files[0])
+        assert len(records) == 1
+        rec = records[0]
+        assert rec["provider"] == "gemini"
+        assert rec["error"] == "rpm_429"
+        assert "requests per minute" in rec["response_raw"]
+        assert rec["response"] is None
+
+    def test_gemini_401_writes_error_record(self, reset_analyst_state, tmp_path):
+        import io
+        import urllib.error
+        from core.analyst import _call_gemini, _GeminiTransportError
+        with patch("core.analyst.LOG_DIR", tmp_path), \
+             patch("core.analyst.LLM_TRAFFIC_LOG_ENABLED", True), \
+             patch("core.analyst._gemini_keys", ["BAD_KEY"]), \
+             patch("core.analyst.urllib.request.urlopen") as mu:
+            mu.side_effect = urllib.error.HTTPError(
+                url="x", code=401, msg="unauth",
+                hdrs=None, fp=io.BytesIO(b"API key not valid"),
+            )
+            with pytest.raises(_GeminiTransportError):
+                _call_gemini("prompt")
+
+        files = list(tmp_path.glob("llm_traffic_*.jsonl"))
+        records = self._read_jsonl(files[0])
+        assert len(records) == 1
+        assert records[0]["error"] == "auth_401"
+
+    def test_gemini_malformed_envelope_writes_record_with_raw_body(
+        self, reset_analyst_state, tmp_path,
+    ):
+        """Bad envelope (HTML error page, etc.) must capture the raw body
+        so we can see what came back instead of the JSON we expected."""
+        from core.analyst import _call_gemini
+        with patch("core.analyst.LOG_DIR", tmp_path), \
+             patch("core.analyst.LLM_TRAFFIC_LOG_ENABLED", True), \
+             patch("core.analyst._gemini_keys", ["KEY"]), \
+             patch("core.analyst.urllib.request.urlopen") as mu:
+            mu.return_value = _mock_http_response(b"<html>504 Gateway Timeout</html>")
+            _call_gemini("prompt")
+
+        files = list(tmp_path.glob("llm_traffic_*.jsonl"))
+        records = self._read_jsonl(files[0])
+        assert len(records) == 1
+        rec = records[0]
+        assert rec["error"] == "malformed_envelope"
+        assert "504 Gateway Timeout" in rec["response_raw"]
+
+    def test_ollama_success_writes_record(self, reset_analyst_state, tmp_path):
+        from core.analyst import _call_ollama
+        with patch("core.analyst.LOG_DIR", tmp_path), \
+             patch("core.analyst.LLM_TRAFFIC_LOG_ENABLED", True), \
+             patch("core.analyst.urllib.request.urlopen") as mu:
+            mu.return_value = _mock_http_response(_ollama_success_body(
+                _valid_llm_response_text(), prompt_tokens=200, output_tokens=90,
+            ))
+            _call_ollama("the ollama prompt")
+
+        files = list(tmp_path.glob("llm_traffic_*.jsonl"))
+        records = self._read_jsonl(files[0])
+        assert len(records) == 1
+        rec = records[0]
+        assert rec["provider"] == "ollama"
+        assert rec["error"] is None
+        assert rec["prompt"] == "the ollama prompt"
+        assert rec["response"]["action"] == "buy"
+        assert rec["tokens"] == {"input": 200, "output": 90}
+
+    def test_disabled_via_env_writes_no_file(self, reset_analyst_state, tmp_path):
+        """LLM_TRAFFIC_LOG_ENABLED=False must produce no JSONL output at all."""
+        from core.analyst import _call_gemini
+        with patch("core.analyst.LOG_DIR", tmp_path), \
+             patch("core.analyst.LLM_TRAFFIC_LOG_ENABLED", False), \
+             patch("core.analyst._gemini_keys", ["KEY"]), \
+             patch("core.analyst.urllib.request.urlopen") as mu:
+            mu.return_value = _mock_http_response(_gemini_success_body(
+                _valid_llm_response_text(),
+            ))
+            _call_gemini("prompt")
+        files = list(tmp_path.glob("llm_traffic_*.jsonl"))
+        assert files == [], "no file should be created when logging disabled"
+
+    def test_disk_error_does_not_break_analyst(self, reset_analyst_state, tmp_path):
+        """If the JSONL write fails (disk full, perms), the analyst call MUST
+        still succeed — diagnostic logging is best-effort, never load-bearing."""
+        from core.analyst import _call_gemini
+        # Point LOG_DIR at a path that cannot be written to (a regular file
+        # masquerading as a directory). Any open() / mkdir() will raise.
+        bad_path = tmp_path / "not_a_directory"
+        bad_path.write_text("blocking file")
+        with patch("core.analyst.LOG_DIR", bad_path), \
+             patch("core.analyst.LLM_TRAFFIC_LOG_ENABLED", True), \
+             patch("core.analyst._gemini_keys", ["KEY"]), \
+             patch("core.analyst.urllib.request.urlopen") as mu:
+            mu.return_value = _mock_http_response(_gemini_success_body(
+                _valid_llm_response_text(),
+            ))
+            result = _call_gemini("prompt")
+        assert result is not None, "Analyst must still return its result"
+
+    def test_caller_context_ticker_and_kind_recorded(
+        self, reset_analyst_state, tmp_path,
+    ):
+        """The trading-prompt caller (analyze_candidate) must annotate the
+        record with the ticker and kind='trading' so we can correlate per-symbol."""
+        from core.analyst import _call_gemini_payload
+        payload = {
+            "contents": [{"parts": [{"text": "hi"}]}],
+            "generationConfig": {"responseMimeType": "application/json"},
+        }
+        with patch("core.analyst.LOG_DIR", tmp_path), \
+             patch("core.analyst.LLM_TRAFFIC_LOG_ENABLED", True), \
+             patch("core.analyst._gemini_keys", ["KEY"]), \
+             patch("core.analyst.urllib.request.urlopen") as mu:
+            mu.return_value = _mock_http_response(_gemini_success_body(
+                _valid_llm_response_text(),
+            ))
+            _call_gemini_payload(payload, ctx={"ticker": "AAPL", "kind": "trading"})
+
+        files = list(tmp_path.glob("llm_traffic_*.jsonl"))
+        records = self._read_jsonl(files[0])
+        assert records[0]["ticker"] == "AAPL"
+        assert records[0]["kind"] == "trading"

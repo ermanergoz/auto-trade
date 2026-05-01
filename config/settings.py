@@ -80,36 +80,28 @@ AI_PROVIDER = os.getenv("AI_PROVIDER", "gemini").lower()
 # Gemini (primary when AI_PROVIDER=gemini). Missing key silently falls back to
 # Ollama — matching the TAVILY_API_KEY "optional API" precedent.
 #
-# Two ways to configure keys, both checked at startup:
-#   GEMINI_API_KEYS=key1,key2,key3   ← preferred: comma-separated rotation list
-#   GEMINI_API_KEY=key1              ← legacy: single key (used only when KEYS unset)
+# Single config knob:
+#   GEMINI_API_KEYS=key1[,key2,...]   ← 1 key = single-key behavior, N keys = rotation
 # Rotation triples free-tier RPD headroom — see docs/CODE-DOCUMENTATION.md.
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+def _parse_gemini_keys(api_keys_env: str) -> list[str]:
+    """Resolve the active Gemini key list from the GEMINI_API_KEYS env var.
 
-
-def _parse_gemini_keys(api_keys_env: str, single_key_env: str) -> list[str]:
-    """Resolve the active Gemini key list.
-
-    Precedence:
-        1. GEMINI_API_KEYS (comma-separated, whitespace trimmed, empty
-           segments dropped). Wins whenever it parses to ≥1 keys.
-        2. GEMINI_API_KEY (single key) — backward-compat fallback.
-        3. Empty list — no keys configured; analyst will raise and the
-           router falls through to Ollama.
+    Comma-separated, whitespace-trimmed, empty segments dropped. A single
+    key is just a one-element rotation list — same code path as multi-key.
+    Returns an empty list when no keys are configured; the analyst then
+    falls straight through to Ollama.
     """
-    if api_keys_env:
-        keys = [k.strip() for k in api_keys_env.split(",") if k.strip()]
-        if keys:
-            return keys
-    if single_key_env:
-        return [single_key_env]
-    return []
+    return [k.strip() for k in api_keys_env.split(",") if k.strip()]
 
 
-GEMINI_API_KEYS = _parse_gemini_keys(
-    os.getenv("GEMINI_API_KEYS", ""),
-    GEMINI_API_KEY,
-)
+GEMINI_API_KEYS = _parse_gemini_keys(os.getenv("GEMINI_API_KEYS", ""))
+
+# Diagnostic JSONL log of every LLM round-trip (Gemini + Ollama, success +
+# failure) to logs/llm_traffic_YYYY-MM-DD.jsonl. Lets us correlate the
+# confidence-distribution analysis with actual prompts/responses and see
+# exactly what each provider returned and why. Defaults ON; flip off via
+# LLM_TRAFFIC_LOG=0 once you no longer need the audit trail.
+LLM_TRAFFIC_LOG_ENABLED = os.getenv("LLM_TRAFFIC_LOG", "1") != "0"
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite")
 GEMINI_HOST = os.getenv("GEMINI_HOST", "https://generativelanguage.googleapis.com")
 
