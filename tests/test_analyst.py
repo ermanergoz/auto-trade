@@ -680,6 +680,27 @@ class TestGeminiCallContract:
                 _call_gemini("prompt")
         assert analyst._gemini_exhausted.is_set() is False
 
+    def test_gemini_socket_timeout_raises_transport_error_not_bare_TimeoutError(self, reset_analyst_state):
+        """A read timeout from inside ssl/socket must not bubble out raw.
+
+        Production crash 2026-05-01: urllib.request.urlopen() raised
+        `TimeoutError: The read operation timed out` from ssl.recv_into.
+        _call_gemini_with_key caught HTTPError + URLError but not
+        TimeoutError, so the bare exception propagated up through
+        _call_gemini → analyst (and through the parallel sector-classifier
+        path: universe.py → build_universe → run_scan_cycle), killing the
+        bot mid-scan. Must be classified as transport failure so the
+        router falls back to Ollama (and doesn't latch _gemini_exhausted).
+        """
+        from core import analyst
+        from core.analyst import _call_gemini, _GeminiTransportError
+        with patch("core.analyst.urllib.request.urlopen") as mu, \
+             patch("core.analyst.GEMINI_API_KEY", "dummy"):
+            mu.side_effect = TimeoutError("The read operation timed out")
+            with pytest.raises(_GeminiTransportError):
+                _call_gemini("prompt")
+        assert analyst._gemini_exhausted.is_set() is False
+
     def test_gemini_malformed_envelope_returns_none_for_router_retry(self, reset_analyst_state):
         """Content errors (bad envelope) return None so the router can retry Gemini."""
         from core import analyst

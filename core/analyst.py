@@ -393,6 +393,14 @@ def _call_gemini_with_key(prompt: str, key: str) -> Optional[dict]:
     except urllib.error.URLError as e:
         logger.warning("Gemini network error: %s", e)
         raise _GeminiTransportError(f"network: {e}") from e
+    except TimeoutError as e:
+        # socket-level read timeout from inside ssl.recv_into. urllib does
+        # not wrap this in URLError when the read times out mid-handshake,
+        # so the bare TimeoutError would otherwise propagate up and kill
+        # the bot (analyst path AND universe sector-classifier path).
+        # Treat as transport failure so the router falls back to Ollama.
+        logger.warning("Gemini read timeout: %s", e)
+        raise _GeminiTransportError(f"timeout: {e}") from e
 
     try:
         envelope = json.loads(raw)
