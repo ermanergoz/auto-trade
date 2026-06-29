@@ -24,6 +24,7 @@ import pandas as pd
 from config.settings import (
     MAX_POSITION_SIZE_PCT,
     DAILY_LOSS_LIMIT_PCT,
+    MAX_PORTFOLIO_HEAT_PCT,
     MAX_OPEN_POSITIONS,
     DEFAULT_STOP_LOSS_PCT,
     MAX_SECTOR_CONCENTRATION_PCT,
@@ -354,6 +355,47 @@ def check_cumulative_risk(
         return False, (
             f"Cumulative risk ${total_risk:.2f} would exceed daily loss limit "
             f"${max_daily_risk:.2f} ({limit_pct}% of ${portfolio_value:.2f})"
+        )
+    return True, ""
+
+
+def check_portfolio_heat(
+    signal: Signal,
+    open_positions: list[Position],
+    portfolio_value: float,
+    position_size: int,
+    max_heat_pct: float = MAX_PORTFOLIO_HEAT_PCT,
+) -> tuple[bool, str]:
+    """Cap total open at-risk capital as a % of equity (ENTRY-ONLY).
+
+    A tighter concentration sibling of ``check_cumulative_risk``: it sums the
+    entry→stop risk across all open positions plus this entry's risk and rejects
+    when the total exceeds ``portfolio_value * max_heat_pct/100``. Distinct from
+    cumulative-risk on purpose (lower cap, not tied to the daily-loss limit).
+
+    Pure: all state is passed in; no IO, no fetch. evaluate() calls this only
+    inside its ``if not is_exit:`` block, so an exit (which reduces heat) is
+    never blocked by it.
+    """
+    if portfolio_value <= 0:
+        return False, "Portfolio value is zero or negative"
+
+    existing_risk = sum(
+        abs(p.entry_price - p.stop_loss) * abs(p.quantity)
+        for p in open_positions
+        if p.stop_loss > 0
+    )
+
+    stop_distance = abs(signal.entry_price - signal.stop_loss)
+    new_risk = stop_distance * position_size if stop_distance > 0 else 0
+
+    total_risk = existing_risk + new_risk
+    max_heat = portfolio_value * (max_heat_pct / 100)
+
+    if total_risk > max_heat:
+        return False, (
+            f"Portfolio heat ${total_risk:.2f} would exceed cap "
+            f"${max_heat:.2f} ({max_heat_pct}% of ${portfolio_value:.2f})"
         )
     return True, ""
 
@@ -1002,6 +1044,8 @@ def evaluate(
             check_position_size(signal, portfolio_value),
             check_cumulative_risk(signal, open_positions, portfolio_value,
                                   position_size=estimated_size),
+            check_portfolio_heat(signal, open_positions, portfolio_value,
+                                 position_size=estimated_size),
             check_sector_concentration(signal, open_positions, portfolio_value,
                                         proposed_value=proposed_value),
             check_excluded_sector(signal),

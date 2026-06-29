@@ -2222,3 +2222,65 @@ class TestSectorConcentrationMissingSector:
             "sector" in rec.message.lower() and "xyz" in rec.message.lower()
             for rec in caplog.records
         ), "Expected WARNING about missing sector for XYZ"
+
+
+class TestSizingBinding:
+    """RSK-01: 15% size cap controls concentration; min(size, risk) governs."""
+
+    def test_size_cap_binds_for_tight_stop(self):
+        # ~3% stop -> risk-based qty is huge, so the 15% size cap binds.
+        sig = _make_signal(entry_price=150.0, stop_loss=145.5)
+        qty = calculate_position_size(sig, 100_000)  # default max_pct=15
+        assert qty * sig.entry_price <= 100_000 * 0.15 + 1e-6
+        assert qty == int(100_000 * 0.15 / 150.0)
+
+    def test_risk_per_trade_binds_for_wide_stop(self):
+        # Wide stop (> entry/3) -> RISK_PER_TRADE_PCT is the binding constraint.
+        from config.settings import RISK_PER_TRADE_PCT
+        sig = _make_signal(entry_price=150.0, stop_loss=90.0)  # $60 stop
+        qty = calculate_position_size(sig, 100_000)
+        expected_risk_qty = int((100_000 * RISK_PER_TRADE_PCT / 100) / 60.0)
+        assert qty == expected_risk_qty
+
+
+class TestPortfolioHeat:
+    """RSK-02: entry-only aggregate-risk cap that never blocks exits."""
+
+    def test_rejects_when_heat_exceeds_cap(self):
+        from core.risk import check_portfolio_heat
+        sig = _make_signal(entry_price=100.0, stop_loss=90.0)
+        # existing open risk = $50 stop * 100 sh = $5000
+        positions = [_make_position(entry_price=100.0, stop_loss=50.0, quantity=100)]
+        # new risk = $10 * 200 = $2000 -> total $7000 > 6% of $100k ($6000)
+        ok, reason = check_portfolio_heat(sig, positions, 100_000, position_size=200)
+        assert ok is False
+        assert "heat" in reason.lower()
+
+    def test_passes_within_cap(self):
+        from core.risk import check_portfolio_heat
+        sig = _make_signal(entry_price=100.0, stop_loss=90.0)
+        ok, _ = check_portfolio_heat(sig, [], 100_000, position_size=50)  # $500 < $6000
+        assert ok is True
+
+    def test_zero_portfolio_value(self):
+        from core.risk import check_portfolio_heat
+        sig = _make_signal(entry_price=100.0, stop_loss=90.0)
+        ok, _ = check_portfolio_heat(sig, [], 0, position_size=10)
+        assert ok is False
+
+    def test_evaluate_rejects_entry_over_heat(self):
+        # Pre-existing open risk already exceeds the 6% cap -> new BUY rejected by heat.
+        sig = _make_signal(ticker="AAPL", entry_price=100.0, stop_loss=95.0)
+        positions = [_make_position(ticker="MSFT", entry_price=100.0, stop_loss=30.0, quantity=100)]  # $7000 risk
+        result = evaluate(sig, positions, 100_000, 0, **_BULLISH_CONSENSUS)
+        assert result.approved is False
+        assert any("heat" in r.lower() for r in result.reasons)
+
+    def test_evaluate_exit_not_blocked_by_heat(self):
+        # Held long + SELL exit must be approved even when open heat exceeds the cap.
+        pos = _make_position(ticker="AAPL", entry_price=100.0, stop_loss=30.0, quantity=100)  # $7000 risk
+        # Coherent SELL (stop above entry, target below) so only the exit/heat path is under test.
+        sig = _make_signal(ticker="AAPL", action=Action.SELL, entry_price=100.0,
+                           stop_loss=105.0, take_profit=90.0)
+        result = evaluate(sig, [pos], 100_000, 0, **_BULLISH_CONSENSUS)
+        assert result.approved is True
