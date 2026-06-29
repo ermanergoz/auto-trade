@@ -38,6 +38,19 @@ class SimulatedPortfolio:
     positions: list[Position] = field(default_factory=list)
     trades: list[Trade] = field(default_factory=list)
     equity_curve: list[tuple[date, float]] = field(default_factory=list)
+    # SPY (or configured benchmark) buy-and-hold equity curve, normalized to
+    # initial_capital and sampled on the SAME warmup-trimmed trading days as
+    # equity_curve so strategy-vs-benchmark returns are comparable over an
+    # identical window. Populated by run_backtest; empty for hand-built
+    # portfolios. Consumed by the CAPM alpha/beta report.
+    benchmark_curve: list[tuple[date, float]] = field(default_factory=list)
+    # RAW, full-history, un-trimmed, un-normalized benchmark close series (a
+    # pandas Series of close indexed by date over the entire history download).
+    # This is the series 02-06's market-regime gate slices as
+    # spy_df[spy_df.index.date < current_date]["close"] — it MUST stay the full
+    # download, never the warmup-trimmed normalized benchmark_curve (too short
+    # at the start of each OOS fold). None for hand-built portfolios.
+    benchmark_prices: Optional[pd.Series] = None
     slippage_pct: float = BACKTEST_SLIPPAGE_PCT
     # commission is now the MINIMUM per order (IBKR $1 floor);
     # commission_per_share is added on top — matches IBKR tiered pricing.
@@ -305,6 +318,45 @@ class BacktestConfig:
     # year), exercising the strategy across regimes. Honors start_date/end_date
     # filters applied after download.
     history_period: str = "5y"
+    # Passive benchmark downloaded alongside the strategy for the buy-and-hold
+    # curve + CAPM alpha/beta. SPY by default. Downloaded over the FULL
+    # history_period (not warmup-trimmed) so the raw close series is available
+    # for 02-06's regime gate.
+    benchmark_ticker: str = "SPY"
+
+
+def _build_benchmark_curve(
+    benchmark_df: Optional[pd.DataFrame],
+    equity_dates: list[date],
+    initial_capital: float,
+) -> list[tuple[date, float]]:
+    """Buy-and-hold equity curve for the benchmark, normalized to initial_capital.
+
+    Sampled on the SAME trading days as the strategy's (warmup-trimmed) equity
+    curve so the two return series cover an identical window — the first point
+    is initial_capital, the last reflects first-close-to-last-close growth.
+    Benchmark closes are forward/back-filled onto the strategy's dates so a
+    missing benchmark bar never drops a strategy day.
+    """
+    if benchmark_df is None or benchmark_df.empty or not equity_dates:
+        return []
+
+    close = benchmark_df["close"]
+    if isinstance(close.index, pd.DatetimeIndex):
+        close = close.copy()
+        close.index = close.index.date
+    # Collapse any duplicate calendar dates (keep the last observation).
+    close = close[~close.index.duplicated(keep="last")]
+
+    aligned = close.reindex(equity_dates).ffill().bfill()
+    vals = aligned.tolist()
+    base = vals[0]
+    if base == 0 or pd.isna(base):
+        return []
+    return [
+        (d, initial_capital * (v / base))
+        for d, v in zip(equity_dates, vals)
+    ]
 
 
 def run_backtest(config: BacktestConfig) -> SimulatedPortfolio:
@@ -349,6 +401,16 @@ def run_backtest(config: BacktestConfig) -> SimulatedPortfolio:
         return SimulatedPortfolio(initial_capital=config.initial_capital)
 
     logger.info("Downloaded data for %d/%d tickers", len(all_data), len(config.tickers))
+
+    # Download the benchmark (SPY) over the FULL history window — NOT
+    # warmup-trimmed. Two artifacts come off this: the raw full-history close
+    # series (exposed for 02-06's regime gate) and a buy-and-hold curve aligned
+    # to the strategy's trading days (built after the loop, once equity_curve
+    # exists). Kept as a local that survives to the regime gate / report.
+    benchmark_df = get_historical_data_yfinance(
+        config.benchmark_ticker, period=config.history_period,
+        interval="1d", market=config.market,
+    )
 
     # Get common date range
     all_dates = set()
@@ -491,6 +553,17 @@ def run_backtest(config: BacktestConfig) -> SimulatedPortfolio:
         else:
             last_price = pos.entry_price
         portfolio.close_position(pos.ticker, last_price, current_dt)
+
+    # Attach benchmark artifacts. benchmark_prices is the RAW, full-history,
+    # un-trimmed, un-normalized close (for 02-06's regime gate); benchmark_curve
+    # is the buy-and-hold equity curve aligned to the strategy's warmup-trimmed
+    # trading days (for the CAPM alpha/beta report).
+    if benchmark_df is not None and not benchmark_df.empty:
+        portfolio.benchmark_prices = benchmark_df["close"]
+    equity_dates = [d for d, _ in portfolio.equity_curve]
+    portfolio.benchmark_curve = _build_benchmark_curve(
+        benchmark_df, equity_dates, config.initial_capital,
+    )
 
     logger.info(
         "Backtest complete: %d trades, final value=$%,.2f (%.1f%% return)",

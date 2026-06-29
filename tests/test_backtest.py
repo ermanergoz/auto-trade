@@ -781,7 +781,9 @@ class TestBacktestVolatility:
         # Alphabetical order: AHIGH inserted first into all_data. With the
         # bug, AHIGH's vol is passed for ZLOW's sizing too.
         def _fake_yf(ticker, *args, **kwargs):
-            return {"AHIGH": high_df, "ZLOW": low_df}[ticker]
+            # The engine also downloads the SPY benchmark — return empty for any
+            # ticker outside the two-stock vol fixture so it is a harmless no-op.
+            return {"AHIGH": high_df, "ZLOW": low_df}.get(ticker, pd.DataFrame())
 
         config = BacktestConfig(
             tickers=["AHIGH", "ZLOW"],
@@ -1552,3 +1554,73 @@ class TestWalkForwardOverfittingDetection:
         # Small degradation — strategy is robust
         assert abs(result.degradation["win_rate_pct"]) < 5
         assert abs(result.degradation["total_return_pct"]) < 1.0
+
+
+# ---------------------------------------------------------------------------
+# Plan 02-02 Task 1: SPY buy-and-hold benchmark + raw full-history close
+# ---------------------------------------------------------------------------
+
+def _ohlc_frame(closes, dates):
+    """OHLC fixture from a close series, indexed by the given dates."""
+    df = pd.DataFrame({
+        "open": [c for c in closes],
+        "high": [c * 1.01 for c in closes],
+        "low": [c * 0.99 for c in closes],
+        "close": [float(c) for c in closes],
+        "volume": [1_000_000] * len(closes),
+    }, index=dates)
+    df.index.name = "date"
+    return df
+
+
+class TestSPYBenchmark:
+    """The benchmark must be a buy-and-hold curve aligned to the strategy's
+    warmup-trimmed trading days, and the RAW full-history SPY close must stay
+    accessible for 02-06's regime gate."""
+
+    def test_benchmark_curve_aligned_and_prices_raw(self, monkeypatch):
+        from backtest.engine import run_backtest
+
+        # Synthetic full-history (no pre-holdout end_date) → unlock the preflight
+        # for this mechanics-only test (scoped to this test).
+        monkeypatch.setenv("BORSA_HOLDOUT_UNLOCKED", "1")
+
+        n = 90
+        dates = pd.date_range("2024-01-01", periods=n, freq="D")
+        # Choppy strategy ticker (no trades needed) and a monotone SPY so the
+        # benchmark return is hand-computable.
+        aapl = _ohlc_frame([100.0 + (i % 3) for i in range(n)], dates)
+        spy = _ohlc_frame([400.0 + i for i in range(n)], dates)
+
+        def _fake_yf(ticker, *args, **kwargs):
+            return {"AAPL": aapl, "SPY": spy}.get(ticker, pd.DataFrame())
+
+        # min_screener_score impossibly high → zero candidates → flat equity.
+        config = BacktestConfig(tickers=["AAPL"], min_screener_score=9_999.0)
+        with patch("backtest.engine.get_historical_data_yfinance", side_effect=_fake_yf):
+            p = run_backtest(config)
+
+        # (a) benchmark_curve aligned to the strategy's warmup-trimmed window.
+        assert len(p.benchmark_curve) == len(p.equity_curve)
+        assert [d for d, _ in p.benchmark_curve] == [d for d, _ in p.equity_curve]
+        # First point normalized to initial_capital.
+        assert p.benchmark_curve[0][1] == pytest.approx(100_000.0)
+        # Benchmark total return == first-close-to-last-close over the SAME window.
+        spy_by_date = {d.date(): c for d, c in zip(dates, [400.0 + i for i in range(n)])}
+        first_date = p.equity_curve[0][0]
+        last_date = p.equity_curve[-1][0]
+        expected_ratio = spy_by_date[last_date] / spy_by_date[first_date]
+        actual_ratio = p.benchmark_curve[-1][1] / p.benchmark_curve[0][1]
+        assert actual_ratio == pytest.approx(expected_ratio)
+
+        # (b) benchmark_prices is the RAW, full-history, un-normalized close:
+        # longer than the warmup-trimmed curve, starts at the raw first close.
+        assert p.benchmark_prices is not None
+        assert len(p.benchmark_prices) == n
+        assert len(p.benchmark_prices) > len(p.benchmark_curve)
+        assert float(p.benchmark_prices.iloc[0]) == pytest.approx(400.0)
+        assert float(p.benchmark_prices.iloc[-1]) == pytest.approx(400.0 + n - 1)
+
+    def test_config_default_benchmark_is_spy(self):
+        assert BacktestConfig(tickers=["AAPL"]).benchmark_ticker == "SPY"
+
