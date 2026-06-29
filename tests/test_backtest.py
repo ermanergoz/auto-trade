@@ -306,6 +306,67 @@ class TestMetrics:
         assert _std([1, 2, 3, 4, 5]) > 0
 
 
+class TestCostDecompositionMetrics:
+    """calculate_metrics must surface cost-as-%-of-gross and breakeven edge,
+    derived from the exact gross/total/net decomposition of the fill prices."""
+
+    def test_known_trade_cost_decomposition(self):
+        """One crafted long trade with KNOWN fills + params pins gross/total/net.
+
+        raw_entry=$100, raw_exit=$110, qty=100, slippage=0.1%, spread=5bps,
+        commission=$1 min / $0.005 per share.
+          entry fill = 100 * (1 + 0.0015) = 100.15
+          exit  fill = 110 * (1 - 0.0015) = 109.835
+          Trade.pnl  = (109.835 - 100.15) * 100 = 968.50
+          slippage   = (100 + 110) * 0.001 * 100 = 21.00
+          spread     = (100 + 110) * 0.0005 * 100 = 10.50
+          commission = max($1, 100*$0.005)=$1 per leg => $2.00 round trip
+          gross_pnl  = 968.50 + 21.00 + 10.50 = 1000.00  (== (110-100)*100)
+          total_cost = 2.00 + 21.00 + 10.50 = 33.50
+          net_pnl    = 968.50 - 2.00 = 966.50
+          cost %     = 33.50 / 1000.00 * 100 = 3.35%
+          breakeven  = 33.50 / 1 trade = $33.50
+        """
+        t = Trade(
+            "AAPL", "SMART", 100, 100.15, 109.835,
+            datetime(2024, 1, 1), datetime(2024, 1, 3), TradeType.SWING,
+        )
+        equity = [(date(2024, 1, 1), 100_000.0), (date(2024, 1, 3), 100_966.5)]
+        m = calculate_metrics(
+            [t], equity, 100_000,
+            slippage_pct=0.1, spread_bps=5.0,
+            commission=1.0, commission_per_share=0.005,
+        )
+
+        assert m["gross_pnl"] == pytest.approx(1000.0)
+        assert m["total_cost"] == pytest.approx(33.5)
+        assert m["net_pnl"] == pytest.approx(966.5)
+        assert m["cost_pct_of_gross_pnl"] == pytest.approx(3.35)
+        assert m["breakeven_edge_per_trade"] == pytest.approx(33.5)
+
+    def test_zero_friction_gross_equals_net(self):
+        """With no slippage/spread/commission, gross == net == Trade.pnl."""
+        t = Trade(
+            "MSFT", "SMART", 10, 100.0, 110.0,
+            datetime(2024, 1, 1), datetime(2024, 1, 2), TradeType.DAY,
+        )
+        m = calculate_metrics(
+            [t], [(date(2024, 1, 1), 100_000.0), (date(2024, 1, 2), 100_100.0)],
+            100_000, slippage_pct=0.0, spread_bps=0.0,
+            commission=0.0, commission_per_share=0.0,
+        )
+        assert m["gross_pnl"] == pytest.approx(100.0)
+        assert m["net_pnl"] == pytest.approx(100.0)
+        assert m["total_cost"] == pytest.approx(0.0)
+
+    def test_metrics_keys_present(self):
+        """The new cost keys must always be present in the metrics dict."""
+        m = calculate_metrics([], [], 100_000)
+        for key in ("gross_pnl", "net_pnl", "total_cost",
+                    "cost_pct_of_gross_pnl", "breakeven_edge_per_trade"):
+            assert key in m
+
+
 class TestGapDownStopLoss:
     """Verify stop-loss uses open price for gap-down modeling (not bar low)."""
 

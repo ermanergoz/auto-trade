@@ -11,11 +11,96 @@ from rich.table import Table
 from rich.panel import Panel
 from rich.text import Text
 
-from config.settings import RISK_FREE_RATE
+from config.settings import (
+    RISK_FREE_RATE,
+    BACKTEST_SLIPPAGE_PCT, BACKTEST_SPREAD_BPS,
+    BACKTEST_COMMISSION, BACKTEST_COMMISSION_PER_SHARE,
+)
 from core.models import Trade
 
 logger = logging.getLogger(__name__)
 console = Console()
+
+# Survivorship-bias caveat printed on EVERY backtest report. yfinance returns
+# only tickers that still exist today, so delisted/acquired names are silently
+# absent and absolute returns are inflated — judge edge by alpha vs SPY.
+SURVIVORSHIP_CAVEAT = (
+    "Universe is survivorship-biased: yfinance returns only tickers that exist "
+    "today; delisted names are silently absent — judge edge by alpha vs SPY, "
+    "not absolute return. The universe is a fixed point-in-time snapshot."
+)
+
+
+# ---------------------------------------------------------------------------
+# Cost decomposition
+# ---------------------------------------------------------------------------
+
+def _commission_for(quantity: int, commission: float, commission_per_share: float) -> float:
+    """Replicate SimulatedPortfolio._commission_for for the report side.
+
+    IBKR-style commission: max(min, per_share * qty). Mirrors the engine's
+    __post_init__ rule — disabling the minimum also zeroes the per-share fee.
+    """
+    if commission <= 0:
+        commission_per_share = 0.0
+    if commission <= 0 and commission_per_share <= 0:
+        return 0.0
+    per_share = abs(quantity) * max(commission_per_share, 0.0)
+    return max(commission, per_share)
+
+
+def _decompose_trade_costs(
+    trade: Trade,
+    slippage_pct: float,
+    spread_bps: float,
+    commission: float,
+    commission_per_share: float,
+) -> dict:
+    """Decompose a single round trip into gross/total-cost/net per the EXACT
+    engine fill mechanics (see core/models.py:91-93 and backtest/engine.py).
+
+    Trade.pnl = (exit_price - entry_price) * quantity, where entry_price and
+    exit_price are the slippage- AND spread-adjusted FILL prices. So Trade.pnl
+    already embeds slippage+spread but NOT commission (commission only touches
+    cash). We reconstruct the pre-friction raw prices from the stored fills,
+    then:
+        gross_pnl  = Trade.pnl + slippage + spread   (add back embedded frictions)
+        total_cost = commissions + slippage + spread
+        net_pnl    = Trade.pnl - commissions          (only commission is left)
+    """
+    q = trade.quantity
+    absq = abs(q)
+    slip_frac = slippage_pct / 100.0
+    spread_frac = spread_bps / 10_000.0
+    frac = slip_frac + spread_frac
+
+    # Invert the engine's per-leg adjustment to recover raw (pre-friction) prices.
+    if q > 0:  # long: entry crossed up, exit crossed down
+        raw_entry = trade.entry_price / (1 + frac)
+        raw_exit = trade.exit_price / (1 - frac)
+    else:  # short: entry crossed down, exit crossed up
+        raw_entry = trade.entry_price / (1 - frac)
+        raw_exit = trade.exit_price / (1 + frac)
+
+    slippage_cost = (raw_entry + raw_exit) * slip_frac * absq
+    spread_cost = (raw_entry + raw_exit) * spread_frac * absq
+
+    commission_entry = _commission_for(q, commission, commission_per_share)
+    commission_exit = _commission_for(q, commission, commission_per_share)
+    commissions = commission_entry + commission_exit
+
+    gross_pnl = trade.pnl + slippage_cost + spread_cost
+    total_cost = commissions + slippage_cost + spread_cost
+    net_pnl = trade.pnl - commissions
+
+    return {
+        "gross_pnl": gross_pnl,
+        "slippage_cost": slippage_cost,
+        "spread_cost": spread_cost,
+        "commission_cost": commissions,
+        "total_cost": total_cost,
+        "net_pnl": net_pnl,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -26,8 +111,19 @@ def calculate_metrics(
     trades: list[Trade],
     equity_curve: list[tuple[date, float]],
     initial_capital: float,
+    slippage_pct: float = BACKTEST_SLIPPAGE_PCT,
+    spread_bps: float = BACKTEST_SPREAD_BPS,
+    commission: float = BACKTEST_COMMISSION,
+    commission_per_share: float = BACKTEST_COMMISSION_PER_SHARE,
 ) -> dict:
-    """Calculate comprehensive backtest performance metrics."""
+    """Calculate comprehensive backtest performance metrics.
+
+    Cost params (slippage_pct, spread_bps, commission, commission_per_share)
+    default to the BACKTEST_* settings — the same values run_backtest uses — so
+    the gross/total-cost/net decomposition reconstructs friction from the stored
+    fill prices, not by re-deriving from cash. Pass the portfolio's actual
+    params when they differ from the defaults.
+    """
     if not trades:
         return {
             "total_return_pct": 0, "annualized_return_pct": 0,
@@ -36,6 +132,8 @@ def calculate_metrics(
             "avg_trade_duration_hours": 0, "num_trades": 0,
             "total_pnl": 0, "avg_pnl_per_trade": 0,
             "best_trade_pnl": 0, "worst_trade_pnl": 0,
+            "gross_pnl": 0, "net_pnl": 0, "total_cost": 0,
+            "cost_pct_of_gross_pnl": 0, "breakeven_edge_per_trade": 0,
             "final_value": initial_capital,
         }
 
@@ -76,6 +174,31 @@ def calculate_metrics(
     durations = [t.duration for t in trades]
     avg_duration = sum(durations) / len(durations) if durations else 0
 
+    # Cost decomposition — aggregate the exact gross/total-cost/net split over
+    # every round trip. gross adds back the slippage+spread embedded in fills;
+    # net subtracts only commission (slippage/spread are already in Trade.pnl).
+    total_gross_pnl = 0.0
+    total_cost = 0.0
+    total_net_pnl = 0.0
+    for t in trades:
+        d = _decompose_trade_costs(
+            t, slippage_pct, spread_bps, commission, commission_per_share,
+        )
+        total_gross_pnl += d["gross_pnl"]
+        total_cost += d["total_cost"]
+        total_net_pnl += d["net_pnl"]
+
+    # Cost as % of gross P&L (guard gross == 0). The fraction of the strategy's
+    # gross edge eaten by friction — the headline realism check.
+    if total_gross_pnl != 0:
+        cost_pct_of_gross = total_cost / total_gross_pnl * 100
+    else:
+        cost_pct_of_gross = 0.0
+
+    # Breakeven edge per trade: the round-trip friction (in $) each trade must
+    # clear just to break even. Same currency basis as the cost columns.
+    breakeven_edge_per_trade = total_cost / len(trades) if trades else 0.0
+
     return {
         "total_return_pct": round(total_return, 2),
         "annualized_return_pct": round(annualized, 2),
@@ -93,6 +216,11 @@ def calculate_metrics(
         "losing_trades": len(losers),
         "gross_profit": round(gross_profit, 2),
         "gross_loss": round(gross_loss, 2),
+        "gross_pnl": round(total_gross_pnl, 2),
+        "net_pnl": round(total_net_pnl, 2),
+        "total_cost": round(total_cost, 2),
+        "cost_pct_of_gross_pnl": round(cost_pct_of_gross, 2),
+        "breakeven_edge_per_trade": round(breakeven_edge_per_trade, 2),
         "final_value": round(final_value, 2),
         "initial_capital": initial_capital,
     }
@@ -175,6 +303,8 @@ def display_metrics(metrics: dict) -> None:
         ("Annualized Return", f"{metrics['annualized_return_pct']:+.2f}%"),
         ("Sharpe Ratio", f"{metrics['sharpe_ratio']:.2f}"),
         ("Max Drawdown", Text(f"-{metrics['max_drawdown_pct']:.2f}%", style="red")),
+        ("Cost % of Gross P&L", f"{metrics.get('cost_pct_of_gross_pnl', 0):.2f}%"),
+        ("Breakeven Edge/Trade", f"${metrics.get('breakeven_edge_per_trade', 0):,.2f}"),
         ("", ""),
         ("Total Trades", str(metrics["num_trades"])),
         ("Win Rate", f"{metrics['win_rate_pct']:.1f}%"),
@@ -197,6 +327,9 @@ def display_metrics(metrics: dict) -> None:
             table.add_row(label, value if isinstance(value, Text) else str(value))
 
     console.print(table)
+    # Survivorship caveat on EVERY report — absolute return is inflated by
+    # delisted names that yfinance silently omits; judge edge by alpha vs SPY.
+    console.print(Text(SURVIVORSHIP_CAVEAT, style="yellow"))
 
 
 def compare_configs(results_list: list[tuple[str, dict]]) -> None:
