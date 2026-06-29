@@ -513,6 +513,158 @@ def compare_configs(results_list: list[tuple[str, dict]]) -> None:
     console.print(table)
 
 
+# ---------------------------------------------------------------------------
+# Walk-forward report — per-segment, IS→OOS degradation, WFE with fail flag
+# ---------------------------------------------------------------------------
+
+# Walk-Forward Efficiency pass bars (STACK.md:22): WFE = annualized_OOS_return /
+# annualized_IS_return. < 0.5 is treated as overfit/regime-bound (FAIL); >= 0.7
+# is robust; the 0.5–0.7 band passes but is not yet robust.
+WFE_FAIL_THRESHOLD = 0.5
+WFE_ROBUST_THRESHOLD = 0.7
+
+
+def walk_forward_wfe_status(wfe: Optional[float]) -> tuple[str, bool]:
+    """Classify a WFE into (status_label, is_pass).
+
+    None (undefined: non-positive in-sample return) is UNDEFINED and not a pass.
+    WFE < 0.5 FAILs; >= 0.7 is ROBUST; the 0.5–0.7 band is a (non-robust) PASS.
+    """
+    if wfe is None:
+        return ("UNDEFINED", False)
+    if wfe < WFE_FAIL_THRESHOLD:
+        return ("FAIL", False)
+    if wfe >= WFE_ROBUST_THRESHOLD:
+        return ("ROBUST", True)
+    return ("PASS", True)
+
+
+def _pooled_oos_tstat(trades: list[Trade]) -> float:
+    """Per-trade-return t-stat over the pooled OOS trades (0.0 if undefined).
+
+    Uses each trade's pnl_pct (as a fraction). The t-stat needs at least two
+    trades and non-degenerate variance; otherwise it is reported as 0.0 rather
+    than NaN so the report never crashes on a thin/identical OOS sample.
+    """
+    from backtest.stats import per_trade_tstat
+
+    returns = [t.pnl_pct / 100.0 for t in trades]
+    if len(returns) < 2 or np.std(returns) == 0:
+        return 0.0
+    return round(per_trade_tstat(returns), 3)
+
+
+def display_walk_forward(result) -> dict:
+    """Render a multi-fold rolling walk-forward and return its gating status.
+
+    Prints a per-fold table (IS vs OOS return, Sharpe, trades, WFE), the
+    aggregate pooled-OOS metrics, and a headline aggregate WFE that is visibly
+    flagged FAIL when WFE < 0.5 (and noted ROBUST at >= 0.7). The aggregate-OOS
+    statistical context from backtest.stats — the per-trade t-stat over pooled
+    OOS trades and whether the >=30-OOS-trade gate passes — is surfaced too.
+
+    Returns a status dict (so tests assert on a value, not stdout): aggregate
+    WFE, its status label / pass flag, pooled-OOS trade count, the >=30-trade
+    gate result, and the pooled-OOS per-trade t-stat.
+    """
+    from backtest.stats import min_trade_gate
+
+    folds = result.folds
+    agg_wfe = result.aggregate_wfe
+    status_label, wfe_pass = walk_forward_wfe_status(agg_wfe)
+
+    num_oos_trades = len(result.aggregate_oos_trades)
+    trade_gate_pass = min_trade_gate(num_oos_trades)
+    oos_tstat = _pooled_oos_tstat(result.aggregate_oos_trades)
+
+    # Per-fold table.
+    table = Table(title="Walk-Forward — Per-Fold IS→OOS", show_lines=True)
+    table.add_column("Fold", style="cyan bold", justify="right")
+    table.add_column("OOS Window", justify="center")
+    table.add_column("IS Ret%", justify="right")
+    table.add_column("OOS Ret%", justify="right")
+    table.add_column("IS Sharpe", justify="right")
+    table.add_column("OOS Sharpe", justify="right")
+    table.add_column("OOS Trades", justify="right")
+    table.add_column("WFE", justify="right")
+
+    for fold in folds:
+        ism = fold.in_sample_metrics
+        oosm = fold.out_of_sample_metrics
+        wfe_txt = "n/a" if fold.wfe is None else f"{fold.wfe:.2f}"
+        table.add_row(
+            str(fold.index),
+            f"{fold.out_of_sample_start} → {fold.out_of_sample_end}",
+            f"{ism.get('annualized_return_pct', 0):+.2f}",
+            f"{oosm.get('annualized_return_pct', 0):+.2f}",
+            f"{ism.get('sharpe_ratio', 0):.2f}",
+            f"{oosm.get('sharpe_ratio', 0):.2f}",
+            str(oosm.get("num_trades", 0)),
+            wfe_txt,
+        )
+    console.print(table)
+
+    # Aggregate pooled-OOS metrics.
+    agg = result.aggregate_oos_metrics
+    agg_table = Table(title="Walk-Forward — Aggregate Out-of-Sample", show_lines=True)
+    agg_table.add_column("Metric", style="cyan bold")
+    agg_table.add_column("Value", justify="right")
+    agg_rows = [
+        ("Pooled OOS Trades", str(num_oos_trades)),
+        ("OOS Total Return", f"{agg.get('total_return_pct', 0):+.2f}%"),
+        ("OOS Annualized Return", f"{agg.get('annualized_return_pct', 0):+.2f}%"),
+        ("OOS Sharpe", f"{agg.get('sharpe_ratio', 0):.2f}"),
+        ("OOS Max Drawdown", f"-{agg.get('max_drawdown_pct', 0):.2f}%"),
+        ("OOS Win Rate", f"{agg.get('win_rate_pct', 0):.1f}%"),
+        ("Per-Trade t-stat", f"{oos_tstat:.3f}"),
+        (">=30-Trade Gate", "PASS" if trade_gate_pass else "FAIL"),
+    ]
+    for label, value in agg_rows:
+        agg_table.add_row(label, value)
+    console.print(agg_table)
+
+    # Headline WFE verdict.
+    wfe_str = "n/a (undefined IS return)" if agg_wfe is None else f"{agg_wfe:.2f}"
+    if status_label == "FAIL":
+        style = "bold red"
+        verdict = (
+            f"WFE = {wfe_str} — FAIL (< {WFE_FAIL_THRESHOLD}): "
+            "treat as overfit / regime-bound."
+        )
+    elif status_label == "ROBUST":
+        style = "bold green"
+        verdict = f"WFE = {wfe_str} — ROBUST (>= {WFE_ROBUST_THRESHOLD})."
+    elif status_label == "PASS":
+        style = "yellow"
+        verdict = (
+            f"WFE = {wfe_str} — PASS (>= {WFE_FAIL_THRESHOLD}) but not yet "
+            f"robust (< {WFE_ROBUST_THRESHOLD})."
+        )
+    else:
+        style = "bold red"
+        verdict = (
+            f"WFE = {wfe_str} — UNDEFINED: no fold had a positive in-sample "
+            "return, so edge survival cannot be judged."
+        )
+    if not trade_gate_pass:
+        verdict += (
+            f"\nWARNING: only {num_oos_trades} pooled OOS trades (< 30) — "
+            "per-trade conclusions are statistically unreliable."
+        )
+    console.print(Panel(Text(verdict, style=style), title="Walk-Forward Efficiency"))
+    console.print(Text(SURVIVORSHIP_CAVEAT, style="yellow"))
+
+    return {
+        "aggregate_wfe": agg_wfe,
+        "wfe_status": status_label,
+        "wfe_pass": wfe_pass,
+        "num_oos_trades": num_oos_trades,
+        "oos_trade_gate_pass": trade_gate_pass,
+        "oos_per_trade_tstat": oos_tstat,
+        "num_folds": len(folds),
+    }
+
+
 def compare_ai_value_add(
     screener_metrics: dict,
     ai_metrics: dict,

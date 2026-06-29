@@ -1921,3 +1921,104 @@ class TestRollingWalkForward:
         cfg = BacktestConfig(tickers=["AAPL"], start_date="", end_date="2024-01-01")
         with pytest.raises(ValueError):
             rolling_walk_forward(cfg)
+
+
+# ---------------------------------------------------------------------------
+# Plan 02-03 Task 2: walk-forward report — degradation + WFE<0.5 fail flag
+# ---------------------------------------------------------------------------
+
+def _fake_fold(index, is_ann, oos_ann, wfe, oos_trades):
+    """Minimal stand-in for a WalkForwardFold (display reads attrs only)."""
+    from types import SimpleNamespace
+    return SimpleNamespace(
+        index=index,
+        out_of_sample_start=date(2022, 1, 1),
+        out_of_sample_end=date(2022, 12, 31),
+        in_sample_metrics={"annualized_return_pct": is_ann, "sharpe_ratio": 1.0},
+        out_of_sample_metrics={
+            "annualized_return_pct": oos_ann, "sharpe_ratio": 0.5,
+            "num_trades": oos_trades,
+        },
+        degradation={"total_return_pct": oos_ann - is_ann},
+        wfe=wfe,
+    )
+
+
+def _fake_wf_result(agg_wfe, oos_trades_list, fold_wfes=(0.8,)):
+    """Stand-in for a RollingWalkForwardResult for display tests."""
+    from types import SimpleNamespace
+    folds = [_fake_fold(i, 20.0, 16.0, w, 30) for i, w in enumerate(fold_wfes)]
+    agg_metrics = {
+        "total_return_pct": 12.0, "annualized_return_pct": 10.0,
+        "sharpe_ratio": 0.9, "max_drawdown_pct": 8.0,
+        "win_rate_pct": 55.0, "num_trades": len(oos_trades_list),
+    }
+    return SimpleNamespace(
+        folds=folds,
+        aggregate_oos_trades=oos_trades_list,
+        aggregate_oos_equity=[],
+        aggregate_oos_metrics=agg_metrics,
+        aggregate_wfe=agg_wfe,
+        is_days=252, oos_days=252, step_days=252,
+    )
+
+
+class TestWalkForwardReport:
+    """display_walk_forward: WFE fail/pass flagging + pooled-OOS stats."""
+
+    def _trades(self, n):
+        # Varied pnls so the per-trade t-stat has non-degenerate variance.
+        return [_make_trade(5.0 + (i % 3), datetime(2022, 1, 1) + timedelta(days=i))
+                for i in range(n)]
+
+    def test_wfe_below_half_is_flagged_fail(self):
+        from backtest.report import display_walk_forward
+        result = _fake_wf_result(0.3, self._trades(35), fold_wfes=(0.3,))
+        status = display_walk_forward(result)
+        assert status["wfe_status"] == "FAIL"
+        assert status["wfe_pass"] is False
+
+    def test_wfe_above_robust_bar_is_pass(self):
+        from backtest.report import display_walk_forward
+        result = _fake_wf_result(0.8, self._trades(35), fold_wfes=(0.8,))
+        status = display_walk_forward(result)
+        assert status["wfe_pass"] is True
+        assert status["wfe_status"] == "ROBUST"
+
+    def test_wfe_mid_band_passes_but_not_robust(self):
+        from backtest.report import display_walk_forward
+        result = _fake_wf_result(0.6, self._trades(35), fold_wfes=(0.6,))
+        status = display_walk_forward(result)
+        assert status["wfe_status"] == "PASS"
+        assert status["wfe_pass"] is True
+
+    def test_undefined_wfe_is_not_a_pass(self):
+        from backtest.report import display_walk_forward
+        result = _fake_wf_result(None, self._trades(35), fold_wfes=(None,))
+        status = display_walk_forward(result)
+        assert status["wfe_status"] == "UNDEFINED"
+        assert status["wfe_pass"] is False
+
+    def test_trade_gate_and_tstat_surfaced(self):
+        from backtest.report import display_walk_forward
+        result = _fake_wf_result(0.8, self._trades(35), fold_wfes=(0.8, 0.9))
+        status = display_walk_forward(result)
+        assert status["num_oos_trades"] == 35
+        assert status["oos_trade_gate_pass"] is True      # >= 30 trades
+        assert status["num_folds"] == 2
+        assert isinstance(status["oos_per_trade_tstat"], float)
+
+    def test_thin_oos_sample_fails_trade_gate(self):
+        from backtest.report import display_walk_forward
+        result = _fake_wf_result(0.8, self._trades(6), fold_wfes=(0.8,))
+        status = display_walk_forward(result)
+        assert status["num_oos_trades"] == 6
+        assert status["oos_trade_gate_pass"] is False     # < 30 trades
+
+    def test_status_classifier_pure_function(self):
+        from backtest.report import walk_forward_wfe_status
+        assert walk_forward_wfe_status(0.3) == ("FAIL", False)
+        assert walk_forward_wfe_status(0.49) == ("FAIL", False)
+        assert walk_forward_wfe_status(0.5) == ("PASS", True)
+        assert walk_forward_wfe_status(0.7) == ("ROBUST", True)
+        assert walk_forward_wfe_status(None) == ("UNDEFINED", False)
