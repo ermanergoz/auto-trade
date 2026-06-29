@@ -17,6 +17,7 @@ from core.risk import (
     check_excluded_sector,
     check_analyst_consensus,
     check_pdt_restriction,
+    check_intraday_margin,
     calculate_position_size,
     evaluate,
 )
@@ -1937,6 +1938,203 @@ class TestPDTRestrictionInEvaluate:
         assert not any("pdt" in r.lower() for r in result.reasons)
 
 
+# ---------------------------------------------------------------------------
+# Intraday-margin framework (post-2026-06-04) tests
+# ---------------------------------------------------------------------------
+
+class TestIntradayMargin:
+    """check_intraday_margin(signal, portfolio_value, position_size, regime,
+    has_uncured_deficit) — the post-2026-06-04 replacement for the eliminated
+    PDT day-trade gate. Three entry-only rejections: Reg-T minimum, 25%
+    intraday maintenance margin, and an uncured intraday-margin deficit.
+    """
+
+    def test_rejects_below_reg_t_minimum(self):
+        """Account equity below REG_T_MIN_EQUITY_USD blocks new entries."""
+        sig = _make_signal(ticker="QUBT", action=Action.BUY, entry_price=10.0)
+        ok, reason = check_intraday_margin(
+            sig, portfolio_value=1500.0, position_size=10,
+            regime="intraday", has_uncured_deficit=False,
+        )
+        assert ok is False
+        assert "reg-t" in reason.lower() or "intraday margin" in reason.lower()
+
+    def test_rejects_when_maintenance_margin_exceeds_equity(self):
+        """A position whose 25% maintenance margin exceeds equity is rejected.
+
+        entry 100 * size 200 * 25% = $5,000 maintenance margin > $3,000 equity.
+        """
+        sig = _make_signal(ticker="QUBT", action=Action.BUY, entry_price=100.0)
+        ok, reason = check_intraday_margin(
+            sig, portfolio_value=3000.0, position_size=200,
+            regime="intraday", has_uncured_deficit=False,
+        )
+        assert ok is False
+        assert "maintenance margin" in reason.lower()
+
+    def test_rejects_uncured_deficit(self):
+        """An uncured intraday-margin deficit blocks new entries (90-day guard)."""
+        sig = _make_signal(ticker="QUBT", action=Action.BUY, entry_price=10.0)
+        ok, reason = check_intraday_margin(
+            sig, portfolio_value=50_000.0, position_size=10,
+            regime="intraday", has_uncured_deficit=True,
+        )
+        assert ok is False
+        assert "deficit" in reason.lower()
+
+    def test_passes_normal_entry(self):
+        """Adequate equity, modest margin, no deficit → pass."""
+        sig = _make_signal(ticker="QUBT", action=Action.BUY, entry_price=100.0)
+        ok, reason = check_intraday_margin(
+            sig, portfolio_value=100_000.0, position_size=100,
+            regime="intraday", has_uncured_deficit=False,
+        )
+        assert ok is True
+        assert reason == ""
+
+    def test_legacy_regime_skips_intraday_checks(self):
+        """Under regime='legacy_pdt' the intraday guard is a pass-through even
+        when equity is below the Reg-T minimum (the legacy counter runs instead).
+        """
+        sig = _make_signal(ticker="QUBT", action=Action.BUY, entry_price=10.0)
+        ok, _ = check_intraday_margin(
+            sig, portfolio_value=100.0, position_size=10,
+            regime="legacy_pdt", has_uncured_deficit=True,
+        )
+        assert ok is True
+
+    def test_evaluate_blocks_entry_below_reg_t_minimum(self):
+        """evaluate() rejects a new BUY when equity is under the Reg-T minimum."""
+        sig = _make_signal(
+            ticker="QUBT", action=Action.BUY, trade_type=TradeType.SWING,
+            entry_price=10.0, stop_loss=9.5, take_profit=11.0,
+        )
+        sig.indicator_values.update({"MA5": 10.5, "MA10": 10.2, "MA20": 10.0})
+        result = evaluate(
+            sig, [], portfolio_value=1500.0, daily_pnl=0.0,
+            current_price=10.0, **_BULLISH_CONSENSUS,
+        )
+        assert result.approved is False
+        assert any("intraday margin" in r.lower() for r in result.reasons)
+
+    def test_evaluate_blocks_entry_under_uncured_deficit(self):
+        """evaluate() rejects a new BUY when an uncured deficit is flagged."""
+        sig = _make_signal(
+            ticker="QUBT", action=Action.BUY, trade_type=TradeType.SWING,
+            entry_price=10.0, stop_loss=9.5, take_profit=11.0,
+        )
+        sig.indicator_values.update({"MA5": 10.5, "MA10": 10.2, "MA20": 10.0})
+        result = evaluate(
+            sig, [], portfolio_value=50_000.0, daily_pnl=0.0,
+            current_price=10.0, has_uncured_intraday_deficit=True,
+            **_BULLISH_CONSENSUS,
+        )
+        assert result.approved is False
+        assert any("deficit" in r.lower() for r in result.reasons)
+
+    def test_evaluate_allows_exit_under_uncured_deficit(self):
+        """The SAME uncured-deficit flag must NOT block an exit (SELL closing a
+        held long). The intraday guard is entry-only — exits are never trapped.
+        """
+        sig = _make_signal(
+            ticker="AAPL", action=Action.SELL,
+            entry_price=150.0, stop_loss=155.0, take_profit=140.0,
+        )
+        positions = [_make_position(ticker="AAPL", quantity=10)]
+        result = evaluate(
+            sig, positions, portfolio_value=50_000.0, daily_pnl=0.0,
+            current_price=150.0, has_uncured_intraday_deficit=True,
+        )
+        assert result.is_exit is True
+        assert not any("intraday margin" in r.lower() for r in result.reasons)
+        assert not any("deficit" in r.lower() for r in result.reasons)
+        assert result.approved is True
+
+
+class TestMarginRegime:
+    """MARGIN_REGIME must degrade safely across legacy_pdt / intraday / both."""
+
+    def _swing_buy(self):
+        sig = _make_signal(
+            ticker="QUBT", action=Action.BUY, trade_type=TradeType.SWING,
+            entry_price=10.0, stop_loss=9.5, take_profit=11.0,
+        )
+        sig.indicator_values.update({"MA5": 10.5, "MA10": 10.2, "MA20": 10.0})
+        return sig
+
+    def test_intraday_regime_runs_only_intraday_guard(self):
+        """regime='intraday': sub-Reg-T equity is blocked by the intraday guard,
+        and the legacy day-trade counter does NOT fire (no 'PDT' reason)."""
+        now = datetime.now(timezone.utc)
+        prior_day_trade = _make_trade(
+            ticker="PRIOR",
+            entry_time=now - timedelta(days=1, hours=2),
+            exit_time=now - timedelta(days=1),
+        )
+        result = evaluate(
+            self._swing_buy(), [], portfolio_value=1500.0, daily_pnl=0.0,
+            current_price=10.0, recent_trades=[prior_day_trade],
+            margin_regime="intraday", **_BULLISH_CONSENSUS,
+        )
+        assert any("intraday margin" in r.lower() for r in result.reasons)
+        assert not any("pdt" in r.lower() for r in result.reasons)
+
+    def test_legacy_regime_runs_only_legacy_counter(self):
+        """regime='legacy_pdt': the legacy counter fires on a prior day trade,
+        and the intraday guard does NOT run (no 'intraday margin' reason)."""
+        now = datetime.now(timezone.utc)
+        prior_day_trade = _make_trade(
+            ticker="PRIOR",
+            entry_time=now - timedelta(days=1, hours=2),
+            exit_time=now - timedelta(days=1),
+        )
+        # Equity below the Reg-T minimum would trip the intraday guard if it ran;
+        # under legacy_pdt it must not, while the legacy PDT counter blocks.
+        result = evaluate(
+            self._swing_buy(), [], portfolio_value=1500.0, daily_pnl=0.0,
+            current_price=10.0, recent_trades=[prior_day_trade],
+            margin_regime="legacy_pdt", **_BULLISH_CONSENSUS,
+        )
+        assert any("pdt" in r.lower() or "day trade" in r.lower() for r in result.reasons)
+        assert not any("intraday margin" in r.lower() for r in result.reasons)
+
+    def test_both_regime_runs_both_guards(self):
+        """regime='both': both the intraday guard and the legacy counter fire."""
+        now = datetime.now(timezone.utc)
+        prior_day_trade = _make_trade(
+            ticker="PRIOR",
+            entry_time=now - timedelta(days=1, hours=2),
+            exit_time=now - timedelta(days=1),
+        )
+        result = evaluate(
+            self._swing_buy(), [], portfolio_value=1500.0, daily_pnl=0.0,
+            current_price=10.0, recent_trades=[prior_day_trade],
+            margin_regime="both", **_BULLISH_CONSENSUS,
+        )
+        assert any("intraday margin" in r.lower() for r in result.reasons)
+        assert any("pdt" in r.lower() or "day trade" in r.lower() for r in result.reasons)
+
+
+class TestNoLegacy5kThresholdBranch:
+    """Regression guard for MGN-01: the eliminated $5,000 PDT gate must not
+    survive as a live code branch anywhere in core/risk.py."""
+
+    def test_no_legacy_5k_threshold_branch(self):
+        from pathlib import Path
+        import core.risk as risk_mod
+
+        source = Path(risk_mod.__file__).read_text()
+        # Strip full-line comments (mirrors the acceptance grep
+        # `grep -v '^[[:space:]]*#'`), then assert the literal is absent.
+        executable = "\n".join(
+            line for line in source.splitlines()
+            if not line.lstrip().startswith("#")
+        )
+        assert "5000" not in executable, (
+            "Eliminated $5,000 PDT threshold still present in executable code"
+        )
+
+
 class TestDailyLossLimitBaseline:
     """Daily loss limit must use start-of-day equity as the denominator, not
     current (post-loss) equity. Using current equity causes the limit dollar
@@ -2024,3 +2222,65 @@ class TestSectorConcentrationMissingSector:
             "sector" in rec.message.lower() and "xyz" in rec.message.lower()
             for rec in caplog.records
         ), "Expected WARNING about missing sector for XYZ"
+
+
+class TestSizingBinding:
+    """RSK-01: 15% size cap controls concentration; min(size, risk) governs."""
+
+    def test_size_cap_binds_for_tight_stop(self):
+        # ~3% stop -> risk-based qty is huge, so the 15% size cap binds.
+        sig = _make_signal(entry_price=150.0, stop_loss=145.5)
+        qty = calculate_position_size(sig, 100_000)  # default max_pct=15
+        assert qty * sig.entry_price <= 100_000 * 0.15 + 1e-6
+        assert qty == int(100_000 * 0.15 / 150.0)
+
+    def test_risk_per_trade_binds_for_wide_stop(self):
+        # Wide stop (> entry/3) -> RISK_PER_TRADE_PCT is the binding constraint.
+        from config.settings import RISK_PER_TRADE_PCT
+        sig = _make_signal(entry_price=150.0, stop_loss=90.0)  # $60 stop
+        qty = calculate_position_size(sig, 100_000)
+        expected_risk_qty = int((100_000 * RISK_PER_TRADE_PCT / 100) / 60.0)
+        assert qty == expected_risk_qty
+
+
+class TestPortfolioHeat:
+    """RSK-02: entry-only aggregate-risk cap that never blocks exits."""
+
+    def test_rejects_when_heat_exceeds_cap(self):
+        from core.risk import check_portfolio_heat
+        sig = _make_signal(entry_price=100.0, stop_loss=90.0)
+        # existing open risk = $50 stop * 100 sh = $5000
+        positions = [_make_position(entry_price=100.0, stop_loss=50.0, quantity=100)]
+        # new risk = $10 * 200 = $2000 -> total $7000 > 6% of $100k ($6000)
+        ok, reason = check_portfolio_heat(sig, positions, 100_000, position_size=200)
+        assert ok is False
+        assert "heat" in reason.lower()
+
+    def test_passes_within_cap(self):
+        from core.risk import check_portfolio_heat
+        sig = _make_signal(entry_price=100.0, stop_loss=90.0)
+        ok, _ = check_portfolio_heat(sig, [], 100_000, position_size=50)  # $500 < $6000
+        assert ok is True
+
+    def test_zero_portfolio_value(self):
+        from core.risk import check_portfolio_heat
+        sig = _make_signal(entry_price=100.0, stop_loss=90.0)
+        ok, _ = check_portfolio_heat(sig, [], 0, position_size=10)
+        assert ok is False
+
+    def test_evaluate_rejects_entry_over_heat(self):
+        # Pre-existing open risk already exceeds the 6% cap -> new BUY rejected by heat.
+        sig = _make_signal(ticker="AAPL", entry_price=100.0, stop_loss=95.0)
+        positions = [_make_position(ticker="MSFT", entry_price=100.0, stop_loss=30.0, quantity=100)]  # $7000 risk
+        result = evaluate(sig, positions, 100_000, 0, **_BULLISH_CONSENSUS)
+        assert result.approved is False
+        assert any("heat" in r.lower() for r in result.reasons)
+
+    def test_evaluate_exit_not_blocked_by_heat(self):
+        # Held long + SELL exit must be approved even when open heat exceeds the cap.
+        pos = _make_position(ticker="AAPL", entry_price=100.0, stop_loss=30.0, quantity=100)  # $7000 risk
+        # Coherent SELL (stop above entry, target below) so only the exit/heat path is under test.
+        sig = _make_signal(ticker="AAPL", action=Action.SELL, entry_price=100.0,
+                           stop_loss=105.0, take_profit=90.0)
+        result = evaluate(sig, [pos], 100_000, 0, **_BULLISH_CONSENSUS)
+        assert result.approved is True

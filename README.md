@@ -1,6 +1,6 @@
 # Auto Trade
 
-An automated stock trading system that day-trades and swing-trades US (NYSE/NASDAQ) equities through Interactive Brokers. The system uses a two-stage pipeline: a fast technical screener filters hundreds of stocks, then an AI analyst (Gemini primary with Ollama as automatic fallback) performs deep analysis on all qualifying candidates. A risk manager gates every trade before execution through IBKR.
+An automated stock trading system that trades US (NYSE/NASDAQ) equities through Interactive Brokers (swing trading by default; day trading is gated behind `DAY_TRADE_ENABLED`, which defaults to false). The system uses a two-stage pipeline: a fast technical screener filters hundreds of stocks, then an AI analyst (Gemini primary with Ollama as automatic fallback) performs deep analysis on all qualifying candidates. A risk manager gates every trade before execution through IBKR.
 
 Financial sector stocks (banks, insurance, lending companies) and defense/military stocks (weapons, ammunition, combat systems) are automatically excluded from all trading.
 
@@ -38,7 +38,7 @@ Financial sector stocks (banks, insurance, lending companies) and defense/milita
 - **AI-powered analysis**: Gemini (primary) for fast, capable cloud-based reasoning; Ollama + Qwen 2.5 7B (fallback) for resilience when Gemini is unavailable, rate-limited, or unconfigured
 - **Comprehensive risk management**: 14 risk checks including position sizing, daily loss limits, sector concentration limits, mandatory stop-losses, duplicate position prevention, defense/financial sector exclusion, circuit breaker, and a two-source analyst consensus gate (yfinance + IBKR Reuters) that requires both to agree on buy/strong_buy. Exit signals bypass discipline checks so positions can always be closed
 - **Bracket order execution**: Automatic stop-loss and take-profit orders attached to every trade via IBKR bracket orders
-- **Day and swing trading**: Automatic end-of-day position closing for day trades, trailing stops for swing trades
+- **Swing-first trading**: Swing trading is the default cadence (`DEFAULT_TRADE_TYPE = "swing"`); day trading is gated behind `DAY_TRADE_ENABLED` (default false) and will be evaluated by the Phase-2 backtest harness out-of-sample. End-of-day auto-close applies only when the day-trade path is enabled
 - **Backtesting engine**: Replay historical data through the exact same strategy code with configurable slippage and commission modeling
 - **Real-time notifications**: Telegram bot alerts for trades, daily summaries, risk warnings, and system errors
 - **Rich terminal dashboard**: Live position tracking, P&L display, scan results, and portfolio summary using Rich
@@ -382,7 +382,8 @@ All trading parameters are configured in `config/settings.py`. Key settings:
 #### Risk Settings
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `MAX_POSITION_SIZE_PCT` | `5.0` | Max portfolio % per position |
+| `MAX_POSITION_SIZE_PCT` | `15.0` | Hard ceiling on portfolio % per position; `RISK_PER_TRADE_PCT` is the primary sizing control |
+| `MAX_PORTFOLIO_HEAT_PCT` | `6.0` | Entry-only cap on total open at-risk capital as % of equity; exits are never blocked |
 | `DAILY_LOSS_LIMIT_PCT` | `2.0` | Daily loss % that halts trading |
 | `MAX_OPEN_POSITIONS` | `10` | Maximum concurrent positions |
 | `DEFAULT_STOP_LOSS_PCT` | `3.0` | Default stop-loss percentage |
@@ -391,6 +392,9 @@ All trading parameters are configured in `config/settings.py`. Key settings:
 | `CIRCUIT_BREAKER_LOSSES` | `3` | Consecutive losses to pause trading |
 | `CIRCUIT_BREAKER_WINDOW_MIN` | `60` | Time window (minutes) for circuit breaker |
 | `STALE_ORDER_MINUTES` | `1440` | Re-screen unfilled orders after N minutes (24h) |
+| `REG_T_MIN_EQUITY_USD` | `2000.0` | Reg-T minimum equity to trade on margin ($2,000 threshold) |
+| `INTRADAY_MAINTENANCE_MARGIN_PCT` | `25.0` | Intraday maintenance margin floor (25%) |
+| `MARGIN_REGIME` | `"both"` | Active margin model: `"intraday"` \| `"legacy_pdt"` \| `"both"` (default `"both"` during broker phase-in through 2027-10-20) |
 
 #### Technical Indicator Settings
 | Parameter | Default | Description |
@@ -407,10 +411,12 @@ All trading parameters are configured in `config/settings.py`. Key settings:
 | `BB_STD` | `2.0` | Bollinger Band standard deviations |
 | `VOLUME_SPIKE_MULTIPLIER` | `2.0` | Volume spike threshold (x avg) |
 
-#### Day Trading Settings
+#### Trade Type & Day-Trade Settings
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `CLOSE_DAY_TRADES_BEFORE_MARKET_CLOSE` | `True` | Auto-close day trades |
+| `DEFAULT_TRADE_TYPE` | `"swing"` | Default trade cadence: `"swing"` (hold overnight) or `"day"` |
+| `DAY_TRADE_ENABLED` | `False` | Enable day-trading path; when false all signals default to SWING |
+| `CLOSE_DAY_TRADES_BEFORE_MARKET_CLOSE` | `True` | Auto-close day trades (applies only when `DAY_TRADE_ENABLED` is True) |
 | `CLOSE_MINUTES_BEFORE` | `15` | Minutes before close to start closing |
 
 ---
@@ -591,7 +597,8 @@ Every trade must pass through **all 15 risk checks** before execution (10 core c
 | Check | Rule | Default |
 |-------|------|---------|
 | **Short Selling Block** | Sell signals for stocks not currently held are blocked | Blocked (configurable) |
-| **Position Size** | Single position cannot exceed X% of portfolio value | 50% |
+| **Position Size** | Single position cannot exceed X% of portfolio value | 15% |
+| **Portfolio Heat** | Total open at-risk capital cannot exceed X% of equity on new entries (exits are never blocked) | 6% |
 | **Daily Loss Limit** | Halt all trading if daily P&L drops below -X% | 10% |
 | **Max Open Positions** | Cannot exceed N concurrent open positions | 3 |
 | **Stop-Loss Required** | Every trade must have a valid stop-loss order | Required |
@@ -622,8 +629,10 @@ IBKR's `TotalCashValue` does not decrement while parent BUY orders are unfilled,
 ### Position Sizing
 
 Position size is calculated using the more conservative of two methods:
-1. **Max position method**: `portfolio_value * MAX_POSITION_SIZE_PCT / entry_price`
-2. **Risk-based method**: `(portfolio_value * RISK_PER_TRADE_PCT%) / (entry_price - stop_loss)` -- limits risk to 5% of portfolio per trade using stop-loss distance (default; was 1% for larger accounts)
+1. **Max position method**: `portfolio_value * MAX_POSITION_SIZE_PCT / entry_price` (hard ceiling at 15%)
+2. **Risk-based method**: `(portfolio_value * RISK_PER_TRADE_PCT%) / (entry_price - stop_loss)` -- the primary sizing control; limits risk to a configurable % of portfolio per trade using stop-loss distance
+
+A separate `MAX_PORTFOLIO_HEAT_PCT` (6%) cap limits total open at-risk capital across all positions on new entries. When all open positions' combined stop-loss risk already exceeds 6% of equity, new entries are blocked. Exits are never blocked by this cap.
 
 When volatility scaling is enabled (`use_volatility_scaling` in backtest config, or passing `volatility` to `evaluate()`), position sizes are scaled inversely to realized volatility. High volatility → smaller positions, low volatility → base size (never increases beyond base to avoid leverage). In the backtest, volatility is computed per candidate from that ticker's own historical close series so each signal is sized by its own vol regime rather than a single market-wide proxy. The baseline annualized volatility is configurable via `VOLATILITY_BASELINE` (default: 20%).
 
@@ -918,7 +927,7 @@ This system is designed with multiple layers of safety:
 
 4. **Daily loss limit** -- If the portfolio's daily P&L (realized + unrealized) drops below -2% (configurable), all trading is automatically halted for the remainder of the day.
 
-5. **Position size limits** -- No single position can exceed 5% of portfolio value (configurable). Position sizing also accounts for stop-loss distance to limit risk to 1% of portfolio per trade.
+5. **Position size limits** -- No single position can exceed 15% of portfolio value (`MAX_POSITION_SIZE_PCT`; hard ceiling). The primary sizing control is `RISK_PER_TRADE_PCT`, which limits risk to a configurable percentage of portfolio per trade based on stop-loss distance. A separate `MAX_PORTFOLIO_HEAT_PCT` (6%) cap limits total open at-risk capital across all positions on new entries; exits are never blocked by this cap.
 
 6. **Sector concentration limits** -- No single sector can exceed 25% of the portfolio, preventing over-concentration.
 
@@ -950,13 +959,13 @@ This system is designed with multiple layers of safety:
 
 16. **Two-source analyst consensus gate** -- Before buying, the bot fetches analyst consensus from **two independent sources** and requires both to agree on `buy` or `strong_buy` before letting the trade through. Source one: yfinance's `recommendations_summary` (Yahoo's republished sell-side ratings). Source two: IBKR's Reuters/Refinitiv RESC report (`reqFundamentalData(stock, 'RESC')`, the `<ConsRecom>` 1.0–5.0 mean rating mapped to the same vocabulary — `<1.5` strong_buy, `<2.5` buy, `<3.5` hold, `<4.5` sell, else strong_sell). If either source returns `hold`/`sell`/`strong_sell` — or returns no data at all — the BUY is blocked. Both sources cached 24 h. Controlled by `CHECK_ANALYST_CONSENSUS` setting. Treating "missing data" as a block is intentional: when only one source has an opinion, two-source agreement cannot be confirmed, and small-cap/newly-listed coverage is exactly where the worst losing entries cluster. Requires the IBKR Reuters Fundamentals subscription on the connected account; without it, BUYs will be blocked.
 
-17. **PDT (Pattern Day Trader) protection** -- IBKR restricts accounts with Liquid Net Worth below `PDT_PROTECTION_THRESHOLD_USD` (default $5,000) to closing-orders-only for 30 days once 2 day trades occur within a rolling 5-business-day window. When the portfolio is at or above the threshold, this check is a pass-through. Below it, two guards run in sequence: (a) any new entry with `trade_type=DAY` is rejected outright because `close_all_day_trades` will force-close it at market close, guaranteeing a day trade — sub-threshold accounts cannot afford a guaranteed round-trip when only one day-trade slot separates them from IBKR's 30-day lockout; (b) for SWING entries and same-day exits, the bot counts same-calendar-day round-trip trades in the last 5 business days and blocks any signal that would push the count to `PDT_MAX_DAY_TRADES_PER_5_DAYS` (default 1 — one less than IBKR's trigger of 2). Exits of positions opened on a prior day are never blocked so swing positions can always be closed. The scheduler queries the full 7-calendar-day window when fetching trades so the rolling count reflects day trades from earlier in the week, not just today.
+17. **Intraday-margin protection** -- The FINRA PDT rule was eliminated 2026-06-04. The system now guards against uncured intraday-margin deficits (which can trigger a 90-day broker restriction) instead. Two margin parameters are enforced on new entries: `REG_T_MIN_EQUITY_USD` ($2,000 — Reg-T minimum equity to trade on margin) and `INTRADAY_MAINTENANCE_MARGIN_PCT` (25% — intraday maintenance margin floor). New entries that would cause or leave uncured intraday-margin deficits are blocked. The `MARGIN_REGIME` env flag (`intraday` | `legacy_pdt` | `both`) selects the active margin model during the broker phase-in period (default `both` through 2027-10-20; set to `intraday` once the IBKR account's new regime is confirmed). Under `legacy_pdt` or `both` regimes, the legacy `LEGACY_PDT_THRESHOLD_USD` ($25,000) gate also remains active.
 
 18. **Parabolic breakout filter** -- Tickers whose latest close is more than `MAX_EXTENSION_OVER_MA20_PCT` (default **15%**, tightened from 20%) above their 20-day moving average are dropped from the screener candidate pool before scoring. This prevents late entries into already-extended moves where confluent BUY indicators would otherwise convince the AI analyst to approve the trade. 15% comes from the 2026-04-28 6-month sweep (`data/sweep_extension_pct_2026-04-28.csv`): 66.7% win rate at 15% vs 50% at 20%, +8.32% return vs ~breakeven, max drawdown unchanged. Trades in the 16–20% band were systematically losers (avg ~+$8/trade at 20% vs +$1500/trade at 15%).
 
 19. **Exit-signal routing** -- When the risk manager approves a signal that closes an existing position (SELL on held long, BUY on held short), the executor places a single market close order instead of a bracket. A bracket's take-profit and stop-loss children stay live at IBKR after the parent closes the position — when price later crosses either child's trigger, those orders re-enter the ticker in the opposite direction. Routing exits through a plain market close eliminates this tail risk. Exits also size to the existing holding's absolute quantity, never to a freshly-calculated new-entry size (which could flip a long into a net short).
 
-20. **Entry-only risk gates for exits** -- Cumulative risk, sector concentration, and excluded-sector/ticker checks apply only to new entries. An exit REDUCES open risk, sector exposure, and excluded-ticker exposure — blocking it because the existing position trips those gates would trap the trader in a losing position or in legacy holdings in newly-excluded sectors. Safety gates that apply to BOTH entries and exits: daily loss limit, stop-loss coherence, max positions, no-duplicate, circuit breaker, and PDT.
+20. **Entry-only risk gates for exits** -- Cumulative risk, sector concentration, portfolio heat, and excluded-sector/ticker checks apply only to new entries. An exit REDUCES open risk, sector exposure, and excluded-ticker exposure — blocking it because the existing position trips those gates would trap the trader in a losing position or in legacy holdings in newly-excluded sectors. Safety gates that apply to BOTH entries and exits: daily loss limit, stop-loss coherence, max positions, no-duplicate, circuit breaker, and intraday-margin.
 
 ---
 

@@ -28,6 +28,21 @@ def test_signal_creation():
     assert sig.indicator_values == {}
 
 
+def test_signal_defaults_to_swing():
+    # Swing is the default cadence (cost/edge); day-trading is opt-in via config.
+    sig = Signal(
+        ticker="X",
+        action=Action.BUY,
+        confidence=1,
+        entry_price=1,
+        stop_loss=0.9,
+        take_profit=1.2,
+        reasoning="",
+        source="screener",
+    )
+    assert sig.trade_type is TradeType.SWING
+
+
 def test_position_pnl():
     pos = Position(
         ticker="MSFT",
