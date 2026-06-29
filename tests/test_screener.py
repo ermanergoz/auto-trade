@@ -15,6 +15,9 @@ from core.screener import (
     analyze_stock,
     score_candidate,
     screen_stocks,
+    dow_trend,
+    DowTrend,
+    DowResult,
 )
 
 
@@ -52,6 +55,16 @@ def _trending_down(n: int = 60, start: float = 200.0, step: float = 0.5) -> list
 def _flat(n: int = 60, price: float = 100.0) -> list[float]:
     """Generate a flat series."""
     return [price] * n
+
+
+def _zigzag(points: list[float], seg: int = 5) -> list[float]:
+    """Build a zigzag close series that interpolates `seg` bars between each
+    turning point. The turning points become confirmed swing highs/lows."""
+    out: list[float] = []
+    for a, b in zip(points, points[1:]):
+        out.extend(list(np.linspace(a, b, seg, endpoint=False)))
+    out.append(points[-1])
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -614,3 +627,85 @@ class TestExtensionGuard:
             "extension guard (it is in the loss-clustered 16–20% band). "
             f"Got: {[(s.ticker, s.action) for s in signals]}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Dow / market-structure classifier (DOW-01)
+# ---------------------------------------------------------------------------
+
+class TestDowTrend:
+    """dow_trend is a PURE, symbol-agnostic swing-structure classifier:
+    HH/HL -> UPTREND, LH/LL -> DOWNTREND, mixed/flat -> RANGE, plus
+    break-of-structure detection. It must never raise."""
+
+    def test_monotonic_up_is_uptrend(self):
+        result = dow_trend(pd.Series(_trending_up(60, 100, 0.5)))
+        assert isinstance(result, DowResult)
+        assert result.trend is DowTrend.UPTREND
+        assert result.break_of_structure is False
+
+    def test_monotonic_down_is_downtrend(self):
+        result = dow_trend(pd.Series(_trending_down(60, 200, 0.5)))
+        assert result.trend is DowTrend.DOWNTREND
+        assert result.break_of_structure is False
+
+    def test_zigzag_uptrend(self):
+        # Higher swing highs (110, 120, 130) AND higher swing lows (105, 112).
+        closes = _zigzag([100, 110, 105, 120, 112, 130])
+        result = dow_trend(pd.Series(closes))
+        assert result.trend is DowTrend.UPTREND
+        assert result.break_of_structure is False
+
+    def test_zigzag_downtrend(self):
+        # Lower swing highs (122, 112) AND lower swing lows (115, 105, 95).
+        closes = _zigzag([130, 115, 122, 105, 112, 95])
+        result = dow_trend(pd.Series(closes))
+        assert result.trend is DowTrend.DOWNTREND
+        assert result.break_of_structure is False
+
+    def test_flat_series_is_range(self):
+        result = dow_trend(pd.Series(_flat(60, 100.0)))
+        assert result.trend is DowTrend.RANGE
+        assert result.break_of_structure is False
+
+    def test_broadening_chop_is_range(self):
+        # Higher highs but lower lows (expanding) -> mixed structure -> RANGE.
+        closes = _zigzag([100, 110, 98, 113, 94, 115, 92])
+        result = dow_trend(pd.Series(closes))
+        assert result.trend is DowTrend.RANGE
+
+    def test_break_of_structure_flips_uptrend_to_downtrend(self):
+        # Establish an uptrend (HH/HL) with a confirmed last swing low ~116,
+        # then a final bar that plunges below it -> break_of_structure.
+        closes = _zigzag([100, 110, 104, 118, 110, 124, 116, 121]) + [105.0]
+        result = dow_trend(pd.Series(closes))
+        assert result.break_of_structure is True
+        assert result.trend is DowTrend.DOWNTREND
+
+    def test_too_short_series_is_range_never_raises(self):
+        # Fewer bars than the swing lookback -> RANGE, BOS False, no exception.
+        result = dow_trend(pd.Series([100.0, 101.0, 99.0, 102.0, 98.0]))
+        assert result.trend is DowTrend.RANGE
+        assert result.break_of_structure is False
+
+    def test_empty_series_is_range(self):
+        result = dow_trend(pd.Series([], dtype=float))
+        assert result.trend is DowTrend.RANGE
+        assert result.break_of_structure is False
+
+    def test_handles_nan_without_raising(self):
+        closes = _trending_up(40, 100, 0.5)
+        closes[5] = float("nan")
+        closes[20] = float("nan")
+        result = dow_trend(pd.Series(closes))
+        assert result.trend is DowTrend.UPTREND
+
+    def test_symbol_agnostic_stock_vs_index(self):
+        # Identical shape at small-cap scale (~$15) and index scale (~$500).
+        base = _zigzag([100, 110, 104, 118, 110, 124, 116, 121]) + [105.0]
+        small_cap = pd.Series([c * 0.15 for c in base])     # ~ $15
+        index_like = pd.Series([c * 5.0 for c in base])      # ~ $500 (SPY-shaped)
+        r_small = dow_trend(small_cap)
+        r_index = dow_trend(index_like)
+        assert r_small.trend is r_index.trend
+        assert r_small.break_of_structure is r_index.break_of_structure
