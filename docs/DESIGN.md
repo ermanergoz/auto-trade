@@ -2,7 +2,7 @@
 
 ## Overview
 
-An automated stock trading system that day-trades and swing-trades US equities through Interactive Brokers. Uses technical indicators for broad market screening and LLM-powered analysis for final trade decisions. Excludes financial sector stocks.
+An automated stock trading system that trades US equities through Interactive Brokers (swing trading is the default cadence; day trading is gated behind `DAY_TRADE_ENABLED`, which defaults to false). Uses technical indicators for broad market screening and LLM-powered analysis for final trade decisions. Excludes financial sector stocks.
 
 ## Broker & Account
 
@@ -137,7 +137,7 @@ Interfaces with IBKR to place and manage orders.
 - Attaches stop-loss orders (bracket orders)
 - Monitors order fills and partial fills
 - Handles connection drops and reconnection
-- For day trades: closes all intraday positions before market close
+- For day trades: closes all intraday positions before market close (applies only when `DAY_TRADE_ENABLED` is True)
 - For swing trades: keeps positions open, manages trailing stops
 
 ### 8. Portfolio Tracker
@@ -249,8 +249,10 @@ MAX_OPEN_POSITIONS = 10
 DEFAULT_STOP_LOSS_PCT = 3.0
 MAX_SECTOR_CONCENTRATION_PCT = 25.0
 
-# Day Trading
-CLOSE_DAY_TRADES_BEFORE_MARKET_CLOSE = True
+# Trade Type / Day-Trade Settings
+DEFAULT_TRADE_TYPE = "swing"    # "swing" (default) or "day"
+DAY_TRADE_ENABLED = False       # gate day-trading path; when False AI "day" signals are downgraded to "swing"
+CLOSE_DAY_TRADES_BEFORE_MARKET_CLOSE = True  # applies only when DAY_TRADE_ENABLED = True
 CLOSE_MINUTES_BEFORE = 15
 
 # Notifications

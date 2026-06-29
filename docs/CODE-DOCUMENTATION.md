@@ -42,7 +42,7 @@ Think of it like a 3-person trading desk, automated:
 
 2. **The AI Analyst** — An LLM that takes those 15 candidates and does deep analysis. It routes through **Gemini** (`gemini-2.5-flash-lite` by default) as the primary provider, and falls back to a local **Ollama + Qwen 2.5 7B** when Gemini is unavailable (missing key, rate limit, credits depleted, network error). It looks at price trends, momentum, volume, news headlines, macro/political context, and a strict 7-point checklist. It's the senior analyst who says "of those 15, I'd actually buy these 3."
 
-3. **The Risk Manager** — A paranoid rule-checker that gates every trade with 15 different safety checks (11 core + 4 discipline checks for new entries only). Position too big? Rejected. Already lost too much today? Rejected. Chasing a stock that already moved 5%? Rejected. Three losses in a row? Circuit breaker pauses everything. Portfolio below the PDT threshold and already used a day trade? The next potential day trade is blocked. Exit signals skip discipline checks so positions can always be closed. It's the compliance officer who makes sure we never blow up.
+3. **The Risk Manager** — A paranoid rule-checker that gates every trade with 15 different safety checks (11 core + 4 discipline checks for new entries only). Position too big? Rejected. Already lost too much today? Rejected. Chasing a stock that already moved 5%? Rejected. Three losses in a row? Circuit breaker pauses everything. Intraday-margin deficit uncured? New entries are blocked to prevent a 90-day restriction. Exit signals skip discipline checks so positions can always be closed. It's the compliance officer who makes sure we never blow up.
 
 Only after all three agree does an order actually get placed.
 
@@ -90,7 +90,7 @@ Every 15 minutes during market hours:
              Update terminal dashboard
 ```
 
-And 15 minutes before market close, the system auto-closes all day trades (swing trades stay open overnight).
+And 15 minutes before market close, the system auto-closes all day trades when `DAY_TRADE_ENABLED` is True (swing trades stay open overnight; this step is skipped entirely when the day-trade path is disabled).
 
 ---
 
@@ -264,8 +264,12 @@ MIN_RISK_REWARD_RATIO = 1.5         # Potential profit must be 1.5x potential lo
 ALLOW_SHORT_SELLING = False         # Block sells for stocks not held (no shorting)
 CIRCUIT_BREAKER_LOSSES = 3          # Pause after 3 consecutive losses
 CIRCUIT_BREAKER_WINDOW_MIN = 60     # Within this many minutes
-PDT_PROTECTION_THRESHOLD_USD = 5000 # Below this, block DAY entries and cap accidental day trades to avoid IBKR's 30-day lockout
-PDT_MAX_DAY_TRADES_PER_5_DAYS = 1   # Under threshold: allow at most 1 accidental (SWING-bracket-fired-same-day) day trade per rolling 5 biz days
+DEFAULT_TRADE_TYPE = "swing"         # "swing" (default) or "day"; Signal.trade_type defaults to SWING
+DAY_TRADE_ENABLED = False            # gate day-trading path; when False AI "day" signals are downgraded to "swing"
+REG_T_MIN_EQUITY_USD = 2000.0        # Reg-T minimum equity to trade on margin ($2,000)
+INTRADAY_MAINTENANCE_MARGIN_PCT = 25.0  # Intraday maintenance margin floor (25%)
+MARGIN_REGIME = "both"               # Active margin model: "intraday" | "legacy_pdt" | "both"
+LEGACY_PDT_THRESHOLD_USD = 25000.0   # Legacy PDT threshold (used only under legacy_pdt/both regimes)
 ```
 
 These values are tuned for a small account ($500). For larger accounts, tighten them back — see [RISK-TUNING.md](RISK-TUNING.md) for a full comparison table and scaling guide.
@@ -819,17 +823,26 @@ Rule: Compute Pearson correlation between the candidate's recent daily returns a
 
 Why: If you already own NVDA and buy AMD, both semiconductor stocks move together. Tomorrow's chip-sector news hits both positions simultaneously — so two "independent" positions are really one big bet. Institutional risk systems measure and constrain correlation between holdings; this check brings a simple version of that discipline into the bot. Uses a default `min_periods=20` to avoid unreliable correlations on short series, and gracefully handles NaN values (produced by halted or missing bars) by skipping them.
 
-#### 15. PDT Restriction — `check_pdt_restriction()`
-"Are we about to trip IBKR's sub-$5K day-trade lockout?"
+#### 15. Intraday-Margin Guard — `check_intraday_margin()`
+"Would this entry create or leave an uncured intraday-margin deficit?"
 
-Rule: When `portfolio_value >= PDT_PROTECTION_THRESHOLD_USD` (default $5,000), the check is a pass-through — unconstrained. Below the threshold, two guards run:
+The FINRA PDT rule was eliminated 2026-06-04. This check replaces it with intraday-margin awareness to guard against the 90-day restriction that IBKR imposes for uncured intraday-margin deficits.
 
-1. **DAY-type guard (new entries only).** Any new entry with `signal.trade_type == TradeType.DAY` is rejected outright. DAY entries are declared same-day round-trips — the scheduler's `close_all_day_trades` forces them flat at the end of the session, so the day-trade outcome is guaranteed. A sub-threshold account has at most one day-trade slot remaining before IBKR's 30-day lockout fires; spending it on a guaranteed round-trip leaves zero margin for an accidental bracket-fire from a SWING position. This guard is independent of historical count — it fires even with `day_trade_count == 0`.
-2. **Rolling-count cap (SWING entries + same-day exits).** Count same-calendar-day round-trip trades in the last 5 business days. If the count is already at `PDT_MAX_DAY_TRADES_PER_5_DAYS` (default 1), block any new SWING entry (bracket SL/TP could still fire same-day) and any same-day exit (definitively completes a day trade). Setting `PDT_MAX_DAY_TRADES_PER_5_DAYS=0` disables this count-based ceiling; the DAY-type guard above still fires.
+Rule: Two margin thresholds are enforced on new entries (exits always pass):
 
-Exits of positions opened on a prior day are **always** allowed — they are not day trades by definition, and blocking them would trap the trader in a losing swing position.
+1. **Reg-T minimum equity (`REG_T_MIN_EQUITY_USD`, default $2,000).** If portfolio equity is below $2,000, new entries are blocked — the account cannot legally trade on margin under Regulation T. Exits are always allowed.
+2. **Intraday maintenance margin floor (`INTRADAY_MAINTENANCE_MARGIN_PCT`, default 25%).** The check computes whether adding the proposed position would push the account's margin ratio below the 25% intraday maintenance floor. Entries that would create an uncured deficit are rejected; exits always pass.
 
-Why: IBKR flags accounts with Liquid Net Worth < $5,000 and restricts them to closing-orders-only for 30 days once 2 day trades occur within a rolling 5-business-day window. Counting historical day trades is necessary but not sufficient: a DAY-typed signal on a sub-$5K account is a *declaration* that we intend to round-trip today, and `close_all_day_trades` enforces that intent — so the signal itself is the risk, not its outcome. Blocking DAY entries at the risk layer prevents the bot from burning its only slot on a guaranteed loss of flexibility. The bot reads the current portfolio value at evaluation time, so as soon as the account clears the threshold the brakes come off automatically — no manual config change needed. This is a pragmatic guard, not a perfect replica of IBKR's internal accounting: the bot counts from its own completed-trades table, which means positions filled while the bot was offline (auto-reconciled at startup) participate in the count once they're recorded.
+`MARGIN_REGIME` (default `"both"`) controls which checks run:
+- `"intraday"` — only the two guards above.
+- `"legacy_pdt"` — only the legacy `LEGACY_PDT_THRESHOLD_USD` ($25,000) gate.
+- `"both"` — all checks run simultaneously (recommended during IBKR's phase-in period through 2027-10-20).
+
+`LEGACY_PDT_THRESHOLD_USD` is set to $25,000 — the correct legacy Pattern Day Trader threshold. Under `"legacy_pdt"` or `"both"`, accounts below this value face additional day-trade restrictions as defined by the legacy gate logic.
+
+Exits of positions opened on a prior day are **always** allowed — blocking exits would trap the trader in a losing position.
+
+Why: Uncured intraday-margin deficits trigger a 90-day closing-orders-only restriction at IBKR regardless of account size. With PDT eliminated, the margin floor ($2,000 Reg-T equity + 25% intraday maintenance) is the real gating condition that must be respected. `MARGIN_REGIME = "both"` provides a safety net during the broker phase-in so the legacy guard remains active for accounts that haven't fully migrated to the new regime.
 
 ### Exit Signal Bypass
 
@@ -847,7 +860,7 @@ The `evaluate()` function detects whether a signal is an **exit** (closing an ex
 
 Why: Most of these checks gate on market conditions and only make sense for deciding whether to **enter** a new position. Applying them to exits creates a dangerous trap — if the market moves against you, the very conditions that make you want to exit (price dropped, trend reversed, sector now crowded) are the same conditions these checks reject. Without this bypass, a losing position could never be closed because the anti-momentum check would say "price already dropped too far", the cumulative-risk check would see the existing position PLUS phantom new risk, and the excluded-sector check would keep the trader trapped in legacy financial-sector holdings.
 
-Core safety checks (daily loss limit, stop-loss coherence, max positions, no-duplicate, circuit breaker, PDT) still apply to all signals.
+Core safety checks (daily loss limit, stop-loss coherence, max positions, no-duplicate, circuit breaker, intraday-margin) still apply to all signals.
 
 For exits, `evaluate()` also sizes the order using the **existing position's absolute quantity** rather than a freshly-calculated new-entry size. If we re-calculated, the "risk-budget" sizing could produce a quantity LARGER than the holding and flip the position to a net short — a position inversion that violates `ALLOW_SHORT_SELLING=False` and is never the user's intent.
 
@@ -1620,11 +1633,11 @@ pytest tests/test_risk.py::test_daily_loss_limit -v
 
 **The solution**: Added an **extension guard** at the screener level. A ticker whose latest close sits more than `MAX_EXTENSION_OVER_MA20_PCT` (default **15%**) above its 20-day SMA is dropped from the candidate pool *before* scoring and *before* the AI ever sees it. Filtering at the source is the only robust fix — any later layer (AI, risk manager) can be overridden by the same confluent-signal pattern that produced the problem in the first place. The original 6-month sweep landed on 20%, but the bot kept buying near the local peak in the 16–20% band; the 2026-04-28 sweep (`data/sweep_extension_pct_2026-04-28.csv`) lifted win rate to 66.7% (vs 50% at 20%) and total return to +8.32% (vs ~breakeven) by tightening to 15%. Trades that fall in the 16–20% band are systematically losers (~+$8 avg per trade at 20% vs +$1500/trade at 15%), so 15% is the empirical sweet spot — defensive enough to cut the loss-clustered tail, but loose enough to keep ~75% of the trade frequency.
 
-### Challenge 17: PDT Protection Silently Truncated to Today Only
+### Challenge 17: Legacy Day-Trade Rolling Count Silently Truncated to Today Only
 
-**The problem**: IBKR's Pattern Day Trader rule counts day trades over a rolling 5-business-day window and, on accounts below $25K (here gated by `PDT_PROTECTION_THRESHOLD_USD`, default $5K), locks the account into closing-transactions-only for 30 days once the count crosses 2. `check_pdt_restriction` implements the rolling count — but the scheduler was calling `get_trades(start_date=datetime.now(utc).date())`, which only returns trades with `exit_time` on today's UTC date. The 7-calendar-day filter inside `check_pdt_restriction` then iterated a list that was already narrowed to today, making the protection effectively a single-day counter.
+**The problem**: Under the legacy PDT regime (LEGACY_PDT_THRESHOLD_USD, accounts below $25K), the day-trade count was gated on a rolling 5-business-day window. But the scheduler was calling `get_trades(start_date=datetime.now(utc).date())`, which only returns trades with `exit_time` on today's UTC date. The 7-calendar-day filter inside the legacy check then iterated a list that was already narrowed to today, making the protection effectively a single-day counter.
 
-**The solution**: Scheduler now queries `get_trades(start_date=(now - timedelta(days=7)).date())` so the full rolling window is visible to the filter. Day trades from earlier in the week are no longer invisible to the count.
+**The solution**: Scheduler now queries `get_trades(start_date=(now - timedelta(days=7)).date())` so the full rolling window is visible to the filter. Day trades from earlier in the week are no longer invisible to the count. This fix applies to the legacy day-trade counter used under `MARGIN_REGIME = "legacy_pdt"` or `"both"`.
 
 ### Challenge 18: Share-Class Tickers Silently Dropped from yfinance
 
