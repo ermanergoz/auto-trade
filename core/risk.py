@@ -40,7 +40,10 @@ from config.settings import (
     VOLATILITY_BASELINE,
     CHECK_ANALYST_CONSENSUS,
     CORRELATION_CAP_THRESHOLD,
-    PDT_PROTECTION_THRESHOLD_USD,
+    REG_T_MIN_EQUITY_USD,
+    INTRADAY_MAINTENANCE_MARGIN_PCT,
+    MARGIN_REGIME,
+    LEGACY_PDT_THRESHOLD_USD,
     PDT_MAX_DAY_TRADES_PER_5_DAYS,
 )
 
@@ -586,19 +589,90 @@ def check_correlation(
     return True, ""
 
 
+def check_intraday_margin(
+    signal: Signal,
+    portfolio_value: float,
+    position_size: int,
+    regime: str = MARGIN_REGIME,
+    has_uncured_deficit: bool = False,
+) -> tuple[bool, str]:
+    """Enforce the post-2026-06-04 intraday-margin framework on new entries.
+
+    Replaces the eliminated FINRA PDT day-trade gate (Notice 26-10). The old
+    $25k minimum + day-trade-count designation is gone; the real constraints
+    under Rule 4210 are checked here:
+
+      1. Reg-T minimum — account equity must stay at/above REG_T_MIN_EQUITY_USD.
+      2. Intraday maintenance margin — the new position's required maintenance
+         margin (entry_price * position_size * INTRADAY_MAINTENANCE_MARGIN_PCT%)
+         must not exceed available equity.
+      3. Uncured intraday-margin deficit — an outstanding (uncured) deficit can
+         trigger a 90-day restriction, so no new entry may open while one is
+         flagged.
+
+    Pure function — all state passed in as args; never fetches data. This is an
+    ENTRY-ONLY guard: evaluate() calls it only inside its `if not is_exit:`
+    block, so exits are never blocked by intraday-margin state.
+
+    When regime == "legacy_pdt" the intraday checks are skipped entirely (the
+    legacy day-trade counter runs instead, dispatched by evaluate()).
+
+    Returns (False, reason) on rejection, (True, "") on pass.
+    """
+    # Legacy-only regime: the new intraday framework does not apply here.
+    if regime == "legacy_pdt":
+        return True, ""
+
+    # 1. Reg-T account-equity minimum.
+    if portfolio_value < REG_T_MIN_EQUITY_USD:
+        return False, (
+            f"Intraday margin: account equity ${portfolio_value:,.2f} is below "
+            f"the Reg-T minimum ${REG_T_MIN_EQUITY_USD:,.2f} — new entries blocked."
+        )
+
+    # 3. Uncured intraday-margin deficit → 90-day-restriction guard.
+    if has_uncured_deficit:
+        return False, (
+            "Intraday margin: an uncured intraday-margin deficit is flagged — "
+            "blocking new entries to avoid a 90-day trading restriction."
+        )
+
+    # 2. Intraday maintenance margin on the proposed position.
+    required_margin = (
+        signal.entry_price * position_size * (INTRADAY_MAINTENANCE_MARGIN_PCT / 100)
+    )
+    if required_margin > portfolio_value:
+        return False, (
+            f"Intraday margin: required maintenance margin ${required_margin:,.2f} "
+            f"({INTRADAY_MAINTENANCE_MARGIN_PCT:.0f}% of ${signal.entry_price:.2f} "
+            f"x {position_size}) exceeds available equity ${portfolio_value:,.2f} "
+            "— new entry blocked."
+        )
+
+    return True, ""
+
+
 def check_pdt_restriction(
     signal: Signal,
     open_positions: list[Position],
     portfolio_value: float,
     recent_trades: list[Trade] | None = None,
-    threshold_usd: float = PDT_PROTECTION_THRESHOLD_USD,
+    threshold_usd: float = LEGACY_PDT_THRESHOLD_USD,
     max_day_trades: int = PDT_MAX_DAY_TRADES_PER_5_DAYS,
 ) -> tuple[bool, str]:
-    """Block trades that would trigger IBKR's sub-threshold day-trade restriction.
+    """Legacy day-trade counter — retained only behind MARGIN_REGIME.
 
-    IBKR flags accounts with Liquid Net Worth < threshold_usd and restricts
-    them to closing-orders-only for 30 days once 2 day trades occur within a
-    rolling 5-business-day window.
+    The FINRA PDT rule was eliminated 2026-06-04 (Notice 26-10); this guard is
+    kept ONLY as a safety net for operators whose IBKR account is still on the
+    legacy framework during the broker phase-in (through 2027-10-20). It is
+    dispatched by evaluate() only when margin_regime is "legacy_pdt" or "both".
+
+    It uses the CORRECT legacy PDT equity threshold (threshold_usd, default
+    LEGACY_PDT_THRESHOLD_USD = $25,000) — never the eliminated $5k value.
+
+    IBKR restricts accounts with Liquid Net Worth < threshold_usd to
+    closing-orders-only for 30 days once 2 day trades occur within a rolling
+    5-business-day window.
 
     Logic:
       - Portfolio >= threshold → pass (unconstrained).
@@ -835,6 +909,8 @@ def evaluate(
     returns_lookup: dict[str, pd.Series] | None = None,
     correlation_threshold: float = CORRELATION_CAP_THRESHOLD,
     start_of_day_equity: Optional[float] = None,
+    margin_regime: str = MARGIN_REGIME,
+    has_uncured_intraday_deficit: bool = False,
 ) -> RiskResult:
     """Run all risk checks on a signal. Returns RiskResult.
 
@@ -852,6 +928,13 @@ def evaluate(
                         check. Pass None to disable the correlation cap.
         correlation_threshold: Max tolerated correlation with any existing
                                position. Default from settings.
+        margin_regime: Which margin framework(s) to enforce — "intraday",
+                       "legacy_pdt", or "both". Default from settings; "both"
+                       conservatively runs every applicable guard during the
+                       broker phase-in.
+        has_uncured_intraday_deficit: True when the account carries an
+                       outstanding (uncured) intraday-margin deficit. Blocks new
+                       entries (90-day-restriction guard); never blocks exits.
     """
     reasons = []
 
@@ -896,9 +979,19 @@ def evaluate(
         check_stop_loss(signal),
         check_no_duplicate(signal, open_positions),
         check_circuit_breaker(recent_trades or []),
-        check_pdt_restriction(signal, open_positions, portfolio_value,
-                              recent_trades=recent_trades),
     ]
+
+    # Margin-regime dispatch for the legacy day-trade counter. The FINRA PDT
+    # rule was eliminated 2026-06-04; the legacy counter is a safety net that
+    # runs only under the legacy regimes. It keeps running for both entries and
+    # exits because it carries its own exit-safety logic (prior-day exits are
+    # never trapped). The NEW intraday-margin guard is entry-only and is added
+    # in the `if not is_exit:` block below so exits are never blocked by it.
+    if margin_regime in ("legacy_pdt", "both"):
+        checks.append(
+            check_pdt_restriction(signal, open_positions, portfolio_value,
+                                  recent_trades=recent_trades)
+        )
 
     # Entry-only checks: skip for exits. An exit REDUCES sector exposure,
     # REDUCES cumulative open risk, and must be allowed even when the
@@ -917,6 +1010,15 @@ def evaluate(
             check_trend_confirmation(signal, indicator_values),
             check_analyst_consensus(signal, analyst_consensus, analyst_consensus_ibkr),
         ])
+        # New intraday-margin guard (post-2026-06-04 framework) — entry-only.
+        if margin_regime in ("intraday", "both"):
+            checks.append(
+                check_intraday_margin(
+                    signal, portfolio_value, estimated_size,
+                    regime=margin_regime,
+                    has_uncured_deficit=has_uncured_intraday_deficit,
+                )
+            )
         if returns_lookup is not None:
             checks.append(check_correlation(
                 signal, open_positions, returns_lookup, threshold=correlation_threshold,
