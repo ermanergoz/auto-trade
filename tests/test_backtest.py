@@ -1267,6 +1267,123 @@ class TestWalkForwardConfigPassThrough:
             assert call.args[0].indicator_weights == weights
 
 
+class TestSpreadCost:
+    """BACKTEST_SPREAD_BPS models half-the-bid/ask crossed on each leg.
+
+    Entry crosses the ask (pays up), exit crosses the bid (receives less).
+    The spread is charged per leg on top of slippage, so a round trip pays
+    it twice. spread_bps=0 must reproduce the pre-spread fills exactly.
+    """
+
+    def test_buy_leg_crosses_ask(self):
+        """A long entry fills worse by the per-leg spread (crosses the ask)."""
+        p = SimulatedPortfolio(
+            initial_capital=100_000, slippage_pct=0, commission=0, spread_bps=10,
+        )
+        sig = _make_signal(action=Action.BUY, entry_price=100.0,
+                           stop_loss=95.0, take_profit=110.0)
+        p.open_position(sig, 10, 100.0, datetime(2024, 1, 15))
+        # 10 bps = 0.10% → entry fill = 100 * (1 + 0.0010) = 100.10
+        assert p.positions[0].entry_price == pytest.approx(100.10)
+
+    def test_short_entry_crosses_bid(self):
+        """A short entry fills worse by the per-leg spread (receives less)."""
+        p = SimulatedPortfolio(
+            initial_capital=100_000, slippage_pct=0, commission=0, spread_bps=10,
+        )
+        sig = _make_signal(action=Action.SELL, entry_price=100.0,
+                           stop_loss=110.0, take_profit=90.0)
+        p.open_position(sig, 10, 100.0, datetime(2024, 1, 15))
+        # Short sale receives less: 100 * (1 - 0.0010) = 99.90
+        assert p.positions[0].entry_price == pytest.approx(99.90)
+
+    def test_spread_zero_reproduces_slippage_only_fill(self):
+        """spread_bps=0 leaves the slippage-only fill untouched (no regression)."""
+        p = SimulatedPortfolio(
+            initial_capital=100_000, slippage_pct=0.1, commission=0, spread_bps=0,
+        )
+        sig = _make_signal(action=Action.BUY, entry_price=100.0,
+                           stop_loss=95.0, take_profit=110.0)
+        p.open_position(sig, 10, 100.0, datetime(2024, 1, 15))
+        # Slippage only: 100 * (1 + 0.001) = 100.10
+        assert p.positions[0].entry_price == pytest.approx(100.10)
+
+    def test_spread_makes_round_trip_strictly_more_expensive(self):
+        """A flat round trip (buy and sell at the same raw price) loses the
+        full round-trip spread; spread_bps>0 must be strictly worse than 0."""
+        sig = _make_signal(action=Action.BUY, entry_price=100.0,
+                           stop_loss=95.0, take_profit=110.0)
+
+        p0 = SimulatedPortfolio(
+            initial_capital=100_000, slippage_pct=0, commission=0, spread_bps=0,
+        )
+        p0.open_position(sig, 100, 100.0, datetime(2024, 1, 15))
+        t0 = p0.close_position("AAPL", 100.0, datetime(2024, 1, 16))
+
+        p1 = SimulatedPortfolio(
+            initial_capital=100_000, slippage_pct=0, commission=0, spread_bps=10,
+        )
+        p1.open_position(sig, 100, 100.0, datetime(2024, 1, 15))
+        t1 = p1.close_position("AAPL", 100.0, datetime(2024, 1, 16))
+
+        # No spread, no slippage: a flat round trip is exactly break-even.
+        assert t0.pnl == pytest.approx(0.0)
+        # With spread the same flat round trip loses money — strictly worse.
+        assert t1.pnl < t0.pnl
+
+
+class TestGapThroughAtOpenFills:
+    """Threat T-02-01: a stop that gaps through its level must fill at the
+    bar OPEN, never the (better) stop price. Pinned so later plans cannot
+    regress the conservative approximation or 'fix' it into look-ahead."""
+
+    def test_gap_down_through_long_stop_fills_at_open_not_stop(self):
+        from backtest.engine import _check_exits
+        from core.models import Position, TradeType
+
+        p = SimulatedPortfolio(
+            initial_capital=100_000, slippage_pct=0, commission=0, spread_bps=0,
+        )
+        p.positions.append(Position(
+            ticker="GAP", exchange="SMART", quantity=100,
+            entry_price=100.0, entry_time=datetime(2024, 1, 1),
+            stop_loss=95.0, take_profit=110.0, trade_type=TradeType.DAY,
+        ))
+        # Open ($90) gaps DOWN through the $95 stop.
+        day_data = {
+            "GAP": pd.Series({"open": 90.0, "high": 91.0, "low": 89.0, "close": 90.5}),
+        }
+        _check_exits(p, day_data, datetime(2024, 1, 2))
+
+        assert len(p.trades) == 1
+        # Fills at the open, NOT the stop price (would be optimistic).
+        assert p.trades[0].exit_price == pytest.approx(90.0)
+        assert p.trades[0].exit_price != pytest.approx(95.0)
+
+    def test_gap_up_through_short_stop_fills_at_open_not_stop(self):
+        from backtest.engine import _check_exits
+        from core.models import Position, TradeType
+
+        p = SimulatedPortfolio(
+            initial_capital=200_000, slippage_pct=0, commission=0, spread_bps=0,
+        )
+        p.positions.append(Position(
+            ticker="SGAP", exchange="SMART", quantity=-100,
+            entry_price=100.0, entry_time=datetime(2024, 1, 1),
+            stop_loss=105.0, take_profit=90.0, trade_type=TradeType.DAY,
+        ))
+        # Open ($115) gaps UP through the $105 short stop.
+        day_data = {
+            "SGAP": pd.Series({"open": 115.0, "high": 118.0, "low": 114.0, "close": 116.0}),
+        }
+        _check_exits(p, day_data, datetime(2024, 1, 2))
+
+        assert len(p.trades) == 1
+        # Fills at the open, NOT the stop price.
+        assert p.trades[0].exit_price == pytest.approx(115.0)
+        assert p.trades[0].exit_price != pytest.approx(105.0)
+
+
 class TestWalkForwardOverfittingDetection:
     """The whole point of walk-forward: detecting optimistic IS results."""
 
