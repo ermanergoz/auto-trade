@@ -367,6 +367,64 @@ class TestCostDecompositionMetrics:
             assert key in m
 
 
+class TestHistoryPeriodAndSurvivorship:
+    """3-5y multi-regime history default, sub-$25k capital, and a survivorship
+    caveat printed on every report (HRN-07)."""
+
+    def test_config_default_history_period_is_5y(self):
+        config = BacktestConfig(tickers=["AAPL"])
+        assert config.history_period == "5y"
+
+    def test_config_history_period_is_overridable(self):
+        config = BacktestConfig(tickers=["AAPL"], history_period="3y")
+        assert config.history_period == "3y"
+
+    def test_history_period_passed_to_download(self):
+        """run_backtest must pull config.history_period, not a hardcoded 1y."""
+        from unittest.mock import patch
+        import pandas as pd
+        from backtest.engine import run_backtest
+
+        captured = {}
+
+        def _fake_yf(ticker, *args, **kwargs):
+            captured["period"] = kwargs.get("period")
+            return pd.DataFrame()  # empty → early return, that's fine
+
+        config = BacktestConfig(tickers=["AAPL"], history_period="5y")
+        with patch("backtest.engine.get_historical_data_yfinance", side_effect=_fake_yf):
+            run_backtest(config)
+
+        assert captured.get("period") == "5y", (
+            f"Expected the 5y history period to flow into the yfinance download, "
+            f"got {captured.get('period')!r}"
+        )
+
+    def test_sub_25k_capital_is_honored(self):
+        """A sub-$25k account must size the simulated portfolio at that capital."""
+        p = SimulatedPortfolio(initial_capital=8_000)
+        assert p.cash == 8_000
+        assert p.portfolio_value == 8_000
+
+    def test_display_metrics_prints_survivorship_caveat(self):
+        """Every report must surface the survivorship caveat substring."""
+        from rich.console import Console
+        from backtest import report as report_mod
+
+        buf = Console(record=True, width=200)
+        with patch.object(report_mod, "console", buf):
+            m = calculate_metrics(
+                [Trade("AAPL", "SMART", 10, 100.0, 110.0,
+                        datetime(2024, 1, 1), datetime(2024, 1, 2), TradeType.DAY)],
+                [(date(2024, 1, 1), 100_000.0), (date(2024, 1, 2), 100_100.0)],
+                100_000,
+            )
+            report_mod.display_metrics(m)
+
+        out = buf.export_text()
+        assert "survivorship" in out.lower()
+
+
 class TestGapDownStopLoss:
     """Verify stop-loss uses open price for gap-down modeling (not bar low)."""
 

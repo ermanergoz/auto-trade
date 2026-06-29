@@ -299,6 +299,11 @@ class BacktestConfig:
     indicator_weights: dict[str, float] | None = None
     use_volatility_scaling: bool = False
     max_extension_pct: float = MAX_EXTENSION_OVER_MA20_PCT
+    # Multi-regime history window pulled from yfinance. Default 5y so every
+    # backtest necessarily spans a 2022-style drawdown (not a single bull
+    # year), exercising the strategy across regimes. Honors start_date/end_date
+    # filters applied after download.
+    history_period: str = "5y"
 
 
 def run_backtest(config: BacktestConfig) -> SimulatedPortfolio:
@@ -320,7 +325,7 @@ def run_backtest(config: BacktestConfig) -> SimulatedPortfolio:
     all_data: dict[str, pd.DataFrame] = {}
     for ticker in config.tickers:
         df = get_historical_data_yfinance(
-            ticker, period="1y", interval="1d", market=config.market,
+            ticker, period=config.history_period, interval="1d", market=config.market,
         )
         if not df.empty:
             all_data[ticker] = df
