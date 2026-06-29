@@ -21,6 +21,7 @@ from core.models import Signal, Position, Trade, Action, TradeType
 from core.screener import screen_stocks
 from core.risk import evaluate, RiskResult, calculate_realized_volatility
 from core.data import get_historical_data_yfinance
+from backtest.holdout import assert_range_excludes_holdout
 
 logger = logging.getLogger(__name__)
 
@@ -315,7 +316,20 @@ def run_backtest(config: BacktestConfig) -> SimulatedPortfolio:
     3. Optionally run AI analyst
     4. Pass signals through risk manager
     5. Simulate execution
+
+    Holdout contract: a preflight guard refuses any range overlapping the
+    single-use holdout while it is locked. A run with no explicit ``end_date``
+    is treated as ending today, which overlaps the locked holdout and is
+    therefore refused — Phase-2 tuning runs MUST set ``config.end_date`` earlier
+    than ``HOLDOUT_START`` explicitly. See ``backtest/holdout.py``.
+
+    Raises:
+        PermissionError: if the requested range overlaps the locked holdout.
     """
+    # Preflight: mechanically refuse holdout-overlapping ranges before any data
+    # download or iteration, so tuning runs cannot peek at the reserved test set.
+    assert_range_excludes_holdout(config.start_date, config.end_date)
+
     logger.info(
         "Starting backtest: %d tickers, capital=$%,.0f, market=%s",
         len(config.tickers), config.initial_capital, config.market,
