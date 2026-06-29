@@ -1703,3 +1703,97 @@ class TestCAPMAlphaBeta:
         assert "SPY Return" in out
         assert "Alpha" in out
 
+
+# ---------------------------------------------------------------------------
+# Plan 02-02 Task 3: deterministic Bernoulli(p=0.5) random-entry control
+# ---------------------------------------------------------------------------
+
+class TestRandomEntryControl:
+    """Coin-flip entries with identical sizing/exits/costs, reproducible by seed."""
+
+    def _universe(self):
+        n = 120
+        dates = pd.date_range("2024-01-01", periods=n, freq="D")
+        frames = {}
+        for j, tkr in enumerate(["AAA", "BBB", "CCC", "DDD"]):
+            base = 50.0 + j * 10
+            closes = [base + 5 * ((i + j) % 7) for i in range(n)]
+            frames[tkr] = _ohlc_frame(closes, dates)
+        spy = _ohlc_frame([400.0 + i * 0.5 for i in range(n)], dates)
+        return frames, spy
+
+    def _run(self, seed, monkeypatch):
+        from backtest.engine import run_backtest
+
+        monkeypatch.setenv("BORSA_HOLDOUT_UNLOCKED", "1")
+        frames, spy = self._universe()
+
+        def _fake_yf(ticker, *args, **kwargs):
+            if ticker == "SPY":
+                return spy
+            return frames.get(ticker, pd.DataFrame())
+
+        config = BacktestConfig(
+            tickers=list(frames.keys()),
+            use_random_entry=True,
+            random_seed=seed,
+            min_screener_score=5.0,
+        )
+        with patch("backtest.engine.get_historical_data_yfinance", side_effect=_fake_yf):
+            return run_backtest(config)
+
+    def _trade_key(self, p):
+        return [
+            (t.ticker, round(t.entry_price, 6), round(t.exit_price, 6),
+             t.entry_time, t.exit_time)
+            for t in p.trades
+        ]
+
+    def test_same_seed_identical_trades(self, monkeypatch):
+        p1 = self._run(42, monkeypatch)
+        p2 = self._run(42, monkeypatch)
+        assert len(p1.trades) > 0, "random control must actually take trades"
+        assert self._trade_key(p1) == self._trade_key(p2)
+
+    def test_different_seed_differs(self, monkeypatch):
+        p1 = self._run(1, monkeypatch)
+        p2 = self._run(999, monkeypatch)
+        assert self._trade_key(p1) != self._trade_key(p2)
+
+    def test_config_default_no_random_entry(self):
+        cfg = BacktestConfig(tickers=["AAPL"])
+        assert cfg.use_random_entry is False
+        assert cfg.random_seed == 0
+
+    def test_random_candidates_are_bernoulli_subset(self):
+        """Per-ticker Bernoulli(0.5): same seed/bar → same picks; the selection
+        is a subset of the available universe."""
+        from backtest.engine import _random_entry_candidates
+
+        n = 70
+        dates = pd.date_range("2024-01-01", periods=n, freq="D")
+        stock_data = {
+            tkr: ("SMART", _ohlc_frame([100.0 + i for i in range(n)], dates))
+            for tkr in ["AAA", "BBB", "CCC", "DDD", "EEE", "FFF"]
+        }
+        picks1 = {s.ticker for s in _random_entry_candidates(stock_data, 5, 7)}
+        picks2 = {s.ticker for s in _random_entry_candidates(stock_data, 5, 7)}
+        assert picks1 == picks2  # deterministic
+        assert picks1.issubset(set(stock_data.keys()))
+        # A different bar index draws a different (independent) selection.
+        other = {s.ticker for s in _random_entry_candidates(stock_data, 6, 7)}
+        assert picks1 != other or len(stock_data) <= 1
+
+    def test_random_signals_are_long_with_default_sl_tp(self):
+        from backtest.engine import _random_entry_candidates
+        from config.settings import DEFAULT_STOP_LOSS_PCT, DEFAULT_TAKE_PROFIT_PCT
+
+        n = 70
+        dates = pd.date_range("2024-01-01", periods=n, freq="D")
+        stock_data = {"AAA": ("SMART", _ohlc_frame([100.0] * n, dates))}
+        sigs = _random_entry_candidates(stock_data, 0, 0)
+        for s in sigs:
+            assert s.action == Action.BUY
+            assert s.entry_price == pytest.approx(100.0)
+            assert s.stop_loss == pytest.approx(100.0 * (1 - DEFAULT_STOP_LOSS_PCT / 100))
+            assert s.take_profit == pytest.approx(100.0 * (1 + DEFAULT_TAKE_PROFIT_PCT / 100))

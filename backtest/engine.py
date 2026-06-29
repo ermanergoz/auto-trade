@@ -9,6 +9,7 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime, date, timedelta
 from typing import Optional
 
+import numpy as np
 import pandas as pd
 
 from config.settings import (
@@ -323,6 +324,12 @@ class BacktestConfig:
     # history_period (not warmup-trimmed) so the raw close series is available
     # for 02-06's regime gate.
     benchmark_ticker: str = "SPY"
+    # Random-entry control (survival-vs-edge): when True, the screener's
+    # candidate selection is replaced by an independent per-ticker Bernoulli(0.5)
+    # coin flip each bar (PITFALLS.md Pitfall 5). Identical sizing/exits/costs —
+    # ONLY the entry decision is randomized. Deterministic per random_seed.
+    use_random_entry: bool = False
+    random_seed: int = 0
 
 
 def _build_benchmark_curve(
@@ -357,6 +364,48 @@ def _build_benchmark_curve(
         (d, initial_capital * (v / base))
         for d, v in zip(equity_dates, vals)
     ]
+
+
+def _random_entry_candidates(
+    stock_data: dict[str, tuple[str, pd.DataFrame]],
+    bar_index: int,
+    random_seed: int,
+) -> list[Signal]:
+    """Coin-flip entry control: independent per-ticker Bernoulli(p=0.5).
+
+    For EACH ticker available on this bar, draw an independent Bernoulli(0.5)
+    and select it as a candidate iff it comes up heads (PITFALLS.md Pitfall 5).
+    Determinism comes from seeding a per-bar RNG with (random_seed + bar_index),
+    so the same random_seed reproduces the exact same picks bar-for-bar while a
+    different seed/index yields a different draw. Signals are plain long entries
+    at the last close with the default SL/TP percentages — the SAME risk
+    machinery, sizing, exits and costs as the real run apply downstream; ONLY
+    the entry decision is randomized.
+    """
+    rng = np.random.RandomState((random_seed + bar_index) % (2 ** 32))
+    signals: list[Signal] = []
+    for ticker in sorted(stock_data.keys()):
+        heads = rng.random() < 0.5
+        if not heads:
+            continue
+        exchange, hist = stock_data[ticker]
+        price = float(hist["close"].iloc[-1])
+        if price <= 0:
+            continue
+        signals.append(Signal(
+            ticker=ticker,
+            action=Action.BUY,
+            confidence=50.0,
+            entry_price=price,
+            stop_loss=price * (1 - DEFAULT_STOP_LOSS_PCT / 100),
+            take_profit=price * (1 + DEFAULT_TAKE_PROFIT_PCT / 100),
+            reasoning="random-entry control (Bernoulli p=0.5)",
+            source="random",
+            exchange=exchange,
+            trade_type=TradeType.SWING,
+            indicator_values={},
+        ))
+    return signals
 
 
 def run_backtest(config: BacktestConfig) -> SimulatedPortfolio:
@@ -484,12 +533,18 @@ def run_backtest(config: BacktestConfig) -> SimulatedPortfolio:
         # End-of-day equity uses today's CLOSE — the actual settled value.
         eod_prices = {t: bar["close"] for t, bar in day_data.items()}
 
-        # Step 3: Run screener (with optional indicator weights)
-        candidates = screen_stocks(
-            stock_data, min_score=config.min_screener_score,
-            indicator_weights=config.indicator_weights,
-            max_extension_pct=config.max_extension_pct,
-        )
+        # Step 3: Pick candidates. The real strategy runs the screener; the
+        # random-entry control replaces that entirely with a seeded per-ticker
+        # Bernoulli(0.5) coin flip (survival-vs-edge control). Everything
+        # downstream — risk, sizing, exits, costs — is identical.
+        if config.use_random_entry:
+            candidates = _random_entry_candidates(stock_data, i, config.random_seed)
+        else:
+            candidates = screen_stocks(
+                stock_data, min_score=config.min_screener_score,
+                indicator_weights=config.indicator_weights,
+                max_extension_pct=config.max_extension_pct,
+            )
 
         if not candidates:
             portfolio.record_equity(current_date, current_prices=eod_prices)
@@ -573,6 +628,44 @@ def run_backtest(config: BacktestConfig) -> SimulatedPortfolio:
     )
 
     return portfolio
+
+
+def run_strategy_with_controls(config: BacktestConfig) -> list[tuple[str, dict]]:
+    """Run the strategy + its two controls and return compare_configs columns.
+
+    Produces three labeled (name, metrics) tuples ready to hand straight to
+    ``compare_configs``:
+
+      - "Strategy"     — the real screener-driven run, with CAPM alpha/beta vs SPY.
+      - "Random-Entry" — a deterministic Bernoulli(p=0.5) coin-flip control with
+                         IDENTICAL sizing/exits/costs (only the entry is random).
+      - "SPY"          — the passive buy-and-hold benchmark column.
+
+    The random control will have a DIFFERENT trade count / market exposure than
+    the screener (it enters roughly half the universe each bar). That difference
+    is expected and acceptable — this is the survival-vs-edge control, not a
+    like-for-like trade-count match. The strategy only has edge if it beats BOTH
+    its random-entry control and SPY net of costs.
+    """
+    from backtest.report import calculate_metrics, benchmark_column_metrics
+
+    strat = run_backtest(config)
+    rand = run_backtest(replace(config, use_random_entry=True))
+
+    def _metrics(portfolio: SimulatedPortfolio) -> dict:
+        return calculate_metrics(
+            portfolio.trades, portfolio.equity_curve, config.initial_capital,
+            slippage_pct=config.slippage_pct, spread_bps=config.spread_bps,
+            commission=config.commission,
+            commission_per_share=config.commission_per_share,
+            benchmark_curve=portfolio.benchmark_curve,
+        )
+
+    return [
+        ("Strategy", _metrics(strat)),
+        ("Random-Entry", _metrics(rand)),
+        ("SPY", benchmark_column_metrics(strat.benchmark_curve, config.initial_capital)),
+    ]
 
 
 # ---------------------------------------------------------------------------
