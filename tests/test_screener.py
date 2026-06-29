@@ -709,3 +709,61 @@ class TestDowTrend:
         r_index = dow_trend(index_like)
         assert r_small.trend is r_index.trend
         assert r_small.break_of_structure is r_index.break_of_structure
+
+
+# ---------------------------------------------------------------------------
+# Optional Dow filter on screen_stocks + screener-purity guard (DOW-01)
+# ---------------------------------------------------------------------------
+
+class TestDowFilter:
+    """use_dow_filter is an opt-in switch (default OFF for live==backtest
+    parity until plan 02-06 validates it OOS). When ON, only UPTREND
+    candidates survive."""
+
+    def test_downtrend_excluded_uptrend_survives(self):
+        down = _make_df(_trending_down(40, 200, 3))          # DOWNTREND, RSI BUY
+        up = _make_df([100 + i * 0.5 for i in range(40)])    # UPTREND, signals
+        data = {"DOWN": ("SMART", down), "UP": ("SMART", up)}
+
+        base_tickers = {s.ticker for s in screen_stocks(data, min_score=0.1)}
+        assert "DOWN" in base_tickers, (
+            "Sanity: the downtrending ticker must be a candidate without the filter"
+        )
+
+        filtered = {s.ticker for s in screen_stocks(data, min_score=0.1, use_dow_filter=True)}
+        assert "DOWN" not in filtered, "Downtrending ticker must be dropped by use_dow_filter"
+        if "UP" in base_tickers:
+            assert "UP" in filtered, "Uptrending ticker must survive use_dow_filter"
+
+    def test_default_off_preserves_parity(self):
+        down = _make_df(_trending_down(40, 200, 3))
+        data = {"DOWN": ("SMART", down)}
+        explicit_off = screen_stocks(data, min_score=0.1, use_dow_filter=False)
+        default = screen_stocks(data, min_score=0.1)
+        assert [s.ticker for s in default] == [s.ticker for s in explicit_off]
+        assert len(default) == len(explicit_off)
+
+
+class TestScreenerPurity:
+    """T-02-04: the screener must remain a pure module — no broker/network IO
+    imports — so backtest and live paths share identical code."""
+
+    def test_no_io_imports(self):
+        import pathlib
+
+        src = pathlib.Path(__file__).resolve().parents[1] / "core" / "screener.py"
+        code = "\n".join(
+            line for line in src.read_text().splitlines()
+            if not line.lstrip().startswith("#")
+        )
+        for forbidden in (
+            "import ib_insync",
+            "import requests",
+            "import yfinance",
+            "import urllib",
+            "import httpx",
+            "import socket",
+        ):
+            assert forbidden not in code, (
+                f"core/screener.py must stay pure — found {forbidden!r}"
+            )

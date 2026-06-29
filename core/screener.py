@@ -656,6 +656,7 @@ def screen_stocks(
     min_score: float = 15.0,
     indicator_weights: dict[str, float] | None = None,
     max_extension_pct: float = MAX_EXTENSION_OVER_MA20_PCT,
+    use_dow_filter: bool = False,
 ) -> list[Signal]:
     """Screen multiple stocks and return all candidates above min_score.
 
@@ -670,6 +671,10 @@ def screen_stocks(
         max_extension_pct: Drop tickers whose close is more than this % above
                            MA20. Prevents chasing parabolic breakouts. Set to
                            0 or negative to disable.
+        use_dow_filter: When True, drop any candidate whose dow_trend is not
+                        UPTREND (market-structure filter). Default False to
+                        preserve existing behaviour and live==backtest parity
+                        until the filter is validated out-of-sample (02-06).
 
     Returns:
         List of Signal objects sorted by score descending.
@@ -677,6 +682,7 @@ def screen_stocks(
     candidates: list[tuple[float, Signal]] = []
     extended_skipped = 0
     illiquid_skipped = 0
+    dow_skipped = 0
 
     for ticker, (exchange, df) in stock_data.items():
         if df.empty or len(df) < MA_SLOW + 1:
@@ -707,6 +713,16 @@ def screen_stocks(
                 )
                 continue
 
+            if use_dow_filter:
+                structure = dow_trend(df["close"])
+                if structure.trend is not DowTrend.UPTREND:
+                    dow_skipped += 1
+                    logger.debug(
+                        "Skipping %s: dow_trend=%s is not UPTREND (market-structure filter)",
+                        ticker, structure.trend.value,
+                    )
+                    continue
+
             triggered = analyze_stock(df)
             if not triggered:
                 continue
@@ -726,8 +742,8 @@ def screen_stocks(
 
     logger.info(
         "Screener found %d candidates (from %d stocks, min_score=%.0f, "
-        "dropped %d extended, %d illiquid)",
+        "dropped %d extended, %d illiquid, %d non-uptrend)",
         len(result), len(stock_data), min_score,
-        extended_skipped, illiquid_skipped,
+        extended_skipped, illiquid_skipped, dow_skipped,
     )
     return result
