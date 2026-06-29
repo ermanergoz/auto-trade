@@ -2022,3 +2022,90 @@ class TestWalkForwardReport:
         assert walk_forward_wfe_status(0.5) == ("PASS", True)
         assert walk_forward_wfe_status(0.7) == ("ROBUST", True)
         assert walk_forward_wfe_status(None) == ("UNDEFINED", False)
+
+
+# ---------------------------------------------------------------------------
+# Plan 02-03 Task 3: --walk-forward CLI flag + run_walk_forward_mode dispatch
+# ---------------------------------------------------------------------------
+
+class TestWalkForwardCLI:
+    """parse_args accepts --walk-forward; backtest mode routes to it."""
+
+    def test_parse_args_accepts_walk_forward_flag(self, monkeypatch):
+        import sys
+        import main
+        monkeypatch.setattr(sys, "argv", [
+            "main.py", "--mode", "backtest", "--walk-forward",
+            "--backtest-tickers", "AAPL",
+        ])
+        args = main.parse_args()
+        assert args.walk_forward is True
+        assert args.mode == "backtest"
+
+    def test_wf_oos_days_default_is_9_to_12_months(self, monkeypatch):
+        """--wf-oos-days default must be ~250 trading days, not a 6-month window."""
+        import sys
+        import main
+        monkeypatch.setattr(sys, "argv", ["main.py", "--mode", "backtest"])
+        args = main.parse_args()
+        assert args.wf_oos_days >= 189          # >= ~9 months of trading days
+        assert args.wf_oos_days > 126 * 1.2     # not a 6-month window
+        assert args.wf_is_days >= 2 * 240       # ~2y in-sample
+
+    def test_run_walk_forward_mode_dispatches_to_rolling(self, monkeypatch):
+        """run_walk_forward_mode builds a config and calls rolling_walk_forward,
+        then renders via display_walk_forward."""
+        from types import SimpleNamespace
+        import main
+
+        captured = {}
+
+        def fake_rolling(config, is_days, oos_days, step_days):
+            captured["config"] = config
+            captured["is_days"] = is_days
+            captured["oos_days"] = oos_days
+            captured["step_days"] = step_days
+            return "RESULT"
+
+        def fake_display(result):
+            captured["displayed"] = result
+            return {}
+
+        monkeypatch.setattr("backtest.engine.rolling_walk_forward", fake_rolling)
+        monkeypatch.setattr("backtest.report.display_walk_forward", fake_display)
+
+        args = SimpleNamespace(
+            backtest_tickers=["AAPL", "MSFT"],
+            backtest_start="2021-06-01",
+            backtest_end="2025-06-01",
+            capital=20_000,
+            wf_is_days=504, wf_oos_days=252, wf_step_days=252,
+        )
+        main.run_walk_forward_mode(args)
+
+        assert captured["config"].tickers == ["AAPL", "MSFT"]
+        assert captured["config"].initial_capital == 20_000
+        assert captured["oos_days"] == 252
+        assert captured["displayed"] == "RESULT"
+
+    def test_backtest_mode_routes_to_walk_forward(self, monkeypatch):
+        """main() with --mode backtest --walk-forward dispatches to the WF path,
+        not the plain single-backtest path."""
+        from types import SimpleNamespace
+        import main
+
+        calls = {"wf": 0, "plain": 0}
+        monkeypatch.setattr(main, "parse_args", lambda: SimpleNamespace(
+            mode="backtest", walk_forward=True,
+        ))
+        monkeypatch.setattr(main, "setup_logging", lambda mode: None)
+        monkeypatch.setattr("config.settings.validate_settings", lambda: [])
+        monkeypatch.setattr(main, "init_db", lambda: None)
+        monkeypatch.setattr(main, "verify_db", lambda: None)
+        monkeypatch.setattr(main, "run_walk_forward_mode",
+                            lambda a: calls.__setitem__("wf", calls["wf"] + 1))
+        monkeypatch.setattr(main, "run_backtest_mode",
+                            lambda a: calls.__setitem__("plain", calls["plain"] + 1))
+
+        main.main()
+        assert calls == {"wf": 1, "plain": 0}
