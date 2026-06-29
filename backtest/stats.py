@@ -128,3 +128,40 @@ def deflated_sharpe_ratio(
     return probabilistic_sharpe_ratio(
         observed_sr, n_obs, sr_star=sr_star, skew=skew, kurtosis=kurtosis
     )
+
+
+def per_trade_tstat(returns) -> float:
+    """One-sample t-statistic of per-trade returns against a zero-mean null.
+
+    t = mean(returns) / (std(returns, ddof=1) / sqrt(N)). Wraps
+    ``scipy.stats.ttest_1samp(returns, 0)`` and returns its ``statistic``.
+    |t| > 2 is the conventional flag for a per-trade edge that is unlikely to be
+    noise. Here ``returns`` is the per-TRADE return series (one entry per closed
+    trade) — distinct from the ``n_obs`` daily-observation count used by the
+    Sharpe functions above.
+    """
+    arr = np.asarray(returns, dtype=float)
+    return float(ttest_1samp(arr, 0.0).statistic)
+
+
+def min_trade_gate(n: int, minimum: int = 30) -> bool:
+    """True iff there are at least ``minimum`` trades (default 30).
+
+    The >=30-trade statistical floor below which per-trade conclusions are
+    unreliable (a handful of trades cannot reject "the strategy is random").
+    This counts TRADES — it is deliberately separate from the ``n_obs``
+    observation-count term in the Sharpe functions.
+    """
+    return n >= minimum
+
+
+def win_rate_binomial_ci(wins: int, n: int, confidence: float = 0.95) -> tuple:
+    """Clopper-Pearson exact binomial CI for the win rate, as ``(low, high)``.
+
+    Wraps ``scipy.stats.binomtest(wins, n).proportion_ci(confidence_level=...)``.
+    For 4/6 wins the 95% CI is ~[0.22, 0.96] — wide enough to be
+    indistinguishable from a coin flip, which is the whole point of reporting it.
+    """
+    result = binomtest(wins, n)
+    ci = result.proportion_ci(confidence_level=confidence)
+    return (float(ci.low), float(ci.high))
