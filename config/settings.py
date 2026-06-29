@@ -73,6 +73,13 @@ SCAN_INTERVAL_MINUTES = 15
 AI_CONFIDENCE_THRESHOLD = 65
 AI_MAX_CANDIDATES = 0               # Max candidates sent to AI per cycle (0 = unlimited)
 
+# Trade cadence. Swing is the default on cost/edge grounds for a sub-$25k retail
+# account (day-trading loses to commissions/slippage/noise). The day-trade code
+# path stays in the codebase but is OFF unless DAY_TRADE_ENABLED is true — the
+# Phase-2 edge-validation harness decides day-vs-swing out-of-sample, not assumption.
+DEFAULT_TRADE_TYPE = os.getenv("DEFAULT_TRADE_TYPE", "swing").lower()
+DAY_TRADE_ENABLED = os.getenv("DAY_TRADE_ENABLED", "false").lower() == "true"
+
 # LLM provider — "gemini" (primary; auto-falls back to Ollama on error/exhaustion)
 # or "ollama" (legacy local-only path). Lower-cased so env vars like "Gemini" work.
 AI_PROVIDER = os.getenv("AI_PROVIDER", "gemini").lower()
@@ -316,6 +323,9 @@ def validate_settings() -> list[str]:
         errors.append(
             f"MARGIN_REGIME must be one of intraday/legacy_pdt/both, got {MARGIN_REGIME!r}"
         )
+
+    if DEFAULT_TRADE_TYPE not in ("day", "swing"):
+        errors.append(f"DEFAULT_TRADE_TYPE must be one of day/swing, got {DEFAULT_TRADE_TYPE!r}")
 
     if PDT_MAX_DAY_TRADES_PER_5_DAYS < 0:
         errors.append(f"PDT_MAX_DAY_TRADES_PER_5_DAYS must be non-negative, got {PDT_MAX_DAY_TRADES_PER_5_DAYS}")

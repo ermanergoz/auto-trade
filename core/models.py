@@ -37,7 +37,7 @@ class Signal:
     source: str  # "screener" or "ai"
     timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     exchange: str = ""
-    trade_type: TradeType = TradeType.DAY
+    trade_type: TradeType = TradeType.SWING
     indicator_values: dict = field(default_factory=dict)
 
 
