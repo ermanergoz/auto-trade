@@ -1624,3 +1624,82 @@ class TestSPYBenchmark:
     def test_config_default_benchmark_is_spy(self):
         assert BacktestConfig(tickers=["AAPL"]).benchmark_ticker == "SPY"
 
+
+# ---------------------------------------------------------------------------
+# Plan 02-02 Task 2: CAPM alpha/beta vs SPY (risk-free-adjusted excess returns)
+# ---------------------------------------------------------------------------
+
+class TestCAPMAlphaBeta:
+    """CAPM regresses RISK-FREE-ADJUSTED excess returns, so strategy==benchmark
+    gives alpha~=0/beta~=1 and a half-beta strategy gives beta~=0.5."""
+
+    def _curve(self, values):
+        return [(date(2024, 1, 1) + timedelta(days=i), v) for i, v in enumerate(values)]
+
+    def _benchmark_values(self):
+        # Varied daily returns so the regression is well-conditioned (non-zero
+        # benchmark variance).
+        rets = [0.01, -0.02, 0.015, 0.03, -0.01, 0.025, -0.018, 0.012, 0.02, -0.005]
+        vals = [100_000.0]
+        for r in rets:
+            vals.append(vals[-1] * (1 + r))
+        return vals, rets
+
+    def test_strategy_equals_benchmark_alpha_zero_beta_one(self):
+        from backtest.report import calculate_capm_metrics
+
+        bench_vals, _ = self._benchmark_values()
+        curve = self._curve(bench_vals)
+        m = calculate_capm_metrics(curve, curve)
+        assert m["alpha"] == pytest.approx(0.0, abs=1e-6)
+        assert m["beta"] == pytest.approx(1.0, abs=1e-6)
+
+    def test_half_beta_strategy(self):
+        from backtest.report import calculate_capm_metrics
+
+        bench_vals, rets = self._benchmark_values()
+        # Strategy daily returns are exactly half the benchmark's → beta ~= 0.5.
+        strat_vals = [100_000.0]
+        for r in rets:
+            strat_vals.append(strat_vals[-1] * (1 + 0.5 * r))
+        m = calculate_capm_metrics(self._curve(strat_vals), self._curve(bench_vals))
+        assert m["beta"] == pytest.approx(0.5, abs=1e-6)
+
+    def test_flat_benchmark_returns_zero_alpha_beta(self):
+        from backtest.report import calculate_capm_metrics
+
+        flat = self._curve([100_000.0] * 6)
+        strat = self._curve([100_000.0 + i * 100 for i in range(6)])
+        m = calculate_capm_metrics(strat, flat)
+        assert m["alpha"] == 0.0
+        assert m["beta"] == 0.0
+
+    def test_calculate_metrics_folds_in_benchmark(self):
+        bench_vals, _ = self._benchmark_values()
+        curve = self._curve(bench_vals)
+        trade = Trade("AAPL", "SMART", 10, 100.0, 110.0,
+                      datetime(2024, 1, 1), datetime(2024, 1, 2), TradeType.DAY)
+        m = calculate_metrics([trade], curve, 100_000, benchmark_curve=curve)
+        for key in ("benchmark_total_return", "benchmark_sharpe", "alpha", "beta"):
+            assert key in m
+        # equity == benchmark → alpha ~= 0, beta ~= 1.
+        assert m["alpha"] == pytest.approx(0.0, abs=1e-6)
+        assert m["beta"] == pytest.approx(1.0, abs=1e-6)
+
+    def test_display_metrics_shows_benchmark_and_alpha(self):
+        from rich.console import Console
+        from backtest import report as report_mod
+
+        bench_vals, _ = self._benchmark_values()
+        curve = self._curve(bench_vals)
+        trade = Trade("AAPL", "SMART", 10, 100.0, 110.0,
+                      datetime(2024, 1, 1), datetime(2024, 1, 2), TradeType.DAY)
+        m = calculate_metrics([trade], curve, 100_000, benchmark_curve=curve)
+
+        buf = Console(record=True, width=200)
+        with patch.object(report_mod, "console", buf):
+            report_mod.display_metrics(m)
+        out = buf.export_text()
+        assert "SPY Return" in out
+        assert "Alpha" in out
+

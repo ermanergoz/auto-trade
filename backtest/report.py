@@ -6,6 +6,9 @@ import math
 from datetime import date
 from typing import Optional
 
+import numpy as np
+from scipy import stats
+
 from rich.console import Console
 from rich.table import Table
 from rich.panel import Panel
@@ -115,6 +118,7 @@ def calculate_metrics(
     spread_bps: float = BACKTEST_SPREAD_BPS,
     commission: float = BACKTEST_COMMISSION,
     commission_per_share: float = BACKTEST_COMMISSION_PER_SHARE,
+    benchmark_curve: Optional[list[tuple[date, float]]] = None,
 ) -> dict:
     """Calculate comprehensive backtest performance metrics.
 
@@ -123,7 +127,19 @@ def calculate_metrics(
     the gross/total-cost/net decomposition reconstructs friction from the stored
     fill prices, not by re-deriving from cash. Pass the portfolio's actual
     params when they differ from the defaults.
+
+    When ``benchmark_curve`` (the SPY buy-and-hold curve aligned to the
+    strategy's warmup-trimmed window) is supplied, the result also carries
+    ``benchmark_total_return``, ``benchmark_sharpe``, and risk-free-adjusted
+    CAPM ``alpha`` / ``beta`` of the strategy vs the benchmark.
     """
+    # CAPM / benchmark block — folded into whichever result we return below.
+    benchmark_metrics = (
+        calculate_capm_metrics(equity_curve, benchmark_curve)
+        if benchmark_curve
+        else {}
+    )
+
     if not trades:
         return {
             "total_return_pct": 0, "annualized_return_pct": 0,
@@ -135,6 +151,7 @@ def calculate_metrics(
             "gross_pnl": 0, "net_pnl": 0, "total_cost": 0,
             "cost_pct_of_gross_pnl": 0, "breakeven_edge_per_trade": 0,
             "final_value": initial_capital,
+            **benchmark_metrics,
         }
 
     # Basic PnL
@@ -223,6 +240,7 @@ def calculate_metrics(
         "breakeven_edge_per_trade": round(breakeven_edge_per_trade, 2),
         "final_value": round(final_value, 2),
         "initial_capital": initial_capital,
+        **benchmark_metrics,
     }
 
 
@@ -284,6 +302,122 @@ def _std(values: list[float]) -> float:
 
 
 # ---------------------------------------------------------------------------
+# CAPM benchmark (SPY) — alpha / beta on risk-free-adjusted excess returns
+# ---------------------------------------------------------------------------
+
+def _daily_returns_from_curve(
+    curve: list[tuple[date, float]],
+) -> list[float]:
+    """Simple daily returns from an equity curve (skips zero-value denominators)."""
+    values = [v for _, v in curve]
+    return [
+        (values[i] - values[i - 1]) / values[i - 1]
+        for i in range(1, len(values))
+        if values[i - 1] != 0
+    ]
+
+
+def calculate_capm_metrics(
+    strategy_curve: list[tuple[date, float]],
+    benchmark_curve: list[tuple[date, float]],
+    risk_free_rate: float = RISK_FREE_RATE,
+) -> dict:
+    """CAPM alpha/beta of the strategy vs the benchmark (SPY).
+
+    The regression is run on RISK-FREE-ADJUSTED EXCESS daily returns — the
+    risk-free rate is subtracted EXPLICITLY (per STACK.md / standard CAPM), so
+    a strategy that merely matches the benchmark shows alpha ~= 0 / beta ~= 1
+    rather than fabricating alpha by omitting the risk-free term:
+
+        excess_strat = strategy_daily_returns - RISK_FREE_RATE/252
+        excess_bench = benchmark_daily_returns - RISK_FREE_RATE/252
+        slope, intercept = linregress(excess_bench, excess_strat)
+        beta            = slope
+        annualized_alpha = intercept * 252
+
+    Both curves must be sampled on the SAME trading days (the engine aligns the
+    benchmark curve to the strategy's warmup-trimmed window) so the excess
+    return series line up bar-for-bar. Returns zeros when there is too little
+    data or the benchmark has degenerate (zero) variance.
+    """
+    result = {
+        "benchmark_total_return": 0.0,
+        "benchmark_sharpe": 0.0,
+        "alpha": 0.0,
+        "beta": 0.0,
+    }
+    if not benchmark_curve or len(benchmark_curve) < 2:
+        return result
+
+    bench_values = [v for _, v in benchmark_curve]
+    if bench_values[0]:
+        result["benchmark_total_return"] = round(
+            (bench_values[-1] / bench_values[0] - 1) * 100, 2
+        )
+    result["benchmark_sharpe"] = round(
+        _calculate_sharpe(benchmark_curve, risk_free_rate), 2
+    )
+
+    strat_r = _daily_returns_from_curve(strategy_curve)
+    bench_r = _daily_returns_from_curve(benchmark_curve)
+    n = min(len(strat_r), len(bench_r))
+    if n < 2:
+        return result
+
+    daily_rf = risk_free_rate / 252
+    excess_strat = np.asarray(strat_r[:n], dtype=float) - daily_rf
+    excess_bench = np.asarray(bench_r[:n], dtype=float) - daily_rf
+
+    # A flat benchmark (zero variance) makes the regression undefined — leave
+    # alpha/beta at zero rather than emitting NaN/inf.
+    if np.std(excess_bench) == 0:
+        return result
+
+    slope, intercept = stats.linregress(excess_bench, excess_strat)[:2]
+    result["beta"] = round(float(slope), 4)
+    result["alpha"] = round(float(intercept) * 252, 4)
+    return result
+
+
+def benchmark_column_metrics(
+    benchmark_curve: list[tuple[date, float]],
+    initial_capital: float,
+) -> dict:
+    """A metrics-shaped dict for rendering the SPY column in compare_configs.
+
+    The benchmark has no trades, so trade-based fields are zeroed; total return,
+    Sharpe and max drawdown come straight off the buy-and-hold curve. Beta vs
+    itself is 1.0 and alpha 0.0 by construction.
+    """
+    if not benchmark_curve or len(benchmark_curve) < 2:
+        return {
+            "total_return_pct": 0.0, "sharpe_ratio": 0.0,
+            "max_drawdown_pct": 0.0, "win_rate_pct": 0.0,
+            "profit_factor": 0.0, "num_trades": 0,
+            "avg_pnl_per_trade": 0.0, "benchmark_total_return": 0.0,
+            "alpha": 0.0, "beta": 0.0,
+            "final_value": initial_capital, "initial_capital": initial_capital,
+        }
+
+    values = [v for _, v in benchmark_curve]
+    total_return = (values[-1] / values[0] - 1) * 100 if values[0] else 0.0
+    return {
+        "total_return_pct": round(total_return, 2),
+        "sharpe_ratio": round(_calculate_sharpe(benchmark_curve, RISK_FREE_RATE), 2),
+        "max_drawdown_pct": round(_calculate_max_drawdown(benchmark_curve), 2),
+        "win_rate_pct": 0.0,
+        "profit_factor": 0.0,
+        "num_trades": 0,
+        "avg_pnl_per_trade": 0.0,
+        "benchmark_total_return": round(total_return, 2),
+        "alpha": 0.0,
+        "beta": 1.0,
+        "final_value": round(values[-1], 2),
+        "initial_capital": initial_capital,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Display
 # ---------------------------------------------------------------------------
 
@@ -303,6 +437,9 @@ def display_metrics(metrics: dict) -> None:
         ("Annualized Return", f"{metrics['annualized_return_pct']:+.2f}%"),
         ("Sharpe Ratio", f"{metrics['sharpe_ratio']:.2f}"),
         ("Max Drawdown", Text(f"-{metrics['max_drawdown_pct']:.2f}%", style="red")),
+        ("SPY Return", f"{metrics.get('benchmark_total_return', 0):+.2f}%"),
+        ("Alpha (annualized)", f"{metrics.get('alpha', 0) * 100:+.2f}%"),
+        ("Beta", f"{metrics.get('beta', 0):.2f}"),
         ("Cost % of Gross P&L", f"{metrics.get('cost_pct_of_gross_pnl', 0):.2f}%"),
         ("Breakeven Edge/Trade", f"${metrics.get('breakeven_edge_per_trade', 0):,.2f}"),
         ("", ""),
@@ -361,6 +498,17 @@ def compare_configs(results_list: list[tuple[str, dict]]) -> None:
             else:
                 row.append(f"{val:{fmt}}")
         table.add_row(*row)
+
+    # Benchmark / CAPM rows. alpha is stored as an annualized return fraction,
+    # rendered here as a percentage. Present per labeled column ("Strategy",
+    # "Random-Entry", "SPY") so the survival-vs-edge comparison is explicit.
+    bench_rows = [
+        ("SPY Return", lambda m: f"{m.get('benchmark_total_return', 0):+.2f}%"),
+        ("Alpha (ann.)", lambda m: f"{m.get('alpha', 0) * 100:+.2f}%"),
+        ("Beta", lambda m: f"{m.get('beta', 0):.2f}"),
+    ]
+    for label, fmt in bench_rows:
+        table.add_row(label, *[fmt(m) for _, m in results_list])
 
     console.print(table)
 
