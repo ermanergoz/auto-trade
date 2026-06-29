@@ -379,11 +379,16 @@ class TestHistoryPeriodAndSurvivorship:
         config = BacktestConfig(tickers=["AAPL"], history_period="3y")
         assert config.history_period == "3y"
 
-    def test_history_period_passed_to_download(self):
+    def test_history_period_passed_to_download(self, monkeypatch):
         """run_backtest must pull config.history_period, not a hardcoded 1y."""
         from unittest.mock import patch
         import pandas as pd
         from backtest.engine import run_backtest
+
+        # Synthetic/mocked download with no pre-holdout end_date → the full-history
+        # holdout preflight would refuse it. Unlock for this mechanics-only test
+        # (scoped to this test; other tests keep the default LOCKED state).
+        monkeypatch.setenv("BORSA_HOLDOUT_UNLOCKED", "1")
 
         captured = {}
 
@@ -690,11 +695,15 @@ class TestBacktestVolatility:
         config = BacktestConfig(tickers=["AAPL"])
         assert config.use_volatility_scaling is False
 
-    def test_volatility_calculated_during_backtest(self):
+    def test_volatility_calculated_during_backtest(self, monkeypatch):
         """When use_volatility_scaling is True, evaluate() should receive volatility."""
         from unittest.mock import patch, MagicMock
         import pandas as pd
         from backtest.engine import run_backtest, BacktestConfig
+
+        # Synthetic/mocked download with no pre-holdout end_date → unlock the
+        # holdout preflight for this mechanics-only test (scoped to this test).
+        monkeypatch.setenv("BORSA_HOLDOUT_UNLOCKED", "1")
 
         # Create data with a sharp drop to trigger Bollinger/RSI signals
         n = 90
@@ -729,7 +738,7 @@ class TestBacktestVolatility:
                     "evaluate() should receive volatility when use_volatility_scaling=True"
                 )
 
-    def test_volatility_is_per_candidate_not_first_ticker(self):
+    def test_volatility_is_per_candidate_not_first_ticker(self, monkeypatch):
         """Each signal must be sized by its OWN realized volatility.
 
         Bug: the previous backtest engine computed `market_volatility` once
@@ -744,6 +753,10 @@ class TestBacktestVolatility:
         from unittest.mock import patch
         import pandas as pd
         from backtest.engine import run_backtest, BacktestConfig
+
+        # Synthetic/mocked download with no pre-holdout end_date → unlock the
+        # holdout preflight for this mechanics-only test (scoped to this test).
+        monkeypatch.setenv("BORSA_HOLDOUT_UNLOCKED", "1")
 
         # Two tickers, very different volatility regimes, both designed so
         # the screener fires on the SAME bar (last row's sharp drop).
@@ -924,11 +937,15 @@ class TestBacktestAntiMomentum:
     and never rejects, inflating backtest performance vs live trading.
     """
 
-    def test_evaluate_receives_current_price(self):
+    def test_evaluate_receives_current_price(self, monkeypatch):
         """evaluate() must receive a non-zero current_price from the backtest."""
         from unittest.mock import patch, MagicMock
         import pandas as pd
         from backtest.engine import run_backtest
+
+        # Synthetic/mocked download with no pre-holdout end_date → unlock the
+        # holdout preflight for this mechanics-only test (scoped to this test).
+        monkeypatch.setenv("BORSA_HOLDOUT_UNLOCKED", "1")
 
         # Create data with a sharp move to trigger signals
         n = 90
