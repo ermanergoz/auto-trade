@@ -127,8 +127,12 @@ OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
 # ---------------------------------------------------------------------------
 # Risk Management
 # ---------------------------------------------------------------------------
-MAX_POSITION_SIZE_PCT = 50.0
+MAX_POSITION_SIZE_PCT = 15.0    # Hard ceiling per position; RISK_PER_TRADE_PCT is the binding sizing constraint
 DAILY_LOSS_LIMIT_PCT = 10.0
+# Caps total open at-risk capital (sum of entry→stop risk across open positions)
+# as a % of equity. Intentionally tighter than DAILY_LOSS_LIMIT_PCT — a tighter
+# concentration sibling of the daily-loss-tied cumulative-risk check.
+MAX_PORTFOLIO_HEAT_PCT = 6.0
 MAX_OPEN_POSITIONS = 3
 DEFAULT_STOP_LOSS_PCT = 3.0
 DEFAULT_TAKE_PROFIT_PCT = 6.0
@@ -326,6 +330,9 @@ def validate_settings() -> list[str]:
 
     if DEFAULT_TRADE_TYPE not in ("day", "swing"):
         errors.append(f"DEFAULT_TRADE_TYPE must be one of day/swing, got {DEFAULT_TRADE_TYPE!r}")
+
+    if not (0 < MAX_PORTFOLIO_HEAT_PCT <= 100):
+        errors.append(f"MAX_PORTFOLIO_HEAT_PCT must be 0-100, got {MAX_PORTFOLIO_HEAT_PCT}")
 
     if PDT_MAX_DAY_TRADES_PER_5_DAYS < 0:
         errors.append(f"PDT_MAX_DAY_TRADES_PER_5_DAYS must be non-negative, got {PDT_MAX_DAY_TRADES_PER_5_DAYS}")
