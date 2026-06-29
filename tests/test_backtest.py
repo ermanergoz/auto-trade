@@ -74,7 +74,7 @@ class TestSimulatedPortfolio:
         non-sensical exit.
         """
         p = SimulatedPortfolio(
-            initial_capital=100_000, slippage_pct=0.0, commission=0.0,
+            initial_capital=100_000, slippage_pct=0.0, commission=0.0, spread_bps=0.0,
         )
         # Signal: long AAPL at $100 with SL=$95 (5% risk) and TP=$110 (10% target)
         sig = _make_signal(
@@ -100,7 +100,7 @@ class TestSimulatedPortfolio:
     def test_stop_and_target_rescaled_to_fill_on_gap_up_short(self):
         """Short version of the gap rescaling: SL above fill, TP below."""
         p = SimulatedPortfolio(
-            initial_capital=100_000, slippage_pct=0.0, commission=0.0,
+            initial_capital=100_000, slippage_pct=0.0, commission=0.0, spread_bps=0.0,
         )
         # Short AAPL at $100 with SL=$105 (5% risk above) and TP=$90 (10% target below)
         sig = _make_signal(
@@ -151,7 +151,7 @@ class TestCommissionPerShare:
     def test_small_position_hits_minimum(self):
         """A 10-share trade pays the $1 minimum, not $0.05."""
         p = SimulatedPortfolio(
-            initial_capital=100_000, slippage_pct=0.0,
+            initial_capital=100_000, slippage_pct=0.0, spread_bps=0.0,
         )
         sig = _make_signal(action=Action.BUY, entry_price=100.0,
                            stop_loss=95.0, take_profit=110.0)
@@ -169,7 +169,7 @@ class TestShortPositionAccounting:
 
     def test_short_open_credits_cash(self):
         """Opening a short sale should ADD cash (you receive sale proceeds)."""
-        p = SimulatedPortfolio(initial_capital=100_000, slippage_pct=0, commission=0)
+        p = SimulatedPortfolio(initial_capital=100_000, slippage_pct=0, commission=0, spread_bps=0)
         sig = _make_signal(action=Action.SELL, entry_price=100.0,
                            stop_loss=110.0, take_profit=90.0)
         p.open_position(sig, 10, 100.0, datetime(2024, 1, 15))
@@ -180,7 +180,7 @@ class TestShortPositionAccounting:
 
     def test_short_position_stores_negative_quantity(self):
         """Short positions must have negative quantity."""
-        p = SimulatedPortfolio(initial_capital=100_000, slippage_pct=0, commission=0)
+        p = SimulatedPortfolio(initial_capital=100_000, slippage_pct=0, commission=0, spread_bps=0)
         sig = _make_signal(action=Action.SELL, entry_price=100.0,
                            stop_loss=110.0, take_profit=90.0)
         p.open_position(sig, 10, 100.0, datetime(2024, 1, 15))
@@ -189,7 +189,7 @@ class TestShortPositionAccounting:
 
     def test_short_close_debits_cash(self):
         """Closing a short (buying back) should DEBIT cash."""
-        p = SimulatedPortfolio(initial_capital=100_000, slippage_pct=0, commission=0)
+        p = SimulatedPortfolio(initial_capital=100_000, slippage_pct=0, commission=0, spread_bps=0)
         sig = _make_signal(action=Action.SELL, entry_price=100.0,
                            stop_loss=110.0, take_profit=90.0)
         p.open_position(sig, 10, 100.0, datetime(2024, 1, 15))
@@ -202,7 +202,7 @@ class TestShortPositionAccounting:
 
     def test_short_profitable_trade_pnl(self):
         """Short that drops in price should have positive P&L."""
-        p = SimulatedPortfolio(initial_capital=100_000, slippage_pct=0, commission=0)
+        p = SimulatedPortfolio(initial_capital=100_000, slippage_pct=0, commission=0, spread_bps=0)
         sig = _make_signal(action=Action.SELL, entry_price=100.0,
                            stop_loss=110.0, take_profit=90.0)
         p.open_position(sig, 10, 100.0, datetime(2024, 1, 15))
@@ -214,7 +214,7 @@ class TestShortPositionAccounting:
 
     def test_short_losing_trade_pnl(self):
         """Short that rises in price should have negative P&L."""
-        p = SimulatedPortfolio(initial_capital=100_000, slippage_pct=0, commission=0)
+        p = SimulatedPortfolio(initial_capital=100_000, slippage_pct=0, commission=0, spread_bps=0)
         sig = _make_signal(action=Action.SELL, entry_price=100.0,
                            stop_loss=110.0, take_profit=90.0)
         p.open_position(sig, 10, 100.0, datetime(2024, 1, 15))
@@ -226,7 +226,7 @@ class TestShortPositionAccounting:
 
     def test_short_mtm_reduces_portfolio_value(self):
         """Short position should reduce portfolio value by its notional."""
-        p = SimulatedPortfolio(initial_capital=100_000, slippage_pct=0, commission=0)
+        p = SimulatedPortfolio(initial_capital=100_000, slippage_pct=0, commission=0, spread_bps=0)
         sig = _make_signal(action=Action.SELL, entry_price=100.0,
                            stop_loss=110.0, take_profit=90.0)
         p.open_position(sig, 10, 100.0, datetime(2024, 1, 15))
@@ -241,7 +241,7 @@ class TestShortPositionAccounting:
         from backtest.engine import _check_exits
         from core.models import Position, TradeType
 
-        portfolio = SimulatedPortfolio(initial_capital=100_000, slippage_pct=0, commission=0)
+        portfolio = SimulatedPortfolio(initial_capital=100_000, slippage_pct=0, commission=0, spread_bps=0)
         portfolio.positions.append(Position(
             ticker="SHORT", exchange="SMART", quantity=-10,
             entry_price=100.0, entry_time=datetime(2024, 1, 1),
@@ -315,7 +315,7 @@ class TestGapDownStopLoss:
         from backtest.engine import SimulatedPortfolio, _check_exits
         from core.models import Position, TradeType
 
-        portfolio = SimulatedPortfolio(initial_capital=100_000, slippage_pct=0, commission=0)
+        portfolio = SimulatedPortfolio(initial_capital=100_000, slippage_pct=0, commission=0, spread_bps=0)
         # Position with stop-loss at $95
         portfolio.positions.append(Position(
             ticker="GAP", exchange="SMART", quantity=100,
@@ -343,7 +343,7 @@ class TestGapDownStopLoss:
         from backtest.engine import SimulatedPortfolio, _check_exits
         from core.models import Position, TradeType
 
-        portfolio = SimulatedPortfolio(initial_capital=100_000, slippage_pct=0, commission=0)
+        portfolio = SimulatedPortfolio(initial_capital=100_000, slippage_pct=0, commission=0, spread_bps=0)
         portfolio.positions.append(Position(
             ticker="NORM", exchange="SMART", quantity=100,
             entry_price=100.0, entry_time=datetime(2024, 1, 1),
@@ -370,7 +370,7 @@ class TestGapDownStopLoss:
         from backtest.engine import SimulatedPortfolio, _check_exits
         from core.models import Position, TradeType
 
-        portfolio = SimulatedPortfolio(initial_capital=200_000, slippage_pct=0, commission=0)
+        portfolio = SimulatedPortfolio(initial_capital=200_000, slippage_pct=0, commission=0, spread_bps=0)
         portfolio.positions.append(Position(
             ticker="SGAP", exchange="SMART", quantity=-100,
             entry_price=100.0, entry_time=datetime(2024, 1, 1),
@@ -411,7 +411,7 @@ class TestEquityCurveMTM:
 
     def test_equity_curve_uses_current_prices(self):
         """record_equity with current_prices should value positions at market price."""
-        p = SimulatedPortfolio(initial_capital=100_000, slippage_pct=0, commission=0)
+        p = SimulatedPortfolio(initial_capital=100_000, slippage_pct=0, commission=0, spread_bps=0)
         sig = _make_signal(entry_price=100.0)
         p.open_position(sig, 10, 100.0, datetime(2024, 1, 15))
         # Cash = 99_000, position = 10 shares entered at $100
@@ -425,7 +425,7 @@ class TestEquityCurveMTM:
 
     def test_daily_pnl_reflects_price_changes(self):
         """daily_pnl should capture unrealized gains from price movement."""
-        p = SimulatedPortfolio(initial_capital=100_000, slippage_pct=0, commission=0)
+        p = SimulatedPortfolio(initial_capital=100_000, slippage_pct=0, commission=0, spread_bps=0)
         sig = _make_signal(entry_price=100.0)
         p.open_position(sig, 10, 100.0, datetime(2024, 1, 15))
 
@@ -444,7 +444,7 @@ class TestEquityCurveNoCandidateDays:
 
     def test_no_candidate_day_still_uses_mtm_prices(self):
         """When no candidates pass screening, equity should still reflect current prices."""
-        p = SimulatedPortfolio(initial_capital=100_000, slippage_pct=0, commission=0)
+        p = SimulatedPortfolio(initial_capital=100_000, slippage_pct=0, commission=0, spread_bps=0)
         sig = _make_signal(entry_price=100.0)
         p.open_position(sig, 10, 100.0, datetime(2024, 1, 14))
         # Cash = 99_000, position = 10 shares @ $100
@@ -462,7 +462,7 @@ class TestEquityCurveNoCandidateDays:
         )
 
         # Without MTM: equity would be 99_000 + 10*100 = 100_000 (wrong)
-        p_bad = SimulatedPortfolio(initial_capital=100_000, slippage_pct=0, commission=0)
+        p_bad = SimulatedPortfolio(initial_capital=100_000, slippage_pct=0, commission=0, spread_bps=0)
         p_bad.open_position(sig, 10, 100.0, datetime(2024, 1, 14))
         p_bad.record_equity(date(2024, 1, 14))
         p_bad.record_equity(date(2024, 1, 15))  # no current_prices!
@@ -860,7 +860,7 @@ class TestSimultaneousTPSLResolution:
         from backtest.engine import SimulatedPortfolio, _check_exits
         from core.models import Position, TradeType
 
-        portfolio = SimulatedPortfolio(initial_capital=100_000, slippage_pct=0, commission=0)
+        portfolio = SimulatedPortfolio(initial_capital=100_000, slippage_pct=0, commission=0, spread_bps=0)
         portfolio.positions.append(Position(
             ticker="WIDE", exchange="SMART", quantity=100,
             entry_price=100.0, entry_time=datetime(2024, 1, 1),
@@ -888,7 +888,7 @@ class TestSimultaneousTPSLResolution:
         from backtest.engine import SimulatedPortfolio, _check_exits
         from core.models import Position, TradeType
 
-        portfolio = SimulatedPortfolio(initial_capital=100_000, slippage_pct=0, commission=0)
+        portfolio = SimulatedPortfolio(initial_capital=100_000, slippage_pct=0, commission=0, spread_bps=0)
         portfolio.positions.append(Position(
             ticker="DROP", exchange="SMART", quantity=100,
             entry_price=100.0, entry_time=datetime(2024, 1, 1),
@@ -915,7 +915,7 @@ class TestSimultaneousTPSLResolution:
         from backtest.engine import SimulatedPortfolio, _check_exits
         from core.models import Position, TradeType
 
-        portfolio = SimulatedPortfolio(initial_capital=200_000, slippage_pct=0, commission=0)
+        portfolio = SimulatedPortfolio(initial_capital=200_000, slippage_pct=0, commission=0, spread_bps=0)
         portfolio.positions.append(Position(
             ticker="SGAP", exchange="SMART", quantity=-100,
             entry_price=100.0, entry_time=datetime(2024, 1, 1),
@@ -940,7 +940,7 @@ class TestSimultaneousTPSLResolution:
         from backtest.engine import SimulatedPortfolio, _check_exits
         from core.models import Position, TradeType
 
-        portfolio = SimulatedPortfolio(initial_capital=200_000, slippage_pct=0, commission=0)
+        portfolio = SimulatedPortfolio(initial_capital=200_000, slippage_pct=0, commission=0, spread_bps=0)
         portfolio.positions.append(Position(
             ticker="SWIN", exchange="SMART", quantity=-100,
             entry_price=100.0, entry_time=datetime(2024, 1, 1),
@@ -969,7 +969,7 @@ class TestDailyPnlMTMConsistency:
 
     def test_daily_pnl_property_matches_mtm(self):
         """The daily_pnl property should agree with daily_pnl_mtm when no prices given."""
-        p = SimulatedPortfolio(initial_capital=100_000, slippage_pct=0, commission=0)
+        p = SimulatedPortfolio(initial_capital=100_000, slippage_pct=0, commission=0, spread_bps=0)
         sig = _make_signal(entry_price=100.0)
         p.open_position(sig, 10, 100.0, datetime(2024, 1, 15))
         # Record equity at entry price

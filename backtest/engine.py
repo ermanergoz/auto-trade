@@ -13,6 +13,7 @@ import pandas as pd
 
 from config.settings import (
     BACKTEST_SLIPPAGE_PCT, BACKTEST_COMMISSION, BACKTEST_COMMISSION_PER_SHARE,
+    BACKTEST_SPREAD_BPS,
     DEFAULT_STOP_LOSS_PCT, DEFAULT_TAKE_PROFIT_PCT,
     MAX_EXTENSION_OVER_MA20_PCT,
 )
@@ -42,6 +43,10 @@ class SimulatedPortfolio:
     # A flat per-trade fee undercounts friction on large positions.
     commission: float = BACKTEST_COMMISSION
     commission_per_share: float = BACKTEST_COMMISSION_PER_SHARE
+    # Bid-ask spread crossed on EACH leg, in basis points (half-the-spread
+    # model). Entry crosses the ask (worse), exit crosses the bid (worse),
+    # on top of slippage_pct. spread_bps=0 reproduces the pre-spread fills.
+    spread_bps: float = BACKTEST_SPREAD_BPS
 
     def __post_init__(self):
         if self.cash == 0:
@@ -92,12 +97,16 @@ class SimulatedPortfolio:
         return self.portfolio_value - self.equity_curve[-1][1]
 
     def open_position(self, signal: Signal, quantity: int, fill_price: float, current_date: datetime) -> None:
-        """Open a new position with slippage and commission."""
-        # Apply slippage
+        """Open a new position with slippage, spread, and commission."""
+        # Apply slippage + half-spread per leg. The entry leg crosses the
+        # spread the wrong way: a BUY pays up (crosses the ask), a short SELL
+        # receives less (crosses the bid). spread_bps is charged on top of
+        # slippage_pct so a round trip pays the spread on both legs.
+        spread_frac = self.spread_bps / 10_000.0
         if signal.action == Action.BUY:
-            adjusted_price = fill_price * (1 + self.slippage_pct / 100)
+            adjusted_price = fill_price * (1 + self.slippage_pct / 100 + spread_frac)
         else:
-            adjusted_price = fill_price * (1 - self.slippage_pct / 100)
+            adjusted_price = fill_price * (1 - self.slippage_pct / 100 - spread_frac)
 
         # Rescale SL/TP to preserve the intended risk/reward percentage relative
         # to the actual fill price. The signal's SL/TP are computed from the
@@ -156,11 +165,14 @@ class SimulatedPortfolio:
         if not pos:
             return None
 
-        # Apply slippage on exit (direction depends on position side)
-        if pos.quantity > 0:  # long: selling, slippage lowers exit price
-            adjusted_exit = exit_price * (1 - self.slippage_pct / 100)
-        else:  # short: buying back, slippage raises exit price
-            adjusted_exit = exit_price * (1 + self.slippage_pct / 100)
+        # Apply slippage + half-spread on exit (direction depends on side).
+        # The exit leg also crosses the spread the wrong way: a long sells
+        # into the bid (worse), a short buys back at the ask (worse).
+        spread_frac = self.spread_bps / 10_000.0
+        if pos.quantity > 0:  # long: selling, slippage + spread lower exit price
+            adjusted_exit = exit_price * (1 - self.slippage_pct / 100 - spread_frac)
+        else:  # short: buying back, slippage + spread raise exit price
+            adjusted_exit = exit_price * (1 + self.slippage_pct / 100 + spread_frac)
         exit_commission = self._commission_for(pos.quantity)
         self.cash += adjusted_exit * pos.quantity - exit_commission
 
@@ -281,6 +293,7 @@ class BacktestConfig:
     slippage_pct: float = BACKTEST_SLIPPAGE_PCT
     commission: float = BACKTEST_COMMISSION
     commission_per_share: float = BACKTEST_COMMISSION_PER_SHARE
+    spread_bps: float = BACKTEST_SPREAD_BPS  # bid-ask spread per leg, basis points
     use_ai: bool = False  # AI analysis is expensive; default to screener-only
     min_screener_score: float = 15.0
     indicator_weights: dict[str, float] | None = None
@@ -348,6 +361,7 @@ def run_backtest(config: BacktestConfig) -> SimulatedPortfolio:
         slippage_pct=config.slippage_pct,
         commission=config.commission,
         commission_per_share=config.commission_per_share,
+        spread_bps=config.spread_bps,
     )
 
     # Iterate day by day (skip warmup period)

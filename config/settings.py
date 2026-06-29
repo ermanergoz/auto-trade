@@ -246,6 +246,13 @@ BACKTEST_SLIPPAGE_PCT = 0.1
 # positions (1000+ shares) and inflates reported Sharpe/profit factor.
 BACKTEST_COMMISSION = 1.0             # Minimum $ per trade (IBKR min)
 BACKTEST_COMMISSION_PER_SHARE = 0.005  # $ per share on top of the minimum
+# Bid-ask spread cost in basis points, crossed on EACH leg (the
+# half-the-spread model): entry crosses the ask and pays up, exit crosses
+# the bid and receives less. ~1-5 bps for liquid large-cap, 10-30+ for
+# small-cap. Charged per leg on top of slippage_pct, so a round trip pays
+# the spread twice. Set to 0 to reproduce the pre-spread fills. See the
+# STACK cost table (round-trip cost ~ commission_min + 2 x (half_spread + slippage)).
+BACKTEST_SPREAD_BPS = 5.0  # basis points per leg (half-spread crossed each side)
 RISK_FREE_RATE = 0.05  # for Sharpe ratio
 
 # ---------------------------------------------------------------------------
@@ -283,6 +290,9 @@ def validate_settings() -> list[str]:
 
     if DEFAULT_STOP_LOSS_PCT <= 0:
         errors.append(f"DEFAULT_STOP_LOSS_PCT must be positive, got {DEFAULT_STOP_LOSS_PCT}")
+
+    if BACKTEST_SPREAD_BPS < 0:
+        errors.append(f"BACKTEST_SPREAD_BPS must be >= 0, got {BACKTEST_SPREAD_BPS}")
 
     if not (0 < AI_CONFIDENCE_THRESHOLD <= 100):
         errors.append(f"AI_CONFIDENCE_THRESHOLD must be 1-100, got {AI_CONFIDENCE_THRESHOLD}")
