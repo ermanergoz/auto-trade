@@ -9,9 +9,14 @@ is driven by the OOS *observation* count, never the trade count.
 import numpy as np
 import pytest
 
+from scipy.stats import ttest_1samp
+
 from backtest.stats import (
     deflated_sharpe_ratio,
+    min_trade_gate,
+    per_trade_tstat,
     probabilistic_sharpe_ratio,
+    win_rate_binomial_ci,
 )
 
 
@@ -91,3 +96,60 @@ def test_dsr_docstring_defines_n_obs_as_observation_count():
     lowered = doc.lower()
     assert "observation" in lowered
     assert "not the trade count" in lowered or "not the number of trades" in lowered
+
+
+# --- Per-trade t-stat -----------------------------------------------------------
+
+
+def test_per_trade_tstat_matches_scipy():
+    returns = np.array([0.02, -0.01, 0.03, 0.015, -0.005, 0.025, 0.01, -0.02])
+    expected = float(ttest_1samp(returns, 0.0).statistic)
+    assert per_trade_tstat(returns) == pytest.approx(expected, abs=1e-12)
+
+
+def test_per_trade_tstat_flags_clearly_positive_sample():
+    # Small, consistently positive returns -> a large positive t-stat (|t| > 2).
+    returns = np.array([0.012, 0.010, 0.011, 0.013, 0.009, 0.012, 0.010, 0.011])
+    assert abs(per_trade_tstat(returns)) > 2.0
+
+
+def test_per_trade_tstat_does_not_flag_coin_flip_sample():
+    # Symmetric +/- returns with near-zero mean -> |t| well under 2.
+    returns = np.array([0.05, -0.05, 0.04, -0.04, 0.045, -0.045, 0.05, -0.05])
+    assert abs(per_trade_tstat(returns)) < 2.0
+
+
+# --- Minimum-trade gate ---------------------------------------------------------
+
+
+def test_min_trade_gate_false_below_thirty():
+    assert min_trade_gate(29) is False
+    assert min_trade_gate(0) is False
+
+
+def test_min_trade_gate_true_at_and_above_thirty():
+    assert min_trade_gate(30) is True
+    assert min_trade_gate(100) is True
+
+
+def test_min_trade_gate_respects_custom_minimum():
+    assert min_trade_gate(49, minimum=50) is False
+    assert min_trade_gate(50, minimum=50) is True
+
+
+# --- Win-rate binomial CI -------------------------------------------------------
+
+
+def test_win_rate_ci_contains_point_estimate():
+    low, high = win_rate_binomial_ci(4, 6)
+    assert low <= 4 / 6 <= high
+
+
+def test_win_rate_ci_4_of_6_known_answer():
+    # 4/6 wins -> Clopper-Pearson 95% CI ~ [0.22, 0.96] (STACK.md example):
+    # indistinguishable from a coin flip.
+    low, high = win_rate_binomial_ci(4, 6)
+    assert low == pytest.approx(0.22277809550351219, abs=1e-9)
+    assert high == pytest.approx(0.9567281317072583, abs=1e-9)
+    assert 0.20 < low < 0.25
+    assert 0.94 < high < 0.97
