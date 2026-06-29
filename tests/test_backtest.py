@@ -2177,3 +2177,162 @@ class TestDowFilterBacktest:
         assert "DOWN" not in _touched(filtered), (
             "use_dow_filter=True must drop the downtrending ticker before entry"
         )
+
+
+# ---------------------------------------------------------------------------
+# Plan 02-06 Task 2: SPY market-regime gate (DOW-03)
+# ---------------------------------------------------------------------------
+
+class TestMarketRegimeGate:
+    """A SPY market-regime gate that skips long entries on any bar where the
+    benchmark trend — dow_trend on the RAW full-history SPY close sliced
+    strictly BEFORE current_date — is not UPTREND ("don't buy into a falling
+    market"). Default OFF for parity; fed the raw benchmark_prices, never the
+    warmup-trimmed normalized benchmark_curve; look-ahead-safe."""
+
+    def test_config_defaults_regime_filter_off(self):
+        assert BacktestConfig(tickers=["AAPL"]).use_market_regime_filter is False
+
+    def test_config_accepts_regime_filter(self):
+        cfg = BacktestConfig(tickers=["AAPL"], use_market_regime_filter=True)
+        assert cfg.use_market_regime_filter is True
+
+    def _run_with_spy(self, monkeypatch, spy_closes, regime_on):
+        """Run a backtest where the ONLY long/short decision is a steady approved
+        BUY in 'STK', so the market-regime gate is the sole differentiator. The
+        screener and risk manager are stubbed; a real synthetic SPY frame flows
+        through the engine so portfolio.benchmark_prices is the genuine raw close.
+        """
+        from unittest.mock import patch
+        from backtest.engine import run_backtest
+
+        # Synthetic full-history mock with no pre-holdout end_date below → unlock
+        # the holdout preflight for this mechanics-only test (scoped per-test).
+        monkeypatch.setenv("BORSA_HOLDOUT_UNLOCKED", "1")
+
+        n = len(spy_closes)
+        dates = pd.date_range("2021-01-01", periods=n, freq="D")
+        stk = _ohlc_frame([100.0 + (i % 3) for i in range(n)], dates)
+        spy = _ohlc_frame(spy_closes, dates)
+
+        def _fake_yf(ticker, *args, **kwargs):
+            return {"STK": stk, "SPY": spy}.get(ticker, pd.DataFrame())
+
+        buy = _make_signal(
+            ticker="STK", action=Action.BUY, entry_price=100.0,
+            stop_loss=95.0, take_profit=115.0,
+        )
+
+        def _fake_screen(*args, **kwargs):
+            return [buy]
+
+        def _approve_all(*args, **kwargs):
+            return RiskResult(approved=True, reasons=[], position_size=10)
+
+        cfg = BacktestConfig(
+            tickers=["STK"], min_screener_score=0.1,
+            use_market_regime_filter=regime_on, end_date="2021-12-31",
+        )
+        with patch("backtest.engine.get_historical_data_yfinance", side_effect=_fake_yf), \
+             patch("backtest.engine.screen_stocks", side_effect=_fake_screen), \
+             patch("backtest.engine.evaluate", side_effect=_approve_all):
+            return run_backtest(cfg)
+
+    @staticmethod
+    def _touched(p):
+        return {t.ticker for t in p.trades} | {pos.ticker for pos in p.positions}
+
+    def test_downtrend_spy_blocks_longs(self, monkeypatch):
+        """With the gate ON and a raw SPY in a clear downtrend, no longs open."""
+        n = 140
+        spy_down = [400.0 - i * 1.5 for i in range(n)]   # DOWNTREND throughout
+        p = self._run_with_spy(monkeypatch, spy_down, regime_on=True)
+        assert "STK" not in self._touched(p), (
+            "Regime gate must skip every long while the SPY trend is not UPTREND"
+        )
+
+    def test_uptrend_spy_allows_longs(self, monkeypatch):
+        """With the gate ON and a raw SPY uptrend, long entries proceed."""
+        n = 140
+        spy_up = [400.0 + i * 1.5 for i in range(n)]     # UPTREND throughout
+        p = self._run_with_spy(monkeypatch, spy_up, regime_on=True)
+        assert "STK" in self._touched(p), (
+            "Longs must proceed while the SPY trend is UPTREND"
+        )
+
+    def test_gate_off_ignores_spy_downtrend(self, monkeypatch):
+        """Parity: with the gate OFF, a downtrend SPY does not block longs."""
+        n = 140
+        spy_down = [400.0 - i * 1.5 for i in range(n)]
+        p = self._run_with_spy(monkeypatch, spy_down, regime_on=False)
+        assert "STK" in self._touched(p), (
+            "With the gate OFF the baseline must enter regardless of SPY trend"
+        )
+
+    def test_gate_reads_raw_full_history_close(self, monkeypatch):
+        """The gate is fed the RAW full-history close (benchmark_prices), which
+        is longer than the warmup-trimmed benchmark_curve. A run on an uptrend
+        SPY attaches the raw series and lets longs through."""
+        n = 140
+        spy_up = [400.0 + i * 1.5 for i in range(n)]
+        p = self._run_with_spy(monkeypatch, spy_up, regime_on=True)
+        assert p.benchmark_prices is not None
+        assert len(p.benchmark_prices) == n
+        # Raw close is strictly longer than the warmup-trimmed aligned curve.
+        assert len(p.benchmark_prices) > len(p.benchmark_curve)
+
+    def test_regime_gate_slices_strictly_before_current_date(self):
+        """No look-ahead: the gate evaluates dow_trend on bars strictly BEFORE
+        current_date. A bearish break-of-structure bar that IS current_date is
+        excluded (still UPTREND); once it falls before current_date it flips the
+        verdict — proving `< current_date`, not `<=`."""
+        from backtest.engine import _market_regime_allows_long
+
+        # Zigzag uptrend (confirmed higher swing highs AND higher swing lows),
+        # then one final bar that craters below the last confirmed swing low →
+        # a break-of-structure that dow_trend flips to DOWNTREND.
+        pivots = [100, 112, 106, 124, 118, 136, 130, 148]
+        seg = 5
+        closes: list[float] = []
+        for a, b in zip(pivots, pivots[1:]):
+            closes.extend(a + (b - a) * k / seg for k in range(seg))
+        closes.append(float(pivots[-1]))
+        closes.append(80.0)  # break-of-structure crater (below last swing low)
+
+        dates = pd.date_range("2021-01-01", periods=len(closes), freq="D")
+        s = pd.Series(closes, index=dates)
+
+        crater_date = dates[-1].date()
+        # current_date == crater bar → strict `<` excludes it → pure uptrend → allow.
+        assert _market_regime_allows_long(s, crater_date) is True
+        # One day later the crater bar is now strictly before current_date →
+        # break-of-structure → not UPTREND → longs blocked.
+        after = (dates[-1] + pd.Timedelta(days=1)).date()
+        assert _market_regime_allows_long(s, after) is False
+
+    def test_gate_uses_raw_not_trimmed_series(self):
+        """WHY the raw series is mandatory: a long raw uptrend classifies as
+        UPTREND (longs allowed), but the short warmup-trimmed curve that exists at
+        an OOS-fold start is too short for dow_trend to confirm a trend (RANGE) and
+        would WRONGLY block longs. The gate must read benchmark_prices, not the
+        trimmed benchmark_curve."""
+        from backtest.engine import _market_regime_allows_long
+
+        n = 120
+        dates = pd.date_range("2021-01-01", periods=n, freq="D")
+        raw_up = pd.Series([400.0 + i for i in range(n)], index=dates)
+        cur = (dates[-1] + pd.Timedelta(days=1)).date()
+        assert _market_regime_allows_long(raw_up, cur) is True
+        # The trimmed-curve analogue (a handful of bars) cannot confirm an uptrend.
+        trimmed_like = raw_up.iloc[-5:]
+        assert _market_regime_allows_long(trimmed_like, cur) is False
+
+    def test_gate_fails_open_when_no_benchmark(self):
+        """A missing benchmark download must never silently disable the strategy:
+        with no series the gate fails OPEN (allows longs)."""
+        from backtest.engine import _market_regime_allows_long
+
+        assert _market_regime_allows_long(None, date(2021, 6, 1)) is True
+        assert _market_regime_allows_long(
+            pd.Series([], dtype=float), date(2021, 6, 1)
+        ) is True

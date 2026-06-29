@@ -19,7 +19,7 @@ from config.settings import (
     MAX_EXTENSION_OVER_MA20_PCT,
 )
 from core.models import Signal, Position, Trade, Action, TradeType
-from core.screener import screen_stocks
+from core.screener import screen_stocks, dow_trend, DowTrend
 from core.risk import evaluate, RiskResult, calculate_realized_volatility
 from core.data import get_historical_data_yfinance
 from backtest.holdout import assert_range_excludes_holdout
@@ -336,6 +336,16 @@ class BacktestConfig:
     # beat the no-Dow baseline net of costs out-of-sample (run the walk-forward
     # both ways and keep only if it wins).
     use_dow_filter: bool = False
+    # SPY market-regime gate (DOW-03): when True, skip ALL long entries on any
+    # bar where the benchmark (SPY) dow_trend — evaluated on the RAW full-history
+    # close (portfolio.benchmark_prices) sliced strictly before the bar — is not
+    # UPTREND ("don't buy into a falling market"). Shorts are unaffected. Default
+    # OFF for the same parity/validation reason as use_dow_filter; kept only if it
+    # beats baseline net of costs OOS. CRITICAL: the gate must read the RAW
+    # full-history close, never the warmup-trimmed normalized benchmark_curve —
+    # the trimmed curve is too short at the start of each OOS fold and would force
+    # RANGE -> block all longs -> unfairly fail the filter.
+    use_market_regime_filter: bool = False
 
 
 def _build_benchmark_curve(
@@ -412,6 +422,39 @@ def _random_entry_candidates(
             indicator_values={},
         ))
     return signals
+
+
+def _market_regime_allows_long(
+    benchmark_close: Optional[pd.Series], current_date: date
+) -> bool:
+    """Whether long entries are allowed on ``current_date`` under the SPY gate.
+
+    Evaluates ``dow_trend`` on the RAW benchmark close sliced strictly BEFORE
+    ``current_date`` — mirroring the screener's ``< current_date`` no-look-ahead
+    discipline (engine.py per-bar slicing) so the gate never sees the current
+    bar's index level. Longs are allowed ONLY when the benchmark trend is
+    UPTREND ("don't buy into a falling market").
+
+    The RAW, full-history ``portfolio.benchmark_prices`` series is used
+    deliberately, NOT the warmup-trimmed normalized ``benchmark_curve``: the raw
+    series is long enough at the start of each OOS fold to classify a real trend,
+    whereas the trimmed curve would be too short there and collapse to RANGE,
+    blocking every long and unfairly failing the filter.
+
+    Fails OPEN (returns True) when no benchmark series is available or the
+    pre-date slice is empty, so a missing SPY download never silently disables
+    the strategy.
+    """
+    if benchmark_close is None or len(benchmark_close) == 0:
+        return True
+    idx = benchmark_close.index
+    if isinstance(idx, pd.DatetimeIndex):
+        hist = benchmark_close[idx.date < current_date]
+    else:
+        hist = benchmark_close[idx < current_date]
+    if len(hist) == 0:
+        return True
+    return dow_trend(hist).trend is DowTrend.UPTREND
 
 
 def run_backtest(config: BacktestConfig) -> SimulatedPortfolio:
@@ -500,6 +543,14 @@ def run_backtest(config: BacktestConfig) -> SimulatedPortfolio:
         spread_bps=config.spread_bps,
     )
 
+    # Expose the RAW, full-history, un-trimmed SPY close BEFORE the loop so the
+    # market-regime gate can slice it per bar. This is the un-normalized full
+    # download — never the warmup-trimmed normalized benchmark_curve (which is
+    # built post-loop). Reuses the single 02-02 benchmark download; no second
+    # fetch. None when the benchmark download was empty (gate fails open).
+    if benchmark_df is not None and not benchmark_df.empty:
+        portfolio.benchmark_prices = benchmark_df["close"]
+
     # Iterate day by day (skip warmup period)
     current_dt = datetime.combine(sorted_dates[warmup], datetime.min.time())
     for i, current_date in enumerate(sorted_dates[warmup:], start=warmup):
@@ -557,6 +608,16 @@ def run_backtest(config: BacktestConfig) -> SimulatedPortfolio:
             portfolio.record_equity(current_date, current_prices=eod_prices)
             continue
 
+        # Step 3b: SPY market-regime gate (DOW-03). When enabled, skip ALL long
+        # entries on any bar where the benchmark trend (dow_trend on the RAW
+        # full-history SPY close sliced strictly BEFORE current_date) is not
+        # UPTREND. Shorts are unaffected. Evaluated once per bar.
+        allow_longs = True
+        if config.use_market_regime_filter:
+            allow_longs = _market_regime_allows_long(
+                portfolio.benchmark_prices, current_date,
+            )
+
         # Step 4: Risk check and execute
         # Use decision-time open prices for portfolio value / daily PnL so
         # risk gates aren't comparing against prices that hadn't yet been
@@ -568,6 +629,10 @@ def run_backtest(config: BacktestConfig) -> SimulatedPortfolio:
         # that doesn't drift down as today's losses accumulate.
         start_of_day_equity = portfolio.equity_curve[-1][1] if portfolio.equity_curve else mtm_value
         for signal in candidates:
+            # Market-regime gate: in a non-UPTREND benchmark, refuse new longs
+            # ("don't buy into a falling market"). Shorts still allowed.
+            if not allow_longs and signal.action == Action.BUY:
+                continue
             # Fill at today's open price (realistic: signal from yesterday's close,
             # execution at today's open)
             if signal.ticker in day_data:
@@ -616,12 +681,10 @@ def run_backtest(config: BacktestConfig) -> SimulatedPortfolio:
             last_price = pos.entry_price
         portfolio.close_position(pos.ticker, last_price, current_dt)
 
-    # Attach benchmark artifacts. benchmark_prices is the RAW, full-history,
-    # un-trimmed, un-normalized close (for 02-06's regime gate); benchmark_curve
-    # is the buy-and-hold equity curve aligned to the strategy's warmup-trimmed
-    # trading days (for the CAPM alpha/beta report).
-    if benchmark_df is not None and not benchmark_df.empty:
-        portfolio.benchmark_prices = benchmark_df["close"]
+    # Attach the remaining benchmark artifact: benchmark_curve, the buy-and-hold
+    # equity curve aligned to the strategy's warmup-trimmed trading days (for the
+    # CAPM alpha/beta report). benchmark_prices (the RAW full-history close used
+    # by the regime gate) was already attached before the loop.
     equity_dates = [d for d, _ in portfolio.equity_curve]
     portfolio.benchmark_curve = _build_benchmark_curve(
         benchmark_df, equity_dates, config.initial_capital,
