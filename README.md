@@ -473,9 +473,13 @@ python main.py --mode live
 | `--force` | flag | off | Bypass market hours check (GTC orders queue for next open) |
 | `--watchdog` | flag | off | Use IBC to auto-start gateway and reconnect on restarts |
 | `--backtest-tickers` | space-separated tickers | default list | Tickers for backtesting |
-| `--backtest-start` | `YYYY-MM-DD` | 1 year ago | Backtest start date |
-| `--backtest-end` | `YYYY-MM-DD` | today | Backtest end date |
-| `--capital` | float | `100000` | Initial capital for backtesting |
+| `--backtest-start` | `YYYY-MM-DD` | 5 years ago | Backtest start date (default history spans multiple regimes) |
+| `--backtest-end` | `YYYY-MM-DD` | today | Backtest end date (must be `< 2025-07-01` while the holdout is locked — see [Backtesting](#backtesting)) |
+| `--capital` | float | `100000` | Initial capital for backtesting (use a realistic sub-$25k value to exercise the swing/margin logic) |
+| `--walk-forward` | flag | off | Run a multi-fold rolling walk-forward instead of a single backtest (reports per-fold IS→OOS degradation and Walk-Forward Efficiency, flagging WFE < 0.5 as fail). Requires `--mode backtest` |
+| `--wf-is-days` | int | `504` | Walk-forward in-sample length in trading days (~2 years) |
+| `--wf-oos-days` | int | `252` | Walk-forward out-of-sample length in trading days (~12 months; kept ≥9 months so each fold clears the ≥30-trade gate after its 60-bar warmup) |
+| `--wf-step-days` | int | `252` | Trading days to advance the window between folds (default = one OOS window, so OOS segments are adjacent and non-overlapping) |
 
 ---
 
@@ -543,7 +547,9 @@ Stop-loss and take-profit levels are calculated using ATR (Average True Range) f
 
 ### Extension Guard
 
-Before scoring, the screener drops any ticker whose latest close sits more than `MAX_EXTENSION_OVER_MA20_PCT` (default **15%**) above its 20-day simple moving average. This prevents parabolic breakouts (e.g. XNDU ripping $9 → $32 in a handful of sessions) — and smaller late-stage rallies in the 16–20% extension band where the bot kept buying at the local peak — from reaching the AI analyst, where confluent BUY indicators could otherwise override into a late entry. The 15% value comes from a 6-month sweep on 2026-04-28 (`data/sweep_extension_pct_2026-04-28.csv`): 15% delivered 66.7% win rate vs 50% at the previous 20% setting, +8.32% return vs ~breakeven, and trades in the 16–20% band were systematically losers (avg ~+$8/trade at 20% vs +$1500/trade at 15%). Set the config to `0` or negative to disable. The backtest exposes the same threshold as `BacktestConfig.max_extension_pct`; `scripts/sweep_extension_pct.py` reruns the sweep against fresh data.
+Before scoring, the screener drops any ticker whose latest close sits more than `MAX_EXTENSION_OVER_MA20_PCT` (default **15%**) above its 20-day simple moving average. This prevents parabolic breakouts (e.g. XNDU ripping $9 → $32 in a handful of sessions) — and smaller late-stage rallies where the bot kept buying at the local peak — from reaching the AI analyst, where confluent BUY indicators could otherwise override into a late entry. Set the config to `0` or negative to disable.
+
+The **15% default is a conservative guard, not an in-sample-validated optimum.** An earlier single-window sweep that crowned 15% on ~6 in-sample trades was a curve-fit and has been retired. The replacement, `scripts/sweep_extension_pct.py`, now runs a **multi-fold walk-forward out-of-sample** sweep: it evaluates each candidate threshold on pooled OOS folds, reports its trial count, deflates the selected Sharpe for multiple testing (DSR), enforces the ≥30-trade / |t|>2 / DSR>0.95 floor, and picks the **plateau** (stable middle of the widest validated band) rather than the peak — emitting either a validated threshold or an explicit **INSUFFICIENT EVIDENCE** verdict. The backtest exposes the same threshold as `BacktestConfig.max_extension_pct`; re-run the sweep against fresh data before treating any value as proven.
 
 ---
 
@@ -640,20 +646,24 @@ When volatility scaling is enabled (`use_volatility_scaling` in backtest config,
 
 ## Backtesting
 
-The backtesting engine replays historical data through the **exact same** screener and risk manager code used in live trading.
+The backtesting engine replays historical data through the **exact same** screener and risk manager code used in live trading. Phase 2 turned it into an **edge-validation harness**: every result is now benchmarked against SPY, walk-forward validated out-of-sample, charged realistic costs, and gated by formal statistics — so the question it answers is "does this strategy beat a passive index *and* a coin-flip, net of costs, on data it never saw?" rather than "did it look good on one window?".
+
+> **No edge has been demonstrated yet.** The harness exists to *test for* an edge honestly. No real money should be deployed until the strategy clears every pre-registered acceptance gate (see [Acceptance Criteria & Single-Use Holdout](#acceptance-criteria--single-use-holdout)) out-of-sample on the reserved holdout.
 
 ### How It Works
 
-1. Downloads 1 year of historical data for all specified tickers via YFinance
+1. Downloads **5 years** of historical data (default; configurable via `history_period`) for all specified tickers via YFinance, so every run spans multiple regimes including the 2022 drawdown — not one bull year
 2. Skips the first 60 trading days for indicator warmup (moving averages, etc.)
 3. Iterates day-by-day:
-   - Checks stop-loss and take-profit exits for open positions
+   - Checks stop-loss and take-profit exits for open positions (a gap *through* a stop fills at the bar **open**, never the stop price — costs are modeled pessimistically)
    - Builds historical data window up to the current day (**no look-ahead bias**)
    - Runs the technical screener on the windowed data
    - Passes candidates through the risk manager with simulated portfolio state
-   - Simulates order execution with configurable slippage and commission
+   - Simulates order execution with configurable slippage, a per-leg bid-ask spread (`BACKTEST_SPREAD_BPS`, default 5 bps crossed on each leg), and commission
 4. Closes all remaining positions at the last bar
-5. Calculates comprehensive performance metrics
+5. Calculates comprehensive performance metrics, decomposed into gross / total-cost / net
+
+**Single-use holdout preflight.** `run_backtest` refuses any date range that overlaps the locked holdout window (`2025-07-01 → 2026-06-29`) while `BORSA_HOLDOUT_UNLOCKED` is unset, raising `PermissionError`. Phase-2 tuning runs must set `--backtest-end` before `2025-07-01`. The holdout is touched exactly once, in Phase 4, after all tuning is frozen. An unset end date defaults to today, overlaps the holdout, and is therefore refused.
 
 IBKR and yfinance use different share-class symbol formats (IBKR: `BRK B` with a space; yfinance: `BRK-B` with a hyphen). The data layer translates IBKR symbols at the yfinance boundary so share-class tickers survive the backtest download and the analyst-consensus lookup instead of silently falling out.
 
@@ -662,16 +672,53 @@ IBKR and yfinance use different share-class symbol formats (IBKR: `BRK B` with a
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | Slippage | 0.1% | Simulated execution slippage |
+| Spread (`BACKTEST_SPREAD_BPS`) | 5 bps/leg | Per-leg bid-ask spread crossed on entry (ask) and exit (bid), so a round trip pays it twice. Set to 0 to reproduce pre-spread fills |
 | Commission | $1/trade | Per-trade commission cost |
-| Initial capital | $100,000 | Starting portfolio value |
+| Initial capital (`--capital`) | $100,000 | Starting portfolio value (use a realistic sub-$25k value to exercise swing/margin logic) |
+| History period | 5y | Multi-regime download window (covers the 2022 drawdown) |
 | Warmup period | 60 days | Days skipped for indicator stabilization |
+| Benchmark (`benchmark_ticker`) | SPY | Passive buy-and-hold benchmark for the CAPM alpha/beta comparison |
 | Indicator weights | Equal (1.0) | Per-indicator weight multipliers for scoring |
 | Volatility scaling | Off | Scale position sizes inversely to realized volatility (per-candidate) |
-| Max extension | 15% | Drop candidates whose close is more than this % above MA20 (0 disables). Tightened from 20% — see `data/sweep_extension_pct_2026-04-28.csv`. |
+| Random-entry control (`use_random_entry`) | Off | Deterministic Bernoulli(0.5) coin-flip entries with the *same* sizing, exits, and costs — the survival-vs-edge control |
+| Dow per-ticker filter (`use_dow_filter`) | Off | Drop entries whose own Dow trend is not up (available but unproven OOS — see [Tuning guide](docs/RISK-TUNING.md)) |
+| SPY market-regime gate (`use_market_regime_filter`) | Off | Block long entries when SPY is not in an uptrend (available but unproven OOS) |
+| Max extension | 15% | Drop candidates whose close is more than this % above MA20 (0 disables). A conservative default, **not** an in-sample-tuned optimum — re-validate with the walk-forward OOS sweep (`scripts/sweep_extension_pct.py`) before treating any value as proven |
 
 ### Walk-Forward Validation
 
-`walk_forward_backtest(config, train_ratio=0.6)` splits the date range into an **in-sample (IS)** training period and a non-overlapping **out-of-sample (OOS)** test period, runs a separate backtest on each with fresh capital, and reports per-period metrics plus a **degradation** dict (`OOS − IS` for each metric). Large negative degradation (e.g., IS win rate 70% but OOS win rate 45%) means the strategy memorized the IS window and will underperform in live trading. Returns a `WalkForwardResult` dataclass with both portfolios, both metric sets, the split date, and the degradation map.
+The headline anti-overfitting test is a **multi-fold rolling walk-forward**. `rolling_walk_forward(config, is_days=504, oos_days=252, step_days=252)` slides a fixed ~2-year in-sample (IS) window followed by an adjacent, non-overlapping ~12-month out-of-sample (OOS) window across the full history. Each fold runs a separate backtest on its IS and OOS slices with fresh capital; the harness then pools all OOS trades, compounds the per-fold OOS equity curves into one continuous series, and computes:
+
+- **Per-fold IS→OOS degradation** — a large drop (e.g., IS win rate 70% but OOS 45%) means the strategy memorized the IS window
+- **Walk-Forward Efficiency (WFE)** — aggregate OOS annualized return ÷ IS annualized return, undefined (rendered explicitly, never faked) when IS return ≤ 0
+- **A WFE verdict** — **FAIL** (WFE < 0.5), **PASS** (0.5–0.7), or **ROBUST** (≥ 0.7)
+
+Run it from the CLI:
+
+```bash
+python main.py --mode backtest --walk-forward \
+  --backtest-tickers AAPL MSFT NVDA AMD XOM CAT HD COST \
+  --backtest-start 2020-06-01 --backtest-end 2025-06-30 \
+  --capital 10000
+```
+
+`--wf-is-days` / `--wf-oos-days` / `--wf-step-days` tune the window sizes (in trading days). OOS windows are kept ≥9 months so each fold clears the ≥30-trade statistical gate after its 60-bar warmup. (The older single-split `walk_forward_backtest(config, train_ratio=0.6)` remains available for back-compatibility.)
+
+### Benchmark & Controls
+
+A backtest result only means something relative to what you could have gotten for free. Every run is measured against two controls:
+
+- **SPY buy-and-hold benchmark** — a passive SPY position over the same window, with **CAPM alpha and beta** computed on risk-free-adjusted excess returns (so a strategy identical to the benchmark scores alpha ≈ 0, beta ≈ 1 rather than fabricating alpha). The strategy must produce **positive alpha** to claim it adds anything over the index.
+- **Deterministic random-entry control** — a seeded Bernoulli(0.5) coin-flip that enters trades through the *exact same* sizing, exits, and cost machinery as the real strategy. This isolates entry edge from the survival effect of good risk management. The strategy has edge only if it beats **both** SPY and its random-entry control net of costs. `run_strategy_with_controls(config)` produces the Strategy / Random-Entry / SPY columns side by side.
+
+### Statistical Gates
+
+Pooled OOS results are run through formal significance tests (vendored in `backtest/stats.py`) so a handful of lucky trades cannot masquerade as an edge:
+
+- **Deflated Sharpe Ratio (DSR)** — the observed Sharpe corrected for the number of configurations tried (multiple-testing / data-snooping). The bar is **DSR > 0.95**.
+- **Per-trade t-statistic** — mean per-trade return over its standard error; the bar is **|t| > 2**.
+- **Minimum-sample gate** — at least **30 OOS trades**; below that the verdict is *insufficient evidence*, not a number.
+- **Win-rate confidence interval** — a binomial CI so a small-sample win rate is never reported as a point estimate.
 
 ### Split and Dividend Adjustment
 
@@ -685,7 +732,7 @@ The backtest report includes:
 
 | Metric | Description |
 |--------|-------------|
-| **Total Return** | Overall portfolio return percentage |
+| **Total Return** | Overall portfolio return percentage (net of all costs) |
 | **Annualized Return** | Return normalized to a yearly basis |
 | **Sharpe Ratio** | Risk-adjusted return (assuming 5% risk-free rate, 252 trading days) |
 | **Max Drawdown** | Largest peak-to-trough decline |
@@ -694,6 +741,13 @@ The backtest report includes:
 | **Average Trade Duration** | Mean holding period |
 | **Best/Worst Trade** | Largest single gain and loss |
 | **Total Trades** | Number of round-trip trades executed |
+| **SPY Return** | Passive SPY buy-and-hold return over the same window |
+| **Alpha (annualized)** | CAPM alpha vs SPY on risk-free-adjusted excess returns — the return *added* over the index |
+| **Beta** | CAPM beta vs SPY — market exposure of the strategy |
+| **Cost % of Gross P&L** | How much of the gross profit is eaten by slippage + spread + commission — a high value means the edge is too thin to survive frictions |
+| **Breakeven Edge/Trade** | The average per-trade edge the strategy must clear just to cover its own costs |
+
+Every report also prints a **survivorship-bias caveat**: the backtest universe is a point-in-time snapshot and excludes delisted/bankrupt names, so absolute returns are optimistic — the alpha-vs-SPY framing is what matters, not the raw return.
 
 ### AI Value-Add Comparison
 
@@ -707,15 +761,30 @@ The `compare_ai_value_add()` function compares screener-only vs screener+AI back
 | **AI Filter Rate** | % of screener trades the AI filtered out |
 | **AI Adds Value** | Boolean: whether the AI improved returns |
 
+### Acceptance Criteria & Single-Use Holdout
+
+The go/no-go bar was **pre-registered and locked before any holdout-touching run** to prevent data-snooping. The canonical, locked copy lives at the repo root in [`ACCEPTANCE-CRITERIA.md`](ACCEPTANCE-CRITERIA.md); the thresholds are not restated here so they cannot silently drift. In summary, the strategy is considered to have a real edge **only if it clears every gate out-of-sample, net of costs**: positive CAPM alpha vs SPY, beats the random-entry control, a passing Walk-Forward Efficiency, a minimum OOS trade count, and a passing Deflated Sharpe Ratio. If any gate fails → no edge demonstrated → do not deploy real money (index instead).
+
+Parameter selection follows two rules baked into the harness: each sweep reports its **trial count** so the DSR can correct for it, and a parameter is chosen from the **plateau** (the stable middle of an OOS band), never the single peak.
+
+The reserved holdout window (`2025-07-01 → 2026-06-29`) is mechanically protected: `run_backtest` raises `PermissionError` on any overlapping range until a Phase-4 unlock (`BORSA_HOLDOUT_UNLOCKED=1`). It is touched exactly once, after all tuning is frozen.
+
 ### Example
 
 ```bash
-# Backtest 10 tech stocks over 6 months
+# Single benchmarked backtest (must end before the locked holdout) at realistic capital
 python main.py --mode backtest \
   --backtest-tickers AAPL MSFT GOOGL AMZN NVDA TSLA META AMD NFLX CRM \
-  --backtest-start 2025-07-01 \
-  --backtest-end 2025-12-31 \
-  --capital 50000
+  --backtest-start 2020-06-01 \
+  --backtest-end 2025-06-30 \
+  --capital 10000
+
+# Multi-fold walk-forward with the WFE verdict (the real edge test)
+python main.py --mode backtest --walk-forward \
+  --backtest-tickers AAPL MSFT GOOGL AMZN NVDA TSLA META AMD NFLX CRM \
+  --backtest-start 2020-06-01 \
+  --backtest-end 2025-06-30 \
+  --capital 10000
 ```
 
 ---
@@ -961,7 +1030,7 @@ This system is designed with multiple layers of safety:
 
 17. **Intraday-margin protection** -- The FINRA PDT rule was eliminated 2026-06-04. The system now guards against uncured intraday-margin deficits (which can trigger a 90-day broker restriction) instead. Two margin parameters are enforced on new entries: `REG_T_MIN_EQUITY_USD` ($2,000 — Reg-T minimum equity to trade on margin) and `INTRADAY_MAINTENANCE_MARGIN_PCT` (25% — intraday maintenance margin floor). New entries that would cause or leave uncured intraday-margin deficits are blocked. The `MARGIN_REGIME` env flag (`intraday` | `legacy_pdt` | `both`) selects the active margin model during the broker phase-in period (default `both` through 2027-10-20; set to `intraday` once the IBKR account's new regime is confirmed). Under `legacy_pdt` or `both` regimes, the legacy `LEGACY_PDT_THRESHOLD_USD` ($25,000) gate also remains active.
 
-18. **Parabolic breakout filter** -- Tickers whose latest close is more than `MAX_EXTENSION_OVER_MA20_PCT` (default **15%**, tightened from 20%) above their 20-day moving average are dropped from the screener candidate pool before scoring. This prevents late entries into already-extended moves where confluent BUY indicators would otherwise convince the AI analyst to approve the trade. 15% comes from the 2026-04-28 6-month sweep (`data/sweep_extension_pct_2026-04-28.csv`): 66.7% win rate at 15% vs 50% at 20%, +8.32% return vs ~breakeven, max drawdown unchanged. Trades in the 16–20% band were systematically losers (avg ~+$8/trade at 20% vs +$1500/trade at 15%).
+18. **Parabolic breakout filter** -- Tickers whose latest close is more than `MAX_EXTENSION_OVER_MA20_PCT` (default **15%**) above their 20-day moving average are dropped from the screener candidate pool before scoring. This prevents late entries into already-extended moves where confluent BUY indicators would otherwise convince the AI analyst to approve the trade. The 15% default is a conservative guard, not an in-sample-validated optimum — the prior single-window "15% sweet spot" claim was a ~6-trade curve-fit and has been retired in favor of the walk-forward OOS sweep (`scripts/sweep_extension_pct.py`), which selects a plateau from validated thresholds or returns INSUFFICIENT EVIDENCE (see [Extension Guard](#extension-guard)).
 
 19. **Exit-signal routing** -- When the risk manager approves a signal that closes an existing position (SELL on held long, BUY on held short), the executor places a single market close order instead of a bracket. A bracket's take-profit and stop-loss children stay live at IBKR after the parent closes the position — when price later crosses either child's trigger, those orders re-enter the ticker in the opposite direction. Routing exits through a plain market close eliminates this tail risk. Exits also size to the existing holding's absolute quantity, never to a freshly-calculated new-entry size (which could flip a long into a net short).
 
