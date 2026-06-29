@@ -1797,3 +1797,127 @@ class TestRandomEntryControl:
             assert s.entry_price == pytest.approx(100.0)
             assert s.stop_loss == pytest.approx(100.0 * (1 - DEFAULT_STOP_LOSS_PCT / 100))
             assert s.take_profit == pytest.approx(100.0 * (1 + DEFAULT_TAKE_PROFIT_PCT / 100))
+
+
+# ---------------------------------------------------------------------------
+# Plan 02-03 Task 1: multi-fold rolling walk-forward + per-fold/aggregate WFE
+# ---------------------------------------------------------------------------
+
+class TestRollingWalkForward:
+    """Multi-fold rolling walk-forward: fold count, per-fold metrics, WFE."""
+
+    def test_old_single_split_api_still_importable(self):
+        """Back-compat: the single-split walk-forward must survive unchanged."""
+        from backtest.engine import walk_forward_backtest, WalkForwardResult
+        assert callable(walk_forward_backtest)
+        assert WalkForwardResult is not None
+
+    def test_default_oos_window_is_9_to_12_months_not_6(self):
+        """Default OOS must clear the >=30-trade gate after the 60-bar warmup —
+        ~250 trading days (>=9-12 months), never a 6-month (~125-bar) window."""
+        from backtest.engine import (
+            DEFAULT_WF_OOS_DAYS, DEFAULT_WF_IS_DAYS, _trading_to_calendar_days,
+        )
+        # ~250 trading days, decidedly more than a 6-month (~126-bar) window.
+        assert DEFAULT_WF_OOS_DAYS >= 189            # >= ~9 months of trading days
+        assert DEFAULT_WF_OOS_DAYS > 126 * 1.2       # not a 6-month window
+        # And in calendar terms that is at least ~9 months.
+        assert _trading_to_calendar_days(DEFAULT_WF_OOS_DAYS) >= 270
+        # In-sample defaults to roughly two years.
+        assert DEFAULT_WF_IS_DAYS >= 2 * 240
+
+    @patch("backtest.engine.run_backtest")
+    def test_correct_number_of_folds_for_window_and_step(self, mock_run):
+        """A 7-year range with 2 run_backtest calls per fold yields 6 folds."""
+        from backtest.engine import rolling_walk_forward, RollingWalkForwardResult
+        mock_run.side_effect = lambda cfg: _make_portfolio_with_trades(5, 10.0)
+
+        cfg = BacktestConfig(
+            tickers=["AAPL"], start_date="2018-01-01", end_date="2025-01-01",
+        )
+        result = rolling_walk_forward(cfg, is_days=252, oos_days=252, step_days=252)
+
+        assert isinstance(result, RollingWalkForwardResult)
+        assert len(result.folds) == 6
+        assert mock_run.call_count == 2 * len(result.folds)
+
+    @patch("backtest.engine.run_backtest")
+    def test_each_fold_has_is_oos_metrics_and_wfe(self, mock_run):
+        from backtest.engine import rolling_walk_forward
+        mock_run.side_effect = lambda cfg: _make_portfolio_with_trades(5, 10.0)
+
+        cfg = BacktestConfig(
+            tickers=["AAPL"], start_date="2020-01-01", end_date="2024-01-01",
+        )
+        result = rolling_walk_forward(cfg, is_days=252, oos_days=252, step_days=252)
+
+        assert result.folds
+        for fold in result.folds:
+            assert "annualized_return_pct" in fold.in_sample_metrics
+            assert "annualized_return_pct" in fold.out_of_sample_metrics
+            assert "total_return_pct" in fold.degradation
+            # IS made money here, so WFE is well-defined.
+            assert fold.wfe is not None
+            # OOS strictly follows IS, folds are time-ordered.
+            assert fold.out_of_sample_start > fold.in_sample_end
+
+    @patch("backtest.engine.run_backtest")
+    def test_oos_windows_are_non_overlapping(self, mock_run):
+        from backtest.engine import rolling_walk_forward
+        mock_run.side_effect = lambda cfg: _make_portfolio_with_trades(5, 10.0)
+
+        cfg = BacktestConfig(
+            tickers=["AAPL"], start_date="2018-01-01", end_date="2025-01-01",
+        )
+        result = rolling_walk_forward(cfg, is_days=252, oos_days=252, step_days=252)
+
+        for prev, nxt in zip(result.folds, result.folds[1:]):
+            assert nxt.out_of_sample_start > prev.out_of_sample_end
+
+    @patch("backtest.engine.run_backtest")
+    def test_wfe_handles_zero_is_return_without_crashing(self, mock_run):
+        """A zero (non-positive) IS annualized return makes WFE undefined —
+        the harness returns None, not a divide-by-zero crash."""
+        from backtest.engine import rolling_walk_forward
+        mock_run.side_effect = [
+            _make_portfolio_with_trades(5, 0.0),    # IS: flat → annualized return 0
+            _make_portfolio_with_trades(5, 10.0),   # OOS: positive
+        ]
+        cfg = BacktestConfig(
+            tickers=["AAPL"], start_date="2020-01-01", end_date="2021-12-31",
+        )
+        result = rolling_walk_forward(cfg, is_days=252, oos_days=252, step_days=252)
+
+        assert len(result.folds) == 1
+        assert result.folds[0].wfe is None         # undefined, did not crash
+        assert result.aggregate_wfe is None        # no well-defined folds to average
+
+    @patch("backtest.engine.run_backtest")
+    def test_aggregate_pools_oos_trades(self, mock_run):
+        from backtest.engine import rolling_walk_forward
+        mock_run.side_effect = lambda cfg: _make_portfolio_with_trades(5, 10.0)
+
+        cfg = BacktestConfig(
+            tickers=["AAPL"], start_date="2018-01-01", end_date="2025-01-01",
+        )
+        result = rolling_walk_forward(cfg, is_days=252, oos_days=252, step_days=252)
+
+        # One OOS portfolio of 5 trades per fold → pooled count is 5 * folds.
+        assert len(result.aggregate_oos_trades) == 5 * len(result.folds)
+        assert result.aggregate_oos_metrics["num_trades"] == 5 * len(result.folds)
+        # Positive per-fold WFE averages to a positive aggregate.
+        assert result.aggregate_wfe is not None and result.aggregate_wfe > 0
+
+    def test_range_too_short_raises(self):
+        from backtest.engine import rolling_walk_forward
+        cfg = BacktestConfig(
+            tickers=["AAPL"], start_date="2023-01-01", end_date="2023-03-01",
+        )
+        with pytest.raises(ValueError):
+            rolling_walk_forward(cfg, is_days=252, oos_days=252, step_days=252)
+
+    def test_missing_dates_raise(self):
+        from backtest.engine import rolling_walk_forward
+        cfg = BacktestConfig(tickers=["AAPL"], start_date="", end_date="2024-01-01")
+        with pytest.raises(ValueError):
+            rolling_walk_forward(cfg)

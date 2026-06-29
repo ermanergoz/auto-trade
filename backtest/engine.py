@@ -777,3 +777,249 @@ def walk_forward_backtest(
         out_of_sample_end=end,
         split_date=split_date,
     )
+
+
+# ---------------------------------------------------------------------------
+# Multi-fold rolling walk-forward
+# ---------------------------------------------------------------------------
+
+# Window sizes are expressed in TRADING days (the natural unit for "~250 trading
+# days ≈ 12 months" and "2y IS"), but run_backtest slices by CALENDAR dates, so
+# the harness converts trading-day counts to a calendar span with this ratio.
+# 252 trading days ≈ 365 calendar days, so oos_days=252 → ~12 calendar months —
+# long enough that, after each fold's fixed 60-bar warmup is consumed, the OOS
+# window can still accumulate the >=30-trade statistical floor.
+_TRADING_DAYS_PER_YEAR = 252
+_CALENDAR_DAYS_PER_YEAR = 365
+
+# Defaults: 2y in-sample, ~12-month out-of-sample, stepped by the OOS length so
+# the OOS windows are ADJACENT and NON-OVERLAPPING (pooling their trades does not
+# double-count any bar). Short OOS windows (e.g. 6 months / ~125 bars) are
+# deliberately avoided: the 60-bar warmup would leave only ~65 tradable bars,
+# starving the >=30-trade gate.
+DEFAULT_WF_IS_DAYS = 2 * _TRADING_DAYS_PER_YEAR   # ~2 years in-sample (504)
+DEFAULT_WF_OOS_DAYS = _TRADING_DAYS_PER_YEAR      # ~12 months OOS (252, >= 9-12mo)
+DEFAULT_WF_STEP_DAYS = _TRADING_DAYS_PER_YEAR     # step by one OOS window (252)
+
+
+def _trading_to_calendar_days(trading_days: int) -> int:
+    """Convert a trading-day count to an approximate calendar-day span."""
+    return round(trading_days * _CALENDAR_DAYS_PER_YEAR / _TRADING_DAYS_PER_YEAR)
+
+
+def _walk_forward_efficiency(is_metrics: dict, oos_metrics: dict) -> Optional[float]:
+    """WFE = annualized_OOS_return / annualized_IS_return (STACK.md:22).
+
+    Returns None when WFE is UNDEFINED: a non-positive in-sample annualized
+    return makes the ratio meaningless (divide-by-zero or a sign flip that would
+    make a losing OOS look "efficient" against a losing IS). The report renders
+    None explicitly rather than fabricating a number.
+    """
+    is_ann = is_metrics.get("annualized_return_pct", 0.0)
+    oos_ann = oos_metrics.get("annualized_return_pct", 0.0)
+    if not isinstance(is_ann, (int, float)) or is_ann <= 0:
+        return None
+    return oos_ann / is_ann
+
+
+def _chain_oos_equity(
+    fold_curves: list[list[tuple[date, float]]],
+    initial_capital: float,
+) -> list[tuple[date, float]]:
+    """Stitch per-fold OOS equity curves into one continuous compounded curve.
+
+    Each fold's OOS backtest starts fresh at initial_capital, so naively
+    concatenating the curves would inject artificial jumps back to the starting
+    equity. Instead we compound: every fold is rebased onto the running ending
+    equity of the previous fold, preserving each fold's internal return shape
+    while producing a single monotonically-dated aggregate curve for Sharpe /
+    drawdown over the pooled OOS period.
+    """
+    chained: list[tuple[date, float]] = []
+    running = float(initial_capital)
+    for curve in fold_curves:
+        if not curve:
+            continue
+        base = curve[0][1]
+        if base == 0:
+            continue
+        for d, v in curve:
+            chained.append((d, running * (v / base)))
+        running = chained[-1][1]
+    return chained
+
+
+@dataclass
+class WalkForwardFold:
+    """One IS→OOS fold of a rolling walk-forward."""
+    index: int
+    in_sample_start: date
+    in_sample_end: date
+    out_of_sample_start: date
+    out_of_sample_end: date
+    in_sample_metrics: dict
+    out_of_sample_metrics: dict
+    degradation: dict
+    wfe: Optional[float]
+    in_sample_portfolio: SimulatedPortfolio
+    out_of_sample_portfolio: SimulatedPortfolio
+
+
+@dataclass
+class RollingWalkForwardResult:
+    """Aggregate result of a multi-fold rolling walk-forward.
+
+    Carries every per-fold result, the pooled out-of-sample trades, an aggregate
+    OOS metrics dict computed over a compounded chain of the folds' OOS equity
+    curves, and the aggregate WFE (mean of the well-defined per-fold WFEs).
+    """
+    folds: list[WalkForwardFold]
+    aggregate_oos_trades: list[Trade]
+    aggregate_oos_equity: list[tuple[date, float]]
+    aggregate_oos_metrics: dict
+    aggregate_wfe: Optional[float]
+    is_days: int
+    oos_days: int
+    step_days: int
+
+
+def rolling_walk_forward(
+    config: BacktestConfig,
+    is_days: int = DEFAULT_WF_IS_DAYS,
+    oos_days: int = DEFAULT_WF_OOS_DAYS,
+    step_days: int = DEFAULT_WF_STEP_DAYS,
+) -> RollingWalkForwardResult:
+    """Slide a fixed IS window + adjacent OOS window across the full date range.
+
+    Each fold runs run_backtest on its IS slice and its (immediately following)
+    OOS slice with fresh capital, then computes IS/OOS metrics, the per-metric
+    IS→OOS degradation, and WFE = annualized_OOS_return / annualized_IS_return.
+    Multiple rolling folds give several independent OOS windows across regimes —
+    a far harder bar to clear than a single 60/40 split.
+
+    Window sizes are in TRADING days (defaults: ~2y IS, ~12-month OOS, stepped by
+    the OOS length so OOS windows are adjacent and non-overlapping). They are
+    converted to calendar spans for run_backtest's date filters. The ~12-month
+    OOS default is deliberate: each fold's fixed 60-bar warmup is consumed before
+    any trade, so a shorter OOS would starve the >=30-trade statistical floor.
+
+    Args:
+        config: BacktestConfig with both start_date and end_date set.
+        is_days: in-sample length in trading days.
+        oos_days: out-of-sample length in trading days.
+        step_days: trading days to advance the window between folds.
+
+    Raises:
+        ValueError: if dates are missing/inverted, any window is non-positive, or
+            the range is too short to fit even one IS+OOS fold.
+    """
+    if not config.start_date or not config.end_date:
+        raise ValueError(
+            "rolling_walk_forward requires both config.start_date and config.end_date"
+        )
+    if is_days <= 0 or oos_days <= 0 or step_days <= 0:
+        raise ValueError("is_days, oos_days and step_days must all be positive")
+
+    start = date.fromisoformat(config.start_date)
+    end = date.fromisoformat(config.end_date)
+    if end <= start:
+        raise ValueError(f"end_date ({end}) must be after start_date ({start})")
+
+    is_cal = _trading_to_calendar_days(is_days)
+    oos_cal = _trading_to_calendar_days(oos_days)
+    step_cal = _trading_to_calendar_days(step_days)
+
+    from backtest.report import calculate_metrics
+
+    folds: list[WalkForwardFold] = []
+    fold_start = start
+    index = 0
+    # A fold fits iff its OOS window ends on or before the requested end date.
+    while fold_start + timedelta(days=is_cal + oos_cal - 1) <= end:
+        is_start = fold_start
+        is_end = is_start + timedelta(days=is_cal - 1)
+        oos_start = is_end + timedelta(days=1)
+        oos_end = oos_start + timedelta(days=oos_cal - 1)
+
+        is_config = replace(
+            config, start_date=is_start.isoformat(), end_date=is_end.isoformat(),
+        )
+        oos_config = replace(
+            config, start_date=oos_start.isoformat(), end_date=oos_end.isoformat(),
+        )
+
+        logger.info(
+            "WF fold %d: IS %s → %s, OOS %s → %s",
+            index, is_start, is_end, oos_start, oos_end,
+        )
+
+        is_portfolio = run_backtest(is_config)
+        oos_portfolio = run_backtest(oos_config)
+
+        is_metrics = calculate_metrics(
+            is_portfolio.trades, is_portfolio.equity_curve, is_config.initial_capital,
+            benchmark_curve=is_portfolio.benchmark_curve,
+        )
+        oos_metrics = calculate_metrics(
+            oos_portfolio.trades, oos_portfolio.equity_curve, oos_config.initial_capital,
+            benchmark_curve=oos_portfolio.benchmark_curve,
+        )
+
+        degradation: dict = {}
+        for key, is_val in is_metrics.items():
+            oos_val = oos_metrics.get(key)
+            if isinstance(is_val, (int, float)) and isinstance(oos_val, (int, float)):
+                degradation[key] = oos_val - is_val
+
+        folds.append(WalkForwardFold(
+            index=index,
+            in_sample_start=is_start,
+            in_sample_end=is_end,
+            out_of_sample_start=oos_start,
+            out_of_sample_end=oos_end,
+            in_sample_metrics=is_metrics,
+            out_of_sample_metrics=oos_metrics,
+            degradation=degradation,
+            wfe=_walk_forward_efficiency(is_metrics, oos_metrics),
+            in_sample_portfolio=is_portfolio,
+            out_of_sample_portfolio=oos_portfolio,
+        ))
+
+        index += 1
+        fold_start = fold_start + timedelta(days=step_cal)
+
+    if not folds:
+        raise ValueError(
+            f"Date range [{start} .. {end}] is too short for one IS+OOS fold "
+            f"(needs ~{is_cal + oos_cal} calendar days for is_days={is_days}, "
+            f"oos_days={oos_days})."
+        )
+
+    # Pool the OOS trades and compound the OOS equity curves into a single
+    # continuous series so the aggregate Sharpe/drawdown reflect the whole
+    # out-of-sample experience, not one cherry-picked fold.
+    pooled_trades: list[Trade] = []
+    for fold in folds:
+        pooled_trades.extend(fold.out_of_sample_portfolio.trades)
+
+    aggregate_equity = _chain_oos_equity(
+        [f.out_of_sample_portfolio.equity_curve for f in folds],
+        config.initial_capital,
+    )
+    aggregate_oos_metrics = calculate_metrics(
+        pooled_trades, aggregate_equity, config.initial_capital,
+    )
+
+    valid_wfes = [f.wfe for f in folds if f.wfe is not None]
+    aggregate_wfe = sum(valid_wfes) / len(valid_wfes) if valid_wfes else None
+
+    return RollingWalkForwardResult(
+        folds=folds,
+        aggregate_oos_trades=pooled_trades,
+        aggregate_oos_equity=aggregate_equity,
+        aggregate_oos_metrics=aggregate_oos_metrics,
+        aggregate_wfe=aggregate_wfe,
+        is_days=is_days,
+        oos_days=oos_days,
+        step_days=step_days,
+    )
