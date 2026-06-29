@@ -142,12 +142,32 @@ CORRELATION_CAP_THRESHOLD = 0.7 # Reject candidate if return-correlation with an
 CIRCUIT_BREAKER_LOSSES = 3      # Number of consecutive losses to trip
 CIRCUIT_BREAKER_WINDOW_MIN = 60 # Time window in minutes to look back
 
-# Pattern Day Trader (PDT) protection
-# IBKR restricts accounts with liquid net worth below the threshold if they
-# execute 2 day trades within a rolling 5-business-day window (30-day lockout).
-# When portfolio value is at or above the threshold, PDT rules don't apply
-# here and trading is unconstrained by this check.
-PDT_PROTECTION_THRESHOLD_USD = 5000.0
+# ---------------------------------------------------------------------------
+# Intraday Margin (post-2026-06-04 framework)
+# ---------------------------------------------------------------------------
+# FINRA's Pattern Day Trader rule was eliminated 2026-06-04 (Notice 26-10) and
+# replaced by a real-time intraday-margin framework under Rule 4210. The old
+# $5,000 day-trade gate is dead code AND a known bug (an $8k–$24,999 account
+# got zero protection from it). The real constraints now are the Reg-T
+# account-equity minimum, the 25% intraday maintenance margin, and avoiding
+# repeated uncured intraday-margin deficits (which can trigger a 90-day
+# restriction). See .planning/codebase/CONCERNS.md and PROJECT.md Constraints.
+REG_T_MIN_EQUITY_USD = 2000.0           # Reg-T minimum account equity (USD)
+INTRADAY_MAINTENANCE_MARGIN_PCT = 25.0  # Intraday maintenance margin requirement (%)
+
+# Operator-confirmable margin regime. Allowed values:
+#   "intraday"   — only the new intraday-margin guard runs
+#   "legacy_pdt" — only the legacy day-trade counter runs
+#   "both"       — run every applicable guard (conservative default)
+# The default "both" keeps every guard active until the operator confirms their
+# IBKR account's regime during the broker phase-in (through 2027-10-20).
+# See MGN-03 / STATE.md Phase-1 blocker.
+MARGIN_REGIME = os.getenv("MARGIN_REGIME", "both").lower()
+
+# Legacy PDT day-trade counter — retained only as a safety net behind
+# MARGIN_REGIME ("legacy_pdt"/"both"). Uses the CORRECT $25k legacy PDT equity
+# threshold, never the eliminated $5k value.
+LEGACY_PDT_THRESHOLD_USD = 25000.0
 PDT_MAX_DAY_TRADES_PER_5_DAYS = 1   # Block the trade that would take us to this count (IBKR trips at 2)
 
 # Stale order re-evaluation
@@ -283,8 +303,19 @@ def validate_settings() -> list[str]:
     if CIRCUIT_BREAKER_WINDOW_MIN <= 0:
         errors.append(f"CIRCUIT_BREAKER_WINDOW_MIN must be positive, got {CIRCUIT_BREAKER_WINDOW_MIN}")
 
-    if PDT_PROTECTION_THRESHOLD_USD < 0:
-        errors.append(f"PDT_PROTECTION_THRESHOLD_USD must be non-negative, got {PDT_PROTECTION_THRESHOLD_USD}")
+    if REG_T_MIN_EQUITY_USD <= 0:
+        errors.append(f"REG_T_MIN_EQUITY_USD must be positive, got {REG_T_MIN_EQUITY_USD}")
+
+    if not (0 < INTRADAY_MAINTENANCE_MARGIN_PCT <= 100):
+        errors.append(f"INTRADAY_MAINTENANCE_MARGIN_PCT must be 0-100, got {INTRADAY_MAINTENANCE_MARGIN_PCT}")
+
+    if LEGACY_PDT_THRESHOLD_USD < 0:
+        errors.append(f"LEGACY_PDT_THRESHOLD_USD must be non-negative, got {LEGACY_PDT_THRESHOLD_USD}")
+
+    if MARGIN_REGIME not in ("intraday", "legacy_pdt", "both"):
+        errors.append(
+            f"MARGIN_REGIME must be one of intraday/legacy_pdt/both, got {MARGIN_REGIME!r}"
+        )
 
     if PDT_MAX_DAY_TRADES_PER_5_DAYS < 0:
         errors.append(f"PDT_MAX_DAY_TRADES_PER_5_DAYS must be non-negative, got {PDT_MAX_DAY_TRADES_PER_5_DAYS}")
