@@ -4,7 +4,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from core.models import Action
+from core.models import Action, TradeType
 from core.screener import (
     check_rsi,
     check_macd,
@@ -290,6 +290,35 @@ class TestScreenStocks:
     def test_empty_data(self):
         signals = screen_stocks({})
         assert signals == []
+
+
+class TestTradeCadence:
+    """SWG-01/02: screener emits SWING by default; DAY only behind the gate."""
+
+    def test_resolve_defaults_to_swing(self):
+        import core.screener as scr
+        assert scr._resolve_trade_type() is TradeType.SWING
+
+    def test_day_cadence_only_behind_gate(self):
+        import core.screener as scr
+        from unittest.mock import patch
+        # DEFAULT_TRADE_TYPE=day but gate OFF -> still swing
+        with patch.object(scr, "DEFAULT_TRADE_TYPE", "day"), \
+             patch.object(scr, "DAY_TRADE_ENABLED", False):
+            assert scr._resolve_trade_type() is TradeType.SWING
+        # DEFAULT_TRADE_TYPE=day AND gate ON -> day
+        with patch.object(scr, "DEFAULT_TRADE_TYPE", "day"), \
+             patch.object(scr, "DAY_TRADE_ENABLED", True):
+            assert scr._resolve_trade_type() is TradeType.DAY
+
+    def test_screener_emits_swing_by_default(self):
+        closes = [100] * 10 + [95] + [100] * 10 + [95.5, 96, 97, 98, 97]
+        n = len(closes)
+        vols = [500_000] * (n - 1) + [2_000_000]
+        df = _make_df(closes, vols)
+        signals = screen_stocks({"TEST": ("SMART", df)}, min_score=0.1)
+        for sig in signals:
+            assert sig.trade_type is TradeType.SWING
 
     def test_short_data_skipped(self):
         df = _make_df([100] * 5)

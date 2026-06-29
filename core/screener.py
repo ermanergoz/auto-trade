@@ -22,10 +22,24 @@ from config.settings import (
     INDICATOR_WEIGHTS,
     MAX_EXTENSION_OVER_MA20_PCT,
     MIN_DAILY_VOLUME,
+    DEFAULT_TRADE_TYPE,
+    DAY_TRADE_ENABLED,
 )
 from core.models import Signal, Action, TradeType
 
 logger = logging.getLogger(__name__)
+
+
+def _resolve_trade_type() -> TradeType:
+    """Resolve the cadence for screener-built signals from config.
+
+    Swing is the default; the day cadence is produced only when explicitly
+    configured AND gated on. Pure (config-only) so the backtester resolves the
+    identical trade_type — no account lookup, no IO.
+    """
+    if DEFAULT_TRADE_TYPE == "day" and DAY_TRADE_ENABLED:
+        return TradeType.DAY
+    return TradeType.SWING
 
 
 # ---------------------------------------------------------------------------
@@ -460,6 +474,7 @@ def _build_signal(
         reasoning=reasoning,
         source="screener",
         exchange=exchange,
+        trade_type=_resolve_trade_type(),
         indicator_values=indicator_values,
     )
 
