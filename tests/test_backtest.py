@@ -2109,3 +2109,71 @@ class TestWalkForwardCLI:
 
         main.main()
         assert calls == {"wf": 1, "plain": 0}
+
+
+# ---------------------------------------------------------------------------
+# Plan 02-06 Task 1: per-ticker Dow filter wired into the backtest (DOW-02)
+# ---------------------------------------------------------------------------
+
+class TestDowFilterBacktest:
+    """use_dow_filter on BacktestConfig flows into screen_stocks so the backtest
+    can run with-vs-without the per-ticker Dow filter. Default OFF preserves the
+    baseline run and live==backtest parity; ON drops non-UPTREND candidates
+    before they reach the risk manager. The keep/drop verdict is the
+    with-vs-without OOS comparison via rolling_walk_forward (see SUMMARY)."""
+
+    def test_config_defaults_dow_filter_off(self):
+        assert BacktestConfig(tickers=["AAPL"]).use_dow_filter is False
+
+    def test_config_accepts_dow_filter(self):
+        assert BacktestConfig(tickers=["AAPL"], use_dow_filter=True).use_dow_filter is True
+
+    def test_dow_filter_blocks_downtrend_baseline_enters(self, monkeypatch):
+        """With the filter ON a steep-downtrend ticker is never entered; with the
+        filter OFF (baseline) it can be.
+
+        The risk manager's MA-trend gate (MA5>MA10>MA20 for a BUY) would itself
+        reject a downtrend BUY, so to isolate the SCREENER-level Dow filter as
+        the sole differentiator we bypass risk with an approve-all evaluate. The
+        only thing that can drop the downtrending ticker is then config.use_dow_filter.
+        """
+        from unittest.mock import patch
+        from backtest.engine import run_backtest
+
+        # Synthetic full-history mock with no pre-holdout end_date below → unlock
+        # the holdout preflight for this mechanics-only test (scoped per-test).
+        monkeypatch.setenv("BORSA_HOLDOUT_UNLOCKED", "1")
+
+        n = 120
+        dates = pd.date_range("2021-01-01", periods=n, freq="D")
+        # Steep monotonic downtrend → RSI oversold fires a BUY in the screener,
+        # while dow_trend classifies the series DOWNTREND (dropped when ON).
+        down = _ohlc_frame([300.0 - i * 1.5 for i in range(n)], dates)
+
+        def _fake_yf(ticker, *args, **kwargs):
+            return {"DOWN": down}.get(ticker, pd.DataFrame())
+
+        def _approve_all(*args, **kwargs):
+            return RiskResult(approved=True, reasons=[], position_size=10)
+
+        def _run(use_dow: bool):
+            cfg = BacktestConfig(
+                tickers=["DOWN"], min_screener_score=0.1,
+                use_dow_filter=use_dow, end_date="2021-12-31",
+            )
+            with patch("backtest.engine.get_historical_data_yfinance", side_effect=_fake_yf), \
+                 patch("backtest.engine.evaluate", side_effect=_approve_all):
+                return run_backtest(cfg)
+
+        def _touched(p):
+            return {t.ticker for t in p.trades} | {pos.ticker for pos in p.positions}
+
+        baseline = _run(False)
+        filtered = _run(True)
+
+        assert "DOWN" in _touched(baseline), (
+            "Baseline (use_dow_filter=False) must be able to enter the downtrending ticker"
+        )
+        assert "DOWN" not in _touched(filtered), (
+            "use_dow_filter=True must drop the downtrending ticker before entry"
+        )

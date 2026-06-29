@@ -330,6 +330,12 @@ class BacktestConfig:
     # ONLY the entry decision is randomized. Deterministic per random_seed.
     use_random_entry: bool = False
     random_seed: int = 0
+    # Per-ticker Dow filter (DOW-02): when True, screen_stocks drops any
+    # candidate whose dow_trend is not UPTREND. Default OFF so the baseline run
+    # is unchanged and live==backtest parity holds until the filter is proven to
+    # beat the no-Dow baseline net of costs out-of-sample (run the walk-forward
+    # both ways and keep only if it wins).
+    use_dow_filter: bool = False
 
 
 def _build_benchmark_curve(
@@ -544,6 +550,7 @@ def run_backtest(config: BacktestConfig) -> SimulatedPortfolio:
                 stock_data, min_score=config.min_screener_score,
                 indicator_weights=config.indicator_weights,
                 max_extension_pct=config.max_extension_pct,
+                use_dow_filter=config.use_dow_filter,
             )
 
         if not candidates:
