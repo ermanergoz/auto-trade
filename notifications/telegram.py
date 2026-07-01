@@ -481,6 +481,42 @@ def notify_risk_warning(message: str) -> bool:
     return _send_sync(text)
 
 
+def notify_veto(ticker: str, evidence: Optional[str] = None) -> bool:
+    """Alert that the LLM catalyst/risk gate REMOVED a mechanical buy (D-07).
+
+    The gate can only subtract — this entry was risk-approved but a current,
+    position-relevant catalyst (earnings, M&A, dilution, etc.) vetoed the
+    fresh multi-day hold.
+    """
+    detail = f"\n\n<i>{evidence[:200]}</i>" if evidence else ""
+    text = f"\U0001f6d1 <b>Buy removed — catalyst</b>\n\n<b>{ticker}</b>{detail}"
+    return _send_sync(text)
+
+
+def notify_warn(ticker: str, evidence: Optional[str] = None) -> bool:
+    """Alert that the gate FLAGGED a buy but let it proceed (D-01/D-07).
+
+    WARN is notify-only: the mechanical buy still stands — the operator is
+    informed of the flag, not blocked by it.
+    """
+    detail = f"\n\n<i>{evidence[:200]}</i>" if evidence else ""
+    text = f"⚠️ <b>Buy proceeded — flagged</b>\n\n<b>{ticker}</b>{detail}"
+    return _send_sync(text)
+
+
+def notify_gate_halt(ticker: str) -> bool:
+    """Alert that the gate was UNAVAILABLE and the entry was blocked (D-02/D-07).
+
+    Both LLM providers were exhausted; fail-closed means the buy is paused,
+    never silently let through.
+    """
+    text = (
+        f"\U0001f6a7 <b>Entries paused — gate unavailable</b>\n\n"
+        f"<b>{ticker}</b> entry blocked: both LLM providers exhausted (fail-closed)."
+    )
+    return _send_sync(text)
+
+
 def notify_error(error: str) -> bool:
     """Send a system error notification."""
     text = f"\U0001f6a8 <b>System Error</b>\n\n<code>{error[:500]}</code>"

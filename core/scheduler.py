@@ -1,5 +1,8 @@
 """Main orchestration loop — runs the trading pipeline on schedule."""
 
+import asyncio
+import functools
+import hashlib
 import logging
 import signal as sig
 import sys
@@ -12,13 +15,16 @@ from ib_insync import IB
 from config.settings import (
     SCAN_INTERVAL_MINUTES, TIMEZONE, MARKET_HOURS,
     CLOSE_DAY_TRADES_BEFORE_MARKET_CLOSE, CLOSE_MINUTES_BEFORE,
-    AI_MAX_CANDIDATES, STALE_ORDER_MINUTES,
+    AI_MAX_CANDIDATES, STALE_ORDER_MINUTES, MAX_SWING_HOLD_DAYS,
 )
 from core.connection import ensure_connected, create_contract, disconnect
-from core.data import get_historical_data, get_news, get_historical_data_yfinance, get_macro_news
+from core.data import (
+    get_historical_data, get_news, get_historical_data_yfinance,
+    get_macro_news, get_earnings_date,
+)
 from core.universe import build_universe, get_tickers_for_market
 from core.screener import screen_stocks
-from core.analyst import analyze_batch
+from core.gate import gate_signal, Verdict
 from core.risk import evaluate
 from core.executor import (
     place_order, place_market_order, close_all_day_trades, setup_fill_handler,
@@ -29,7 +35,7 @@ from core.executor import (
 )
 from core.portfolio import (
     get_open_positions, get_daily_pnl, record_signal,
-    get_portfolio_value, get_trades,
+    get_portfolio_value, get_trades, log_verdict,
 )
 from core.models import StockInfo, Position, TradeType, Action
 from notifications.telegram import (
@@ -37,6 +43,7 @@ from notifications.telegram import (
     notify_shutdown, update_status, notify_risk_results,
     update_portfolio_data, notify_risk_warning,
     notify_stale_order_cancelled, notify_reconciliation_mismatch,
+    notify_veto, notify_warn, notify_gate_halt,
 )
 
 from core import state as _state
@@ -254,47 +261,42 @@ def run_scan_cycle(
             )
             candidates = candidates[:AI_MAX_CANDIDATES]
 
-        # Step 3: AI analysis
-        ai_input = []
+        # Step 3: build a per-ticker source_text map for the gate.
+        # Pipeline is INVERTED (LLM-01): mechanical risk runs FIRST and the
+        # LLM gate runs LAST and can only SUBTRACT. So a candidate lacking
+        # news is NOT dropped here (that would silently shrink the mechanical
+        # universe) — "no news" routes to the gate as INSUFFICIENT_DATA and
+        # the buy stands (D-05 spirit). We keep every screener candidate.
+        source_text: dict[str, str] = {}
         for sig_obj in candidates:
-            ticker = sig_obj.ticker
-            exchange = sig_obj.exchange
-            df = stock_data.get(ticker, (None, None))[1]
-            if df is None or df.empty:
-                continue
+            news = get_news(sig_obj.ticker, market) or []
+            source_text[sig_obj.ticker] = "\n".join(news) if news else ""
 
-            news = get_news(ticker, market)
-            if not news:
-                logger.info("Skipping %s: no news from Tavily or yfinance", ticker)
-                continue
-            ai_input.append({
-                "ticker": ticker,
-                "exchange": exchange,
-                "df": df,
-                "indicator_values": sig_obj.indicator_values,
-                "news": news,
-            })
+        update_status("risk_eval", f"{len(candidates)} candidates for {market}")
 
-        update_status("ai_analysis", f"0/{len(ai_input)} candidates for {market}")
-
-        def _on_ai_progress(current, total, _market=market):
-            update_status("ai_analysis", f"{current}/{total} candidates for {_market}")
-
-        # Step 3+4: AI analysis with streaming risk check + execution.
-        # Each AI-approved signal is immediately sent to risk check and
-        # order placement via the on_signal callback, instead of waiting
-        # for all AI analysis to complete first.
+        # Signals that survived mechanical risk. `risk_approved_signals` is the
+        # notify list; entries flow to the gate as `pre_llm_buys`, exits bypass
+        # the gate entirely (an LLM must never block an exit).
         risk_approved_signals = []
-        # Virtual positions for bracket orders placed this cycle whose fills
-        # haven't been written to the DB yet. Without this, two rapid AI
-        # approvals both evaluate against the same stale DB snapshot and the
-        # max-positions / sector-concentration / cumulative-risk checks both
-        # pass when they should not.
+        pre_llm_buys: list[tuple] = []   # (signal, result) — risk-approved ENTRIES to gate
+        exit_signals: list[tuple] = []   # (signal, result) — risk-approved exits, bypass gate
+        # Virtual positions for entries approved this cycle whose orders/fills
+        # haven't hit the DB yet. Without this, two rapid approvals both
+        # evaluate against the same stale DB snapshot and the max-positions /
+        # sector-concentration / cumulative-risk checks both pass when they
+        # should not (Pitfall 1 — the bugfix/cumulative-risk-sizing race).
         pending_this_cycle: list[Position] = []
+        # Running reserve for this cycle's approved-but-unplaced BUYs. In the
+        # inverted flow, orders are placed AFTER the whole risk loop, so
+        # get_pending_buy_reserve(ib) cannot yet see this cycle's approvals
+        # (it only reads unfilled parent orders live at IBKR). Accumulate the
+        # notional here so back-to-back approvals don't over-commit cash
+        # (preserves the Error-201 guard the old synchronous placement gave).
+        cycle_buy_reserve = 0.0
 
-        def _on_signal(signal):
-            nonlocal open_positions, portfolio_value
-            summary["ai_approved"] += 1
+        # ---- RISK LOOP (mechanical, FIRST) — produces pre_llm_buys ----------
+        for signal in candidates:
+            summary["ai_approved"] += 1  # candidates reaching risk eval
             record_signal(signal)
 
             # Refresh account state to capture any fills since scan start
@@ -360,12 +362,12 @@ def run_scan_cycle(
                         "Circuit breaker tripped — consecutive losses detected. "
                         "Trading paused. Review manually."
                     )
-                return
+                continue
 
             # Market-close boundary guard: wall-clock may have advanced into
-            # the close window while AI analysis was running. If so, skip —
-            # close_all_day_trades would immediately flatten this position,
-            # creating an unnecessary round-trip at uncertain market price.
+            # the close window during this scan. If so, skip — close_all_day_trades
+            # would immediately flatten this position, creating an unnecessary
+            # round-trip at uncertain market price.
             if not force and CLOSE_DAY_TRADES_BEFORE_MARKET_CLOSE:
                 mins_left_now = minutes_to_close(market)
                 if 0 < mins_left_now <= CLOSE_MINUTES_BEFORE:
@@ -374,18 +376,19 @@ def run_scan_cycle(
                         "(%d min to close, threshold %d min)",
                         signal.ticker, mins_left_now, CLOSE_MINUTES_BEFORE,
                     )
-                    return
+                    continue
 
             # Cash-reserve gate — only long entries consume settled cash.
             # IBKR's TotalCashValue is not decremented for unfilled parent
-            # BUY orders, so we subtract that reserve ourselves. Without
-            # this, two back-to-back approvals can over-commit and the
-            # second bracket is rejected by IBKR (Error 201 — see 2026-04-22
-            # HPE+STLD run). If short on cash, try to evict the weakest
-            # pending BUY (only if the new one is clearly stronger).
+            # BUY orders, so we subtract that reserve ourselves plus this
+            # cycle's already-approved BUYs. Without this, two back-to-back
+            # approvals can over-commit and the second bracket is rejected by
+            # IBKR (Error 201 — see 2026-04-22 HPE+STLD run). If short on cash,
+            # try to evict the weakest pending BUY (only if the new one is
+            # clearly stronger).
             if signal.action == Action.BUY and not result.is_exit:
                 total_cash = fresh_account.get("TotalCashValue", 0.0)
-                pending_reserve = get_pending_buy_reserve(ib)
+                pending_reserve = get_pending_buy_reserve(ib) + cycle_buy_reserve
                 needed_cash = signal.entry_price * result.position_size
                 available_cash = total_cash - pending_reserve
                 if needed_cash > available_cash:
@@ -403,7 +406,7 @@ def run_scan_cycle(
                         # Refresh cash view after cancellation — the freed
                         # reserve should now cover this order.
                         ib.sleep(0.5)
-                        pending_reserve = get_pending_buy_reserve(ib)
+                        pending_reserve = get_pending_buy_reserve(ib) + cycle_buy_reserve
                         available_cash = total_cash - pending_reserve
                     if needed_cash > available_cash:
                         logger.info(
@@ -412,28 +415,134 @@ def run_scan_cycle(
                             signal.ticker, needed_cash, available_cash,
                             total_cash, pending_reserve,
                         )
-                        return
+                        continue
 
             summary["risk_approved"] += 1
             risk_approved_signals.append(signal)
 
-            dry_run = mode in ("dry-run", "backtest")
+            if result.is_exit:
+                # Exits bypass the gate — an LLM must never block a close.
+                exit_signals.append((signal, result))
+                continue
 
-            def _on_fill(sig, filled_qty, fill_price):
-                notify_trade(sig, filled_qty)
-                logger.info(
-                    "Order filled: %s %d @ $%.2f",
-                    sig.ticker, filled_qty, fill_price,
-                )
+            # Approved ENTRY — queue for the gate and accumulate the virtual
+            # position + cash reserve BEFORE evaluating the next candidate so
+            # the race guard (Pitfall 1) holds across the loop.
+            pre_llm_buys.append((signal, result))
+            signed_qty = (
+                result.position_size
+                if signal.action == Action.BUY
+                else -result.position_size
+            )
+            # entry_time must be UTC. The PDT check converts naive datetimes to
+            # UTC by attaching tzinfo=UTC (not by converting); an Istanbul-time
+            # datetime would be mis-bucketed by 3h relative to ET.
+            from datetime import timezone as _utc_tz2
+            pending_this_cycle.append(Position(
+                ticker=signal.ticker,
+                exchange=signal.exchange,
+                quantity=signed_qty,
+                entry_price=signal.entry_price,
+                entry_time=datetime.now(_utc_tz2.utc),
+                stop_loss=signal.stop_loss,
+                take_profit=signal.take_profit,
+                trade_type=signal.trade_type,
+                sector=signal.indicator_values.get("sector", ""),
+            ))
+            if signal.action == Action.BUY:
+                cycle_buy_reserve += signal.entry_price * result.position_size
 
-            def _on_exit(ticker, exit_price, exit_type):
-                from notifications.telegram import notify_trade_closed, refresh_positions_cache
-                from core.portfolio import get_trades
-                trades_list = get_trades(ticker=ticker)
-                if trades_list:
-                    notify_trade_closed(trades_list[0])
-                refresh_positions_cache()
+        # ---- GATE LOOP (LLM veto, LAST, OFF-LOOP) — produces post_llm_buys ---
+        # The gate is a BLOCKING call (up to 40 min on the Ollama fallback).
+        # Run it in the default ThreadPoolExecutor while ib.sleep(0.1) pumps
+        # the asyncio loop so fills/disconnects are still serviced (LLM-05).
+        # The gate can only VETO/WARN/OK/abstain — never originate a buy.
+        post_llm_buys: list[tuple] = []
+        if pre_llm_buys:
+            update_status("gate", f"{len(pre_llm_buys)} entries for {market}")
+        for signal, result in pre_llm_buys:
+            ticker = signal.ticker
+            src = source_text.get(ticker, "")
+            # Horizon fallback (D-06). Earnings date fetched UPSTREAM so the
+            # pure gate stays IO-free / backtestable.
+            horizon_days = MAX_SWING_HOLD_DAYS
+            earnings_date = get_earnings_date(ticker, market)
 
+            loop = asyncio.get_event_loop()  # ib_insync's loop (main thread)
+            fut = loop.run_in_executor(
+                None,
+                functools.partial(gate_signal, earnings_date=earnings_date),
+                src, signal.__dict__, horizon_days,
+            )
+            while not fut.done():
+                ib.sleep(0.1)  # pumps the loop — NOT time.sleep / asyncio.sleep
+            gate = fut.result()
+
+            # LLM-08: persist EVERY verdict (VETO/WARN/OK/INSUFFICIENT_DATA).
+            log_verdict(
+                ticker=ticker,
+                verdict=gate.verdict.value,
+                quoted_evidence=gate.quoted_evidence,
+                reason=gate.reason,
+                provider=gate.provider,
+                horizon_days=horizon_days,
+                earnings_date=earnings_date.isoformat() if earnings_date else None,
+                source_text_hash=hashlib.sha256(src.encode()).hexdigest(),
+                timestamp=datetime.now(_tz).isoformat(),
+            )
+
+            if gate.verdict == Verdict.VETO:
+                # Buy removed — a current catalyst threatens the fresh hold (D-07).
+                logger.info("Gate VETO %s: %s", ticker, gate.reason)
+                notify_veto(ticker, gate.quoted_evidence)
+                continue
+            if gate.provider == "none":
+                # Both providers exhausted — FAIL CLOSED, block the entry (D-02/D-07).
+                logger.warning("Gate unavailable for %s — entry blocked (fail-closed)", ticker)
+                notify_gate_halt(ticker)
+                continue
+            if gate.verdict == Verdict.WARN:
+                # Notify-only — the buy still stands (D-01).
+                logger.info("Gate WARN %s (buy stands): %s", ticker, gate.reason)
+                notify_warn(ticker, gate.quoted_evidence)
+            # OK / WARN / INSUFFICIENT_DATA (with a live provider) → buy stands.
+            post_llm_buys.append((signal, result))
+
+        # ---- INVARIANT (T-3-04): the gate can only SUBTRACT ----------------
+        # post_llm_buys MUST be a subset of pre_llm_buys. A gate that ADDED a
+        # ticker has re-promoted the LLM to decision-maker — a critical bug,
+        # never a tradeable state. Halt the cycle, log, and alert.
+        if not ({s.ticker for s, _ in post_llm_buys} <= {s.ticker for s, _ in pre_llm_buys}):
+            added = {s.ticker for s, _ in post_llm_buys} - {s.ticker for s, _ in pre_llm_buys}
+            logger.error(
+                "INVARIANT BREACH: gate produced tickers absent from pre_llm_buys: %s "
+                "— halting cycle (the gate must only subtract)", added,
+            )
+            notify_error(
+                f"CRITICAL: LLM gate invariant breach — added {sorted(added)} "
+                "(post_llm_buys must be a subset of pre_llm_buys). Cycle halted."
+            )
+            continue  # never execute a gate-originated buy
+
+        # ---- EXECUTE LOOP — over exits + gate survivors --------------------
+        dry_run = mode in ("dry-run", "backtest")
+
+        def _on_fill(sig, filled_qty, fill_price):
+            notify_trade(sig, filled_qty)
+            logger.info(
+                "Order filled: %s %d @ $%.2f",
+                sig.ticker, filled_qty, fill_price,
+            )
+
+        def _on_exit(ticker, exit_price, exit_type):
+            from notifications.telegram import notify_trade_closed, refresh_positions_cache
+            from core.portfolio import get_trades
+            trades_list = get_trades(ticker=ticker)
+            if trades_list:
+                notify_trade_closed(trades_list[0])
+            refresh_positions_cache()
+
+        for signal, result in exit_signals + post_llm_buys:
             # Route exits through a plain close order rather than a bracket.
             # A bracket's SL/TP children would stay live at IBKR after the
             # parent closes our position — those orders could later fire when
@@ -455,7 +564,7 @@ def run_scan_cycle(
                     summary["orders_placed"] += 1
                 ib.sleep(0.5)
                 open_positions = get_open_positions()
-                return
+                continue
 
             trades = place_order(ib, signal, result.position_size, dry_run=dry_run)
 
@@ -502,40 +611,11 @@ def run_scan_cycle(
                 else:
                     summary["orders_placed"] += 1
                     notify_trade(signal, result.position_size, action_type="SUBMITTED")
-                    # Track as a virtual position so subsequent risk checks in
-                    # this cycle see it, even if the DB refresh below hasn't
-                    # picked up the fill yet. Fill handler will update DB
-                    # asynchronously; the effective_positions merge handles
-                    # the overlap without double-counting.
-                    signed_qty = (
-                        result.position_size
-                        if signal.action == Action.BUY
-                        else -result.position_size
-                    )
-                    # entry_time must be UTC. The PDT check converts naive
-                    # datetimes to UTC by attaching a tzinfo=UTC (not by
-                    # converting); a datetime in Istanbul time would be
-                    # mis-bucketed by 3 hours relative to ET for the
-                    # day-trade boundary classification.
-                    from datetime import timezone as _utc_tz2
-                    pending_this_cycle.append(Position(
-                        ticker=signal.ticker,
-                        exchange=signal.exchange,
-                        quantity=signed_qty,
-                        entry_price=signal.entry_price,
-                        entry_time=datetime.now(_utc_tz2.utc),
-                        stop_loss=signal.stop_loss,
-                        take_profit=signal.take_profit,
-                        trade_type=signal.trade_type,
-                        sector=signal.indicator_values.get("sector", ""),
-                    ))
 
-            # Always refresh positions for next risk check, regardless of
-            # whether the order succeeded — async fills may have updated DB
+            # Refresh positions after each placement — async fills may have
+            # updated DB.
             ib.sleep(0.5)
             open_positions = get_open_positions()
-
-        analyze_batch(ai_input, on_signal=_on_signal, on_progress=_on_ai_progress, macro_news=macro_news)
 
         if risk_approved_signals:
             notify_risk_results(risk_approved_signals)
