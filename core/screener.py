@@ -5,7 +5,9 @@ so that the backtester can feed historical data without code duplication.
 """
 
 import logging
+from dataclasses import dataclass
 from datetime import datetime
+from enum import Enum
 from typing import Optional
 
 import pandas as pd
@@ -519,6 +521,133 @@ def _is_extended(df: pd.DataFrame, max_pct: float = MAX_EXTENSION_OVER_MA20_PCT)
 
 
 # ---------------------------------------------------------------------------
+# Dow / market-structure classifier (DOW-01) — pure, symbol-agnostic
+# ---------------------------------------------------------------------------
+
+class DowTrend(Enum):
+    """Market-structure trend classification (Dow-theory swing analysis)."""
+    UPTREND = "uptrend"
+    DOWNTREND = "downtrend"
+    RANGE = "range"
+
+
+@dataclass(frozen=True)
+class DowResult:
+    """Result of a dow_trend classification.
+
+    trend: the current structural trend (after any break-of-structure flip).
+    break_of_structure: True when the latest bar breached the most recent
+        confirmed opposite swing pivot, flipping an established trend.
+    """
+    trend: DowTrend
+    break_of_structure: bool
+
+
+def _find_swings(
+    values: list[float], strength: int
+) -> tuple[list[tuple[int, float]], list[tuple[int, float]]]:
+    """Return (swing_highs, swing_lows) as ordered (index, value) pairs.
+
+    A swing high is a bar strictly greater than `strength` neighbours on each
+    side; a swing low strictly lower. Pure list scan — no IO, no pandas state.
+    The final `strength` bars can never be confirmed pivots (insufficient
+    right-side neighbours), so the latest bar is never mistaken for a pivot.
+    """
+    highs: list[tuple[int, float]] = []
+    lows: list[tuple[int, float]] = []
+    n = len(values)
+    for i in range(strength, n - strength):
+        v = values[i]
+        left = values[i - strength:i]
+        right = values[i + 1:i + 1 + strength]
+        if all(v > x for x in left) and all(v > x for x in right):
+            highs.append((i, v))
+        elif all(v < x for x in left) and all(v < x for x in right):
+            lows.append((i, v))
+    return highs, lows
+
+
+def _fallback_trend(values: list[float], threshold: float = 0.02) -> DowTrend:
+    """Classify by net drift when too few swing pivots exist.
+
+    A smooth monotonic series has no interior pivots, so compare the mean of
+    the first third to the last third, normalised by the first-third mean.
+    Normalisation keeps the function symbol-agnostic (scale-invariant).
+    """
+    n = len(values)
+    third = max(1, n // 3)
+    first = sum(values[:third]) / third
+    last = sum(values[-third:]) / third
+    if first <= 0:
+        return DowTrend.RANGE
+    change = (last - first) / first
+    if change > threshold:
+        return DowTrend.UPTREND
+    if change < -threshold:
+        return DowTrend.DOWNTREND
+    return DowTrend.RANGE
+
+
+def dow_trend(
+    close: pd.Series, lookback: int = 20, swing_strength: int = 2
+) -> DowResult:
+    """Classify a price series' Dow / market-structure trend.
+
+    PURE FUNCTION — no IO, symbol-agnostic. Runs identically on a single
+    small-cap stock series or an index (e.g. SPY) series because every
+    comparison is relative/scale-invariant.
+
+    Logic:
+      * Identify confirmed swing highs/lows (a bar more extreme than
+        `swing_strength` neighbours on each side).
+      * Higher-high AND higher-low  -> UPTREND
+        Lower-high  AND lower-low   -> DOWNTREND
+        anything mixed              -> RANGE
+      * When fewer than two highs AND two lows are confirmed (e.g. a smooth
+        monotonic run with no interior pivots) fall back to net-drift.
+      * break_of_structure: the latest bar breaches the most recent confirmed
+        opposite swing pivot, flipping an established trend (an uptrend bar
+        closing below the last swing low -> DOWNTREND; a downtrend bar closing
+        above the last swing high -> UPTREND).
+
+    Never raises: a too-short series (fewer bars than `lookback`) returns
+    RANGE with break_of_structure False.
+    """
+    if close is None:
+        return DowResult(DowTrend.RANGE, False)
+    values = [float(v) for v in close.dropna().tolist()]
+    if len(values) < lookback or len(values) < swing_strength * 2 + 1:
+        return DowResult(DowTrend.RANGE, False)
+
+    highs, lows = _find_swings(values, swing_strength)
+    latest = values[-1]
+
+    if len(highs) >= 2 and len(lows) >= 2:
+        prev_h, last_h = highs[-2][1], highs[-1][1]
+        prev_l, last_l = lows[-2][1], lows[-1][1]
+        if last_h > prev_h and last_l > prev_l:
+            base = DowTrend.UPTREND
+        elif last_h < prev_h and last_l < prev_l:
+            base = DowTrend.DOWNTREND
+        else:
+            base = DowTrend.RANGE
+    else:
+        base = _fallback_trend(values)
+
+    # Break-of-structure: latest bar breaches the most recent opposite pivot.
+    bos = False
+    trend = base
+    if base is DowTrend.UPTREND and lows and latest < lows[-1][1]:
+        bos = True
+        trend = DowTrend.DOWNTREND
+    elif base is DowTrend.DOWNTREND and highs and latest > highs[-1][1]:
+        bos = True
+        trend = DowTrend.UPTREND
+
+    return DowResult(trend, bos)
+
+
+# ---------------------------------------------------------------------------
 # Main screening entry point (pure function)
 # ---------------------------------------------------------------------------
 
@@ -527,6 +656,7 @@ def screen_stocks(
     min_score: float = 15.0,
     indicator_weights: dict[str, float] | None = None,
     max_extension_pct: float = MAX_EXTENSION_OVER_MA20_PCT,
+    use_dow_filter: bool = False,
 ) -> list[Signal]:
     """Screen multiple stocks and return all candidates above min_score.
 
@@ -541,6 +671,10 @@ def screen_stocks(
         max_extension_pct: Drop tickers whose close is more than this % above
                            MA20. Prevents chasing parabolic breakouts. Set to
                            0 or negative to disable.
+        use_dow_filter: When True, drop any candidate whose dow_trend is not
+                        UPTREND (market-structure filter). Default False to
+                        preserve existing behaviour and live==backtest parity
+                        until the filter is validated out-of-sample (02-06).
 
     Returns:
         List of Signal objects sorted by score descending.
@@ -548,6 +682,7 @@ def screen_stocks(
     candidates: list[tuple[float, Signal]] = []
     extended_skipped = 0
     illiquid_skipped = 0
+    dow_skipped = 0
 
     for ticker, (exchange, df) in stock_data.items():
         if df.empty or len(df) < MA_SLOW + 1:
@@ -578,6 +713,16 @@ def screen_stocks(
                 )
                 continue
 
+            if use_dow_filter:
+                structure = dow_trend(df["close"])
+                if structure.trend is not DowTrend.UPTREND:
+                    dow_skipped += 1
+                    logger.debug(
+                        "Skipping %s: dow_trend=%s is not UPTREND (market-structure filter)",
+                        ticker, structure.trend.value,
+                    )
+                    continue
+
             triggered = analyze_stock(df)
             if not triggered:
                 continue
@@ -597,8 +742,8 @@ def screen_stocks(
 
     logger.info(
         "Screener found %d candidates (from %d stocks, min_score=%.0f, "
-        "dropped %d extended, %d illiquid)",
+        "dropped %d extended, %d illiquid, %d non-uptrend)",
         len(result), len(stock_data), min_score,
-        extended_skipped, illiquid_skipped,
+        extended_skipped, illiquid_skipped, dow_skipped,
     )
     return result

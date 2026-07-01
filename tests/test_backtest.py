@@ -74,7 +74,7 @@ class TestSimulatedPortfolio:
         non-sensical exit.
         """
         p = SimulatedPortfolio(
-            initial_capital=100_000, slippage_pct=0.0, commission=0.0,
+            initial_capital=100_000, slippage_pct=0.0, commission=0.0, spread_bps=0.0,
         )
         # Signal: long AAPL at $100 with SL=$95 (5% risk) and TP=$110 (10% target)
         sig = _make_signal(
@@ -100,7 +100,7 @@ class TestSimulatedPortfolio:
     def test_stop_and_target_rescaled_to_fill_on_gap_up_short(self):
         """Short version of the gap rescaling: SL above fill, TP below."""
         p = SimulatedPortfolio(
-            initial_capital=100_000, slippage_pct=0.0, commission=0.0,
+            initial_capital=100_000, slippage_pct=0.0, commission=0.0, spread_bps=0.0,
         )
         # Short AAPL at $100 with SL=$105 (5% risk above) and TP=$90 (10% target below)
         sig = _make_signal(
@@ -151,7 +151,7 @@ class TestCommissionPerShare:
     def test_small_position_hits_minimum(self):
         """A 10-share trade pays the $1 minimum, not $0.05."""
         p = SimulatedPortfolio(
-            initial_capital=100_000, slippage_pct=0.0,
+            initial_capital=100_000, slippage_pct=0.0, spread_bps=0.0,
         )
         sig = _make_signal(action=Action.BUY, entry_price=100.0,
                            stop_loss=95.0, take_profit=110.0)
@@ -169,7 +169,7 @@ class TestShortPositionAccounting:
 
     def test_short_open_credits_cash(self):
         """Opening a short sale should ADD cash (you receive sale proceeds)."""
-        p = SimulatedPortfolio(initial_capital=100_000, slippage_pct=0, commission=0)
+        p = SimulatedPortfolio(initial_capital=100_000, slippage_pct=0, commission=0, spread_bps=0)
         sig = _make_signal(action=Action.SELL, entry_price=100.0,
                            stop_loss=110.0, take_profit=90.0)
         p.open_position(sig, 10, 100.0, datetime(2024, 1, 15))
@@ -180,7 +180,7 @@ class TestShortPositionAccounting:
 
     def test_short_position_stores_negative_quantity(self):
         """Short positions must have negative quantity."""
-        p = SimulatedPortfolio(initial_capital=100_000, slippage_pct=0, commission=0)
+        p = SimulatedPortfolio(initial_capital=100_000, slippage_pct=0, commission=0, spread_bps=0)
         sig = _make_signal(action=Action.SELL, entry_price=100.0,
                            stop_loss=110.0, take_profit=90.0)
         p.open_position(sig, 10, 100.0, datetime(2024, 1, 15))
@@ -189,7 +189,7 @@ class TestShortPositionAccounting:
 
     def test_short_close_debits_cash(self):
         """Closing a short (buying back) should DEBIT cash."""
-        p = SimulatedPortfolio(initial_capital=100_000, slippage_pct=0, commission=0)
+        p = SimulatedPortfolio(initial_capital=100_000, slippage_pct=0, commission=0, spread_bps=0)
         sig = _make_signal(action=Action.SELL, entry_price=100.0,
                            stop_loss=110.0, take_profit=90.0)
         p.open_position(sig, 10, 100.0, datetime(2024, 1, 15))
@@ -202,7 +202,7 @@ class TestShortPositionAccounting:
 
     def test_short_profitable_trade_pnl(self):
         """Short that drops in price should have positive P&L."""
-        p = SimulatedPortfolio(initial_capital=100_000, slippage_pct=0, commission=0)
+        p = SimulatedPortfolio(initial_capital=100_000, slippage_pct=0, commission=0, spread_bps=0)
         sig = _make_signal(action=Action.SELL, entry_price=100.0,
                            stop_loss=110.0, take_profit=90.0)
         p.open_position(sig, 10, 100.0, datetime(2024, 1, 15))
@@ -214,7 +214,7 @@ class TestShortPositionAccounting:
 
     def test_short_losing_trade_pnl(self):
         """Short that rises in price should have negative P&L."""
-        p = SimulatedPortfolio(initial_capital=100_000, slippage_pct=0, commission=0)
+        p = SimulatedPortfolio(initial_capital=100_000, slippage_pct=0, commission=0, spread_bps=0)
         sig = _make_signal(action=Action.SELL, entry_price=100.0,
                            stop_loss=110.0, take_profit=90.0)
         p.open_position(sig, 10, 100.0, datetime(2024, 1, 15))
@@ -226,7 +226,7 @@ class TestShortPositionAccounting:
 
     def test_short_mtm_reduces_portfolio_value(self):
         """Short position should reduce portfolio value by its notional."""
-        p = SimulatedPortfolio(initial_capital=100_000, slippage_pct=0, commission=0)
+        p = SimulatedPortfolio(initial_capital=100_000, slippage_pct=0, commission=0, spread_bps=0)
         sig = _make_signal(action=Action.SELL, entry_price=100.0,
                            stop_loss=110.0, take_profit=90.0)
         p.open_position(sig, 10, 100.0, datetime(2024, 1, 15))
@@ -241,7 +241,7 @@ class TestShortPositionAccounting:
         from backtest.engine import _check_exits
         from core.models import Position, TradeType
 
-        portfolio = SimulatedPortfolio(initial_capital=100_000, slippage_pct=0, commission=0)
+        portfolio = SimulatedPortfolio(initial_capital=100_000, slippage_pct=0, commission=0, spread_bps=0)
         portfolio.positions.append(Position(
             ticker="SHORT", exchange="SMART", quantity=-10,
             entry_price=100.0, entry_time=datetime(2024, 1, 1),
@@ -306,6 +306,130 @@ class TestMetrics:
         assert _std([1, 2, 3, 4, 5]) > 0
 
 
+class TestCostDecompositionMetrics:
+    """calculate_metrics must surface cost-as-%-of-gross and breakeven edge,
+    derived from the exact gross/total/net decomposition of the fill prices."""
+
+    def test_known_trade_cost_decomposition(self):
+        """One crafted long trade with KNOWN fills + params pins gross/total/net.
+
+        raw_entry=$100, raw_exit=$110, qty=100, slippage=0.1%, spread=5bps,
+        commission=$1 min / $0.005 per share.
+          entry fill = 100 * (1 + 0.0015) = 100.15
+          exit  fill = 110 * (1 - 0.0015) = 109.835
+          Trade.pnl  = (109.835 - 100.15) * 100 = 968.50
+          slippage   = (100 + 110) * 0.001 * 100 = 21.00
+          spread     = (100 + 110) * 0.0005 * 100 = 10.50
+          commission = max($1, 100*$0.005)=$1 per leg => $2.00 round trip
+          gross_pnl  = 968.50 + 21.00 + 10.50 = 1000.00  (== (110-100)*100)
+          total_cost = 2.00 + 21.00 + 10.50 = 33.50
+          net_pnl    = 968.50 - 2.00 = 966.50
+          cost %     = 33.50 / 1000.00 * 100 = 3.35%
+          breakeven  = 33.50 / 1 trade = $33.50
+        """
+        t = Trade(
+            "AAPL", "SMART", 100, 100.15, 109.835,
+            datetime(2024, 1, 1), datetime(2024, 1, 3), TradeType.SWING,
+        )
+        equity = [(date(2024, 1, 1), 100_000.0), (date(2024, 1, 3), 100_966.5)]
+        m = calculate_metrics(
+            [t], equity, 100_000,
+            slippage_pct=0.1, spread_bps=5.0,
+            commission=1.0, commission_per_share=0.005,
+        )
+
+        assert m["gross_pnl"] == pytest.approx(1000.0)
+        assert m["total_cost"] == pytest.approx(33.5)
+        assert m["net_pnl"] == pytest.approx(966.5)
+        assert m["cost_pct_of_gross_pnl"] == pytest.approx(3.35)
+        assert m["breakeven_edge_per_trade"] == pytest.approx(33.5)
+
+    def test_zero_friction_gross_equals_net(self):
+        """With no slippage/spread/commission, gross == net == Trade.pnl."""
+        t = Trade(
+            "MSFT", "SMART", 10, 100.0, 110.0,
+            datetime(2024, 1, 1), datetime(2024, 1, 2), TradeType.DAY,
+        )
+        m = calculate_metrics(
+            [t], [(date(2024, 1, 1), 100_000.0), (date(2024, 1, 2), 100_100.0)],
+            100_000, slippage_pct=0.0, spread_bps=0.0,
+            commission=0.0, commission_per_share=0.0,
+        )
+        assert m["gross_pnl"] == pytest.approx(100.0)
+        assert m["net_pnl"] == pytest.approx(100.0)
+        assert m["total_cost"] == pytest.approx(0.0)
+
+    def test_metrics_keys_present(self):
+        """The new cost keys must always be present in the metrics dict."""
+        m = calculate_metrics([], [], 100_000)
+        for key in ("gross_pnl", "net_pnl", "total_cost",
+                    "cost_pct_of_gross_pnl", "breakeven_edge_per_trade"):
+            assert key in m
+
+
+class TestHistoryPeriodAndSurvivorship:
+    """3-5y multi-regime history default, sub-$25k capital, and a survivorship
+    caveat printed on every report (HRN-07)."""
+
+    def test_config_default_history_period_is_5y(self):
+        config = BacktestConfig(tickers=["AAPL"])
+        assert config.history_period == "5y"
+
+    def test_config_history_period_is_overridable(self):
+        config = BacktestConfig(tickers=["AAPL"], history_period="3y")
+        assert config.history_period == "3y"
+
+    def test_history_period_passed_to_download(self, monkeypatch):
+        """run_backtest must pull config.history_period, not a hardcoded 1y."""
+        from unittest.mock import patch
+        import pandas as pd
+        from backtest.engine import run_backtest
+
+        # Synthetic/mocked download with no pre-holdout end_date → the full-history
+        # holdout preflight would refuse it. Unlock for this mechanics-only test
+        # (scoped to this test; other tests keep the default LOCKED state).
+        monkeypatch.setenv("BORSA_HOLDOUT_UNLOCKED", "1")
+
+        captured = {}
+
+        def _fake_yf(ticker, *args, **kwargs):
+            captured["period"] = kwargs.get("period")
+            return pd.DataFrame()  # empty → early return, that's fine
+
+        config = BacktestConfig(tickers=["AAPL"], history_period="5y")
+        with patch("backtest.engine.get_historical_data_yfinance", side_effect=_fake_yf):
+            run_backtest(config)
+
+        assert captured.get("period") == "5y", (
+            f"Expected the 5y history period to flow into the yfinance download, "
+            f"got {captured.get('period')!r}"
+        )
+
+    def test_sub_25k_capital_is_honored(self):
+        """A sub-$25k account must size the simulated portfolio at that capital."""
+        p = SimulatedPortfolio(initial_capital=8_000)
+        assert p.cash == 8_000
+        assert p.portfolio_value == 8_000
+
+    def test_display_metrics_prints_survivorship_caveat(self):
+        """Every report must surface the survivorship caveat substring."""
+        from rich.console import Console
+        from backtest import report as report_mod
+
+        buf = Console(record=True, width=200)
+        with patch.object(report_mod, "console", buf):
+            m = calculate_metrics(
+                [Trade("AAPL", "SMART", 10, 100.0, 110.0,
+                        datetime(2024, 1, 1), datetime(2024, 1, 2), TradeType.DAY)],
+                [(date(2024, 1, 1), 100_000.0), (date(2024, 1, 2), 100_100.0)],
+                100_000,
+            )
+            report_mod.display_metrics(m)
+
+        out = buf.export_text()
+        assert "survivorship" in out.lower()
+
+
 class TestGapDownStopLoss:
     """Verify stop-loss uses open price for gap-down modeling (not bar low)."""
 
@@ -315,7 +439,7 @@ class TestGapDownStopLoss:
         from backtest.engine import SimulatedPortfolio, _check_exits
         from core.models import Position, TradeType
 
-        portfolio = SimulatedPortfolio(initial_capital=100_000, slippage_pct=0, commission=0)
+        portfolio = SimulatedPortfolio(initial_capital=100_000, slippage_pct=0, commission=0, spread_bps=0)
         # Position with stop-loss at $95
         portfolio.positions.append(Position(
             ticker="GAP", exchange="SMART", quantity=100,
@@ -343,7 +467,7 @@ class TestGapDownStopLoss:
         from backtest.engine import SimulatedPortfolio, _check_exits
         from core.models import Position, TradeType
 
-        portfolio = SimulatedPortfolio(initial_capital=100_000, slippage_pct=0, commission=0)
+        portfolio = SimulatedPortfolio(initial_capital=100_000, slippage_pct=0, commission=0, spread_bps=0)
         portfolio.positions.append(Position(
             ticker="NORM", exchange="SMART", quantity=100,
             entry_price=100.0, entry_time=datetime(2024, 1, 1),
@@ -370,7 +494,7 @@ class TestGapDownStopLoss:
         from backtest.engine import SimulatedPortfolio, _check_exits
         from core.models import Position, TradeType
 
-        portfolio = SimulatedPortfolio(initial_capital=200_000, slippage_pct=0, commission=0)
+        portfolio = SimulatedPortfolio(initial_capital=200_000, slippage_pct=0, commission=0, spread_bps=0)
         portfolio.positions.append(Position(
             ticker="SGAP", exchange="SMART", quantity=-100,
             entry_price=100.0, entry_time=datetime(2024, 1, 1),
@@ -411,7 +535,7 @@ class TestEquityCurveMTM:
 
     def test_equity_curve_uses_current_prices(self):
         """record_equity with current_prices should value positions at market price."""
-        p = SimulatedPortfolio(initial_capital=100_000, slippage_pct=0, commission=0)
+        p = SimulatedPortfolio(initial_capital=100_000, slippage_pct=0, commission=0, spread_bps=0)
         sig = _make_signal(entry_price=100.0)
         p.open_position(sig, 10, 100.0, datetime(2024, 1, 15))
         # Cash = 99_000, position = 10 shares entered at $100
@@ -425,7 +549,7 @@ class TestEquityCurveMTM:
 
     def test_daily_pnl_reflects_price_changes(self):
         """daily_pnl should capture unrealized gains from price movement."""
-        p = SimulatedPortfolio(initial_capital=100_000, slippage_pct=0, commission=0)
+        p = SimulatedPortfolio(initial_capital=100_000, slippage_pct=0, commission=0, spread_bps=0)
         sig = _make_signal(entry_price=100.0)
         p.open_position(sig, 10, 100.0, datetime(2024, 1, 15))
 
@@ -444,7 +568,7 @@ class TestEquityCurveNoCandidateDays:
 
     def test_no_candidate_day_still_uses_mtm_prices(self):
         """When no candidates pass screening, equity should still reflect current prices."""
-        p = SimulatedPortfolio(initial_capital=100_000, slippage_pct=0, commission=0)
+        p = SimulatedPortfolio(initial_capital=100_000, slippage_pct=0, commission=0, spread_bps=0)
         sig = _make_signal(entry_price=100.0)
         p.open_position(sig, 10, 100.0, datetime(2024, 1, 14))
         # Cash = 99_000, position = 10 shares @ $100
@@ -462,7 +586,7 @@ class TestEquityCurveNoCandidateDays:
         )
 
         # Without MTM: equity would be 99_000 + 10*100 = 100_000 (wrong)
-        p_bad = SimulatedPortfolio(initial_capital=100_000, slippage_pct=0, commission=0)
+        p_bad = SimulatedPortfolio(initial_capital=100_000, slippage_pct=0, commission=0, spread_bps=0)
         p_bad.open_position(sig, 10, 100.0, datetime(2024, 1, 14))
         p_bad.record_equity(date(2024, 1, 14))
         p_bad.record_equity(date(2024, 1, 15))  # no current_prices!
@@ -571,11 +695,15 @@ class TestBacktestVolatility:
         config = BacktestConfig(tickers=["AAPL"])
         assert config.use_volatility_scaling is False
 
-    def test_volatility_calculated_during_backtest(self):
+    def test_volatility_calculated_during_backtest(self, monkeypatch):
         """When use_volatility_scaling is True, evaluate() should receive volatility."""
         from unittest.mock import patch, MagicMock
         import pandas as pd
         from backtest.engine import run_backtest, BacktestConfig
+
+        # Synthetic/mocked download with no pre-holdout end_date → unlock the
+        # holdout preflight for this mechanics-only test (scoped to this test).
+        monkeypatch.setenv("BORSA_HOLDOUT_UNLOCKED", "1")
 
         # Create data with a sharp drop to trigger Bollinger/RSI signals
         n = 90
@@ -610,7 +738,7 @@ class TestBacktestVolatility:
                     "evaluate() should receive volatility when use_volatility_scaling=True"
                 )
 
-    def test_volatility_is_per_candidate_not_first_ticker(self):
+    def test_volatility_is_per_candidate_not_first_ticker(self, monkeypatch):
         """Each signal must be sized by its OWN realized volatility.
 
         Bug: the previous backtest engine computed `market_volatility` once
@@ -625,6 +753,10 @@ class TestBacktestVolatility:
         from unittest.mock import patch
         import pandas as pd
         from backtest.engine import run_backtest, BacktestConfig
+
+        # Synthetic/mocked download with no pre-holdout end_date → unlock the
+        # holdout preflight for this mechanics-only test (scoped to this test).
+        monkeypatch.setenv("BORSA_HOLDOUT_UNLOCKED", "1")
 
         # Two tickers, very different volatility regimes, both designed so
         # the screener fires on the SAME bar (last row's sharp drop).
@@ -649,7 +781,9 @@ class TestBacktestVolatility:
         # Alphabetical order: AHIGH inserted first into all_data. With the
         # bug, AHIGH's vol is passed for ZLOW's sizing too.
         def _fake_yf(ticker, *args, **kwargs):
-            return {"AHIGH": high_df, "ZLOW": low_df}[ticker]
+            # The engine also downloads the SPY benchmark — return empty for any
+            # ticker outside the two-stock vol fixture so it is a harmless no-op.
+            return {"AHIGH": high_df, "ZLOW": low_df}.get(ticker, pd.DataFrame())
 
         config = BacktestConfig(
             tickers=["AHIGH", "ZLOW"],
@@ -805,11 +939,15 @@ class TestBacktestAntiMomentum:
     and never rejects, inflating backtest performance vs live trading.
     """
 
-    def test_evaluate_receives_current_price(self):
+    def test_evaluate_receives_current_price(self, monkeypatch):
         """evaluate() must receive a non-zero current_price from the backtest."""
         from unittest.mock import patch, MagicMock
         import pandas as pd
         from backtest.engine import run_backtest
+
+        # Synthetic/mocked download with no pre-holdout end_date → unlock the
+        # holdout preflight for this mechanics-only test (scoped to this test).
+        monkeypatch.setenv("BORSA_HOLDOUT_UNLOCKED", "1")
 
         # Create data with a sharp move to trigger signals
         n = 90
@@ -860,7 +998,7 @@ class TestSimultaneousTPSLResolution:
         from backtest.engine import SimulatedPortfolio, _check_exits
         from core.models import Position, TradeType
 
-        portfolio = SimulatedPortfolio(initial_capital=100_000, slippage_pct=0, commission=0)
+        portfolio = SimulatedPortfolio(initial_capital=100_000, slippage_pct=0, commission=0, spread_bps=0)
         portfolio.positions.append(Position(
             ticker="WIDE", exchange="SMART", quantity=100,
             entry_price=100.0, entry_time=datetime(2024, 1, 1),
@@ -888,7 +1026,7 @@ class TestSimultaneousTPSLResolution:
         from backtest.engine import SimulatedPortfolio, _check_exits
         from core.models import Position, TradeType
 
-        portfolio = SimulatedPortfolio(initial_capital=100_000, slippage_pct=0, commission=0)
+        portfolio = SimulatedPortfolio(initial_capital=100_000, slippage_pct=0, commission=0, spread_bps=0)
         portfolio.positions.append(Position(
             ticker="DROP", exchange="SMART", quantity=100,
             entry_price=100.0, entry_time=datetime(2024, 1, 1),
@@ -915,7 +1053,7 @@ class TestSimultaneousTPSLResolution:
         from backtest.engine import SimulatedPortfolio, _check_exits
         from core.models import Position, TradeType
 
-        portfolio = SimulatedPortfolio(initial_capital=200_000, slippage_pct=0, commission=0)
+        portfolio = SimulatedPortfolio(initial_capital=200_000, slippage_pct=0, commission=0, spread_bps=0)
         portfolio.positions.append(Position(
             ticker="SGAP", exchange="SMART", quantity=-100,
             entry_price=100.0, entry_time=datetime(2024, 1, 1),
@@ -940,7 +1078,7 @@ class TestSimultaneousTPSLResolution:
         from backtest.engine import SimulatedPortfolio, _check_exits
         from core.models import Position, TradeType
 
-        portfolio = SimulatedPortfolio(initial_capital=200_000, slippage_pct=0, commission=0)
+        portfolio = SimulatedPortfolio(initial_capital=200_000, slippage_pct=0, commission=0, spread_bps=0)
         portfolio.positions.append(Position(
             ticker="SWIN", exchange="SMART", quantity=-100,
             entry_price=100.0, entry_time=datetime(2024, 1, 1),
@@ -969,7 +1107,7 @@ class TestDailyPnlMTMConsistency:
 
     def test_daily_pnl_property_matches_mtm(self):
         """The daily_pnl property should agree with daily_pnl_mtm when no prices given."""
-        p = SimulatedPortfolio(initial_capital=100_000, slippage_pct=0, commission=0)
+        p = SimulatedPortfolio(initial_capital=100_000, slippage_pct=0, commission=0, spread_bps=0)
         sig = _make_signal(entry_price=100.0)
         p.open_position(sig, 10, 100.0, datetime(2024, 1, 15))
         # Record equity at entry price
@@ -1267,6 +1405,123 @@ class TestWalkForwardConfigPassThrough:
             assert call.args[0].indicator_weights == weights
 
 
+class TestSpreadCost:
+    """BACKTEST_SPREAD_BPS models half-the-bid/ask crossed on each leg.
+
+    Entry crosses the ask (pays up), exit crosses the bid (receives less).
+    The spread is charged per leg on top of slippage, so a round trip pays
+    it twice. spread_bps=0 must reproduce the pre-spread fills exactly.
+    """
+
+    def test_buy_leg_crosses_ask(self):
+        """A long entry fills worse by the per-leg spread (crosses the ask)."""
+        p = SimulatedPortfolio(
+            initial_capital=100_000, slippage_pct=0, commission=0, spread_bps=10,
+        )
+        sig = _make_signal(action=Action.BUY, entry_price=100.0,
+                           stop_loss=95.0, take_profit=110.0)
+        p.open_position(sig, 10, 100.0, datetime(2024, 1, 15))
+        # 10 bps = 0.10% → entry fill = 100 * (1 + 0.0010) = 100.10
+        assert p.positions[0].entry_price == pytest.approx(100.10)
+
+    def test_short_entry_crosses_bid(self):
+        """A short entry fills worse by the per-leg spread (receives less)."""
+        p = SimulatedPortfolio(
+            initial_capital=100_000, slippage_pct=0, commission=0, spread_bps=10,
+        )
+        sig = _make_signal(action=Action.SELL, entry_price=100.0,
+                           stop_loss=110.0, take_profit=90.0)
+        p.open_position(sig, 10, 100.0, datetime(2024, 1, 15))
+        # Short sale receives less: 100 * (1 - 0.0010) = 99.90
+        assert p.positions[0].entry_price == pytest.approx(99.90)
+
+    def test_spread_zero_reproduces_slippage_only_fill(self):
+        """spread_bps=0 leaves the slippage-only fill untouched (no regression)."""
+        p = SimulatedPortfolio(
+            initial_capital=100_000, slippage_pct=0.1, commission=0, spread_bps=0,
+        )
+        sig = _make_signal(action=Action.BUY, entry_price=100.0,
+                           stop_loss=95.0, take_profit=110.0)
+        p.open_position(sig, 10, 100.0, datetime(2024, 1, 15))
+        # Slippage only: 100 * (1 + 0.001) = 100.10
+        assert p.positions[0].entry_price == pytest.approx(100.10)
+
+    def test_spread_makes_round_trip_strictly_more_expensive(self):
+        """A flat round trip (buy and sell at the same raw price) loses the
+        full round-trip spread; spread_bps>0 must be strictly worse than 0."""
+        sig = _make_signal(action=Action.BUY, entry_price=100.0,
+                           stop_loss=95.0, take_profit=110.0)
+
+        p0 = SimulatedPortfolio(
+            initial_capital=100_000, slippage_pct=0, commission=0, spread_bps=0,
+        )
+        p0.open_position(sig, 100, 100.0, datetime(2024, 1, 15))
+        t0 = p0.close_position("AAPL", 100.0, datetime(2024, 1, 16))
+
+        p1 = SimulatedPortfolio(
+            initial_capital=100_000, slippage_pct=0, commission=0, spread_bps=10,
+        )
+        p1.open_position(sig, 100, 100.0, datetime(2024, 1, 15))
+        t1 = p1.close_position("AAPL", 100.0, datetime(2024, 1, 16))
+
+        # No spread, no slippage: a flat round trip is exactly break-even.
+        assert t0.pnl == pytest.approx(0.0)
+        # With spread the same flat round trip loses money — strictly worse.
+        assert t1.pnl < t0.pnl
+
+
+class TestGapThroughAtOpenFills:
+    """Threat T-02-01: a stop that gaps through its level must fill at the
+    bar OPEN, never the (better) stop price. Pinned so later plans cannot
+    regress the conservative approximation or 'fix' it into look-ahead."""
+
+    def test_gap_down_through_long_stop_fills_at_open_not_stop(self):
+        from backtest.engine import _check_exits
+        from core.models import Position, TradeType
+
+        p = SimulatedPortfolio(
+            initial_capital=100_000, slippage_pct=0, commission=0, spread_bps=0,
+        )
+        p.positions.append(Position(
+            ticker="GAP", exchange="SMART", quantity=100,
+            entry_price=100.0, entry_time=datetime(2024, 1, 1),
+            stop_loss=95.0, take_profit=110.0, trade_type=TradeType.DAY,
+        ))
+        # Open ($90) gaps DOWN through the $95 stop.
+        day_data = {
+            "GAP": pd.Series({"open": 90.0, "high": 91.0, "low": 89.0, "close": 90.5}),
+        }
+        _check_exits(p, day_data, datetime(2024, 1, 2))
+
+        assert len(p.trades) == 1
+        # Fills at the open, NOT the stop price (would be optimistic).
+        assert p.trades[0].exit_price == pytest.approx(90.0)
+        assert p.trades[0].exit_price != pytest.approx(95.0)
+
+    def test_gap_up_through_short_stop_fills_at_open_not_stop(self):
+        from backtest.engine import _check_exits
+        from core.models import Position, TradeType
+
+        p = SimulatedPortfolio(
+            initial_capital=200_000, slippage_pct=0, commission=0, spread_bps=0,
+        )
+        p.positions.append(Position(
+            ticker="SGAP", exchange="SMART", quantity=-100,
+            entry_price=100.0, entry_time=datetime(2024, 1, 1),
+            stop_loss=105.0, take_profit=90.0, trade_type=TradeType.DAY,
+        ))
+        # Open ($115) gaps UP through the $105 short stop.
+        day_data = {
+            "SGAP": pd.Series({"open": 115.0, "high": 118.0, "low": 114.0, "close": 116.0}),
+        }
+        _check_exits(p, day_data, datetime(2024, 1, 2))
+
+        assert len(p.trades) == 1
+        # Fills at the open, NOT the stop price.
+        assert p.trades[0].exit_price == pytest.approx(115.0)
+        assert p.trades[0].exit_price != pytest.approx(105.0)
+
+
 class TestWalkForwardOverfittingDetection:
     """The whole point of walk-forward: detecting optimistic IS results."""
 
@@ -1299,3 +1554,785 @@ class TestWalkForwardOverfittingDetection:
         # Small degradation — strategy is robust
         assert abs(result.degradation["win_rate_pct"]) < 5
         assert abs(result.degradation["total_return_pct"]) < 1.0
+
+
+# ---------------------------------------------------------------------------
+# Plan 02-02 Task 1: SPY buy-and-hold benchmark + raw full-history close
+# ---------------------------------------------------------------------------
+
+def _ohlc_frame(closes, dates):
+    """OHLC fixture from a close series, indexed by the given dates."""
+    df = pd.DataFrame({
+        "open": [c for c in closes],
+        "high": [c * 1.01 for c in closes],
+        "low": [c * 0.99 for c in closes],
+        "close": [float(c) for c in closes],
+        "volume": [1_000_000] * len(closes),
+    }, index=dates)
+    df.index.name = "date"
+    return df
+
+
+class TestSPYBenchmark:
+    """The benchmark must be a buy-and-hold curve aligned to the strategy's
+    warmup-trimmed trading days, and the RAW full-history SPY close must stay
+    accessible for 02-06's regime gate."""
+
+    def test_benchmark_curve_aligned_and_prices_raw(self, monkeypatch):
+        from backtest.engine import run_backtest
+
+        # Synthetic full-history (no pre-holdout end_date) → unlock the preflight
+        # for this mechanics-only test (scoped to this test).
+        monkeypatch.setenv("BORSA_HOLDOUT_UNLOCKED", "1")
+
+        n = 90
+        dates = pd.date_range("2024-01-01", periods=n, freq="D")
+        # Choppy strategy ticker (no trades needed) and a monotone SPY so the
+        # benchmark return is hand-computable.
+        aapl = _ohlc_frame([100.0 + (i % 3) for i in range(n)], dates)
+        spy = _ohlc_frame([400.0 + i for i in range(n)], dates)
+
+        def _fake_yf(ticker, *args, **kwargs):
+            return {"AAPL": aapl, "SPY": spy}.get(ticker, pd.DataFrame())
+
+        # min_screener_score impossibly high → zero candidates → flat equity.
+        config = BacktestConfig(tickers=["AAPL"], min_screener_score=9_999.0)
+        with patch("backtest.engine.get_historical_data_yfinance", side_effect=_fake_yf):
+            p = run_backtest(config)
+
+        # (a) benchmark_curve aligned to the strategy's warmup-trimmed window.
+        assert len(p.benchmark_curve) == len(p.equity_curve)
+        assert [d for d, _ in p.benchmark_curve] == [d for d, _ in p.equity_curve]
+        # First point normalized to initial_capital.
+        assert p.benchmark_curve[0][1] == pytest.approx(100_000.0)
+        # Benchmark total return == first-close-to-last-close over the SAME window.
+        spy_by_date = {d.date(): c for d, c in zip(dates, [400.0 + i for i in range(n)])}
+        first_date = p.equity_curve[0][0]
+        last_date = p.equity_curve[-1][0]
+        expected_ratio = spy_by_date[last_date] / spy_by_date[first_date]
+        actual_ratio = p.benchmark_curve[-1][1] / p.benchmark_curve[0][1]
+        assert actual_ratio == pytest.approx(expected_ratio)
+
+        # (b) benchmark_prices is the RAW, full-history, un-normalized close:
+        # longer than the warmup-trimmed curve, starts at the raw first close.
+        assert p.benchmark_prices is not None
+        assert len(p.benchmark_prices) == n
+        assert len(p.benchmark_prices) > len(p.benchmark_curve)
+        assert float(p.benchmark_prices.iloc[0]) == pytest.approx(400.0)
+        assert float(p.benchmark_prices.iloc[-1]) == pytest.approx(400.0 + n - 1)
+
+    def test_config_default_benchmark_is_spy(self):
+        assert BacktestConfig(tickers=["AAPL"]).benchmark_ticker == "SPY"
+
+
+# ---------------------------------------------------------------------------
+# Plan 02-02 Task 2: CAPM alpha/beta vs SPY (risk-free-adjusted excess returns)
+# ---------------------------------------------------------------------------
+
+class TestCAPMAlphaBeta:
+    """CAPM regresses RISK-FREE-ADJUSTED excess returns, so strategy==benchmark
+    gives alpha~=0/beta~=1 and a half-beta strategy gives beta~=0.5."""
+
+    def _curve(self, values):
+        return [(date(2024, 1, 1) + timedelta(days=i), v) for i, v in enumerate(values)]
+
+    def _benchmark_values(self):
+        # Varied daily returns so the regression is well-conditioned (non-zero
+        # benchmark variance).
+        rets = [0.01, -0.02, 0.015, 0.03, -0.01, 0.025, -0.018, 0.012, 0.02, -0.005]
+        vals = [100_000.0]
+        for r in rets:
+            vals.append(vals[-1] * (1 + r))
+        return vals, rets
+
+    def test_strategy_equals_benchmark_alpha_zero_beta_one(self):
+        from backtest.report import calculate_capm_metrics
+
+        bench_vals, _ = self._benchmark_values()
+        curve = self._curve(bench_vals)
+        m = calculate_capm_metrics(curve, curve)
+        assert m["alpha"] == pytest.approx(0.0, abs=1e-6)
+        assert m["beta"] == pytest.approx(1.0, abs=1e-6)
+
+    def test_half_beta_strategy(self):
+        from backtest.report import calculate_capm_metrics
+
+        bench_vals, rets = self._benchmark_values()
+        # Strategy daily returns are exactly half the benchmark's → beta ~= 0.5.
+        strat_vals = [100_000.0]
+        for r in rets:
+            strat_vals.append(strat_vals[-1] * (1 + 0.5 * r))
+        m = calculate_capm_metrics(self._curve(strat_vals), self._curve(bench_vals))
+        assert m["beta"] == pytest.approx(0.5, abs=1e-6)
+
+    def test_flat_benchmark_returns_zero_alpha_beta(self):
+        from backtest.report import calculate_capm_metrics
+
+        flat = self._curve([100_000.0] * 6)
+        strat = self._curve([100_000.0 + i * 100 for i in range(6)])
+        m = calculate_capm_metrics(strat, flat)
+        assert m["alpha"] == 0.0
+        assert m["beta"] == 0.0
+
+    def test_calculate_metrics_folds_in_benchmark(self):
+        bench_vals, _ = self._benchmark_values()
+        curve = self._curve(bench_vals)
+        trade = Trade("AAPL", "SMART", 10, 100.0, 110.0,
+                      datetime(2024, 1, 1), datetime(2024, 1, 2), TradeType.DAY)
+        m = calculate_metrics([trade], curve, 100_000, benchmark_curve=curve)
+        for key in ("benchmark_total_return", "benchmark_sharpe", "alpha", "beta"):
+            assert key in m
+        # equity == benchmark → alpha ~= 0, beta ~= 1.
+        assert m["alpha"] == pytest.approx(0.0, abs=1e-6)
+        assert m["beta"] == pytest.approx(1.0, abs=1e-6)
+
+    def test_display_metrics_shows_benchmark_and_alpha(self):
+        from rich.console import Console
+        from backtest import report as report_mod
+
+        bench_vals, _ = self._benchmark_values()
+        curve = self._curve(bench_vals)
+        trade = Trade("AAPL", "SMART", 10, 100.0, 110.0,
+                      datetime(2024, 1, 1), datetime(2024, 1, 2), TradeType.DAY)
+        m = calculate_metrics([trade], curve, 100_000, benchmark_curve=curve)
+
+        buf = Console(record=True, width=200)
+        with patch.object(report_mod, "console", buf):
+            report_mod.display_metrics(m)
+        out = buf.export_text()
+        assert "SPY Return" in out
+        assert "Alpha" in out
+
+
+# ---------------------------------------------------------------------------
+# Plan 02-02 Task 3: deterministic Bernoulli(p=0.5) random-entry control
+# ---------------------------------------------------------------------------
+
+class TestRandomEntryControl:
+    """Coin-flip entries with identical sizing/exits/costs, reproducible by seed."""
+
+    def _universe(self):
+        n = 120
+        dates = pd.date_range("2024-01-01", periods=n, freq="D")
+        frames = {}
+        for j, tkr in enumerate(["AAA", "BBB", "CCC", "DDD"]):
+            base = 50.0 + j * 10
+            closes = [base + 5 * ((i + j) % 7) for i in range(n)]
+            frames[tkr] = _ohlc_frame(closes, dates)
+        spy = _ohlc_frame([400.0 + i * 0.5 for i in range(n)], dates)
+        return frames, spy
+
+    def _run(self, seed, monkeypatch):
+        from backtest.engine import run_backtest
+
+        monkeypatch.setenv("BORSA_HOLDOUT_UNLOCKED", "1")
+        frames, spy = self._universe()
+
+        def _fake_yf(ticker, *args, **kwargs):
+            if ticker == "SPY":
+                return spy
+            return frames.get(ticker, pd.DataFrame())
+
+        config = BacktestConfig(
+            tickers=list(frames.keys()),
+            use_random_entry=True,
+            random_seed=seed,
+            min_screener_score=5.0,
+        )
+        with patch("backtest.engine.get_historical_data_yfinance", side_effect=_fake_yf):
+            return run_backtest(config)
+
+    def _trade_key(self, p):
+        return [
+            (t.ticker, round(t.entry_price, 6), round(t.exit_price, 6),
+             t.entry_time, t.exit_time)
+            for t in p.trades
+        ]
+
+    def test_same_seed_identical_trades(self, monkeypatch):
+        p1 = self._run(42, monkeypatch)
+        p2 = self._run(42, monkeypatch)
+        assert len(p1.trades) > 0, "random control must actually take trades"
+        assert self._trade_key(p1) == self._trade_key(p2)
+
+    def test_different_seed_differs(self, monkeypatch):
+        p1 = self._run(1, monkeypatch)
+        p2 = self._run(999, monkeypatch)
+        assert self._trade_key(p1) != self._trade_key(p2)
+
+    def test_config_default_no_random_entry(self):
+        cfg = BacktestConfig(tickers=["AAPL"])
+        assert cfg.use_random_entry is False
+        assert cfg.random_seed == 0
+
+    def test_random_candidates_are_bernoulli_subset(self):
+        """Per-ticker Bernoulli(0.5): same seed/bar → same picks; the selection
+        is a subset of the available universe."""
+        from backtest.engine import _random_entry_candidates
+
+        n = 70
+        dates = pd.date_range("2024-01-01", periods=n, freq="D")
+        stock_data = {
+            tkr: ("SMART", _ohlc_frame([100.0 + i for i in range(n)], dates))
+            for tkr in ["AAA", "BBB", "CCC", "DDD", "EEE", "FFF"]
+        }
+        picks1 = {s.ticker for s in _random_entry_candidates(stock_data, 5, 7)}
+        picks2 = {s.ticker for s in _random_entry_candidates(stock_data, 5, 7)}
+        assert picks1 == picks2  # deterministic
+        assert picks1.issubset(set(stock_data.keys()))
+        # A different bar index draws a different (independent) selection.
+        other = {s.ticker for s in _random_entry_candidates(stock_data, 6, 7)}
+        assert picks1 != other or len(stock_data) <= 1
+
+    def test_random_signals_are_long_with_default_sl_tp(self):
+        from backtest.engine import _random_entry_candidates
+        from config.settings import DEFAULT_STOP_LOSS_PCT, DEFAULT_TAKE_PROFIT_PCT
+
+        n = 70
+        dates = pd.date_range("2024-01-01", periods=n, freq="D")
+        stock_data = {"AAA": ("SMART", _ohlc_frame([100.0] * n, dates))}
+        sigs = _random_entry_candidates(stock_data, 0, 0)
+        for s in sigs:
+            assert s.action == Action.BUY
+            assert s.entry_price == pytest.approx(100.0)
+            assert s.stop_loss == pytest.approx(100.0 * (1 - DEFAULT_STOP_LOSS_PCT / 100))
+            assert s.take_profit == pytest.approx(100.0 * (1 + DEFAULT_TAKE_PROFIT_PCT / 100))
+
+
+# ---------------------------------------------------------------------------
+# Plan 02-03 Task 1: multi-fold rolling walk-forward + per-fold/aggregate WFE
+# ---------------------------------------------------------------------------
+
+class TestRollingWalkForward:
+    """Multi-fold rolling walk-forward: fold count, per-fold metrics, WFE."""
+
+    def test_old_single_split_api_still_importable(self):
+        """Back-compat: the single-split walk-forward must survive unchanged."""
+        from backtest.engine import walk_forward_backtest, WalkForwardResult
+        assert callable(walk_forward_backtest)
+        assert WalkForwardResult is not None
+
+    def test_default_oos_window_is_9_to_12_months_not_6(self):
+        """Default OOS must clear the >=30-trade gate after the 60-bar warmup —
+        ~250 trading days (>=9-12 months), never a 6-month (~125-bar) window."""
+        from backtest.engine import (
+            DEFAULT_WF_OOS_DAYS, DEFAULT_WF_IS_DAYS, _trading_to_calendar_days,
+        )
+        # ~250 trading days, decidedly more than a 6-month (~126-bar) window.
+        assert DEFAULT_WF_OOS_DAYS >= 189            # >= ~9 months of trading days
+        assert DEFAULT_WF_OOS_DAYS > 126 * 1.2       # not a 6-month window
+        # And in calendar terms that is at least ~9 months.
+        assert _trading_to_calendar_days(DEFAULT_WF_OOS_DAYS) >= 270
+        # In-sample defaults to roughly two years.
+        assert DEFAULT_WF_IS_DAYS >= 2 * 240
+
+    @patch("backtest.engine.run_backtest")
+    def test_correct_number_of_folds_for_window_and_step(self, mock_run):
+        """A 7-year range with 2 run_backtest calls per fold yields 6 folds."""
+        from backtest.engine import rolling_walk_forward, RollingWalkForwardResult
+        mock_run.side_effect = lambda cfg: _make_portfolio_with_trades(5, 10.0)
+
+        cfg = BacktestConfig(
+            tickers=["AAPL"], start_date="2018-01-01", end_date="2025-01-01",
+        )
+        result = rolling_walk_forward(cfg, is_days=252, oos_days=252, step_days=252)
+
+        assert isinstance(result, RollingWalkForwardResult)
+        assert len(result.folds) == 6
+        assert mock_run.call_count == 2 * len(result.folds)
+
+    @patch("backtest.engine.run_backtest")
+    def test_each_fold_has_is_oos_metrics_and_wfe(self, mock_run):
+        from backtest.engine import rolling_walk_forward
+        mock_run.side_effect = lambda cfg: _make_portfolio_with_trades(5, 10.0)
+
+        cfg = BacktestConfig(
+            tickers=["AAPL"], start_date="2020-01-01", end_date="2024-01-01",
+        )
+        result = rolling_walk_forward(cfg, is_days=252, oos_days=252, step_days=252)
+
+        assert result.folds
+        for fold in result.folds:
+            assert "annualized_return_pct" in fold.in_sample_metrics
+            assert "annualized_return_pct" in fold.out_of_sample_metrics
+            assert "total_return_pct" in fold.degradation
+            # IS made money here, so WFE is well-defined.
+            assert fold.wfe is not None
+            # OOS strictly follows IS, folds are time-ordered.
+            assert fold.out_of_sample_start > fold.in_sample_end
+
+    @patch("backtest.engine.run_backtest")
+    def test_oos_windows_are_non_overlapping(self, mock_run):
+        from backtest.engine import rolling_walk_forward
+        mock_run.side_effect = lambda cfg: _make_portfolio_with_trades(5, 10.0)
+
+        cfg = BacktestConfig(
+            tickers=["AAPL"], start_date="2018-01-01", end_date="2025-01-01",
+        )
+        result = rolling_walk_forward(cfg, is_days=252, oos_days=252, step_days=252)
+
+        for prev, nxt in zip(result.folds, result.folds[1:]):
+            assert nxt.out_of_sample_start > prev.out_of_sample_end
+
+    @patch("backtest.engine.run_backtest")
+    def test_wfe_handles_zero_is_return_without_crashing(self, mock_run):
+        """A zero (non-positive) IS annualized return makes WFE undefined —
+        the harness returns None, not a divide-by-zero crash."""
+        from backtest.engine import rolling_walk_forward
+        mock_run.side_effect = [
+            _make_portfolio_with_trades(5, 0.0),    # IS: flat → annualized return 0
+            _make_portfolio_with_trades(5, 10.0),   # OOS: positive
+        ]
+        cfg = BacktestConfig(
+            tickers=["AAPL"], start_date="2020-01-01", end_date="2021-12-31",
+        )
+        result = rolling_walk_forward(cfg, is_days=252, oos_days=252, step_days=252)
+
+        assert len(result.folds) == 1
+        assert result.folds[0].wfe is None         # undefined, did not crash
+        assert result.aggregate_wfe is None        # no well-defined folds to average
+
+    @patch("backtest.engine.run_backtest")
+    def test_aggregate_pools_oos_trades(self, mock_run):
+        from backtest.engine import rolling_walk_forward
+        mock_run.side_effect = lambda cfg: _make_portfolio_with_trades(5, 10.0)
+
+        cfg = BacktestConfig(
+            tickers=["AAPL"], start_date="2018-01-01", end_date="2025-01-01",
+        )
+        result = rolling_walk_forward(cfg, is_days=252, oos_days=252, step_days=252)
+
+        # One OOS portfolio of 5 trades per fold → pooled count is 5 * folds.
+        assert len(result.aggregate_oos_trades) == 5 * len(result.folds)
+        assert result.aggregate_oos_metrics["num_trades"] == 5 * len(result.folds)
+        # Positive per-fold WFE averages to a positive aggregate.
+        assert result.aggregate_wfe is not None and result.aggregate_wfe > 0
+
+    def test_range_too_short_raises(self):
+        from backtest.engine import rolling_walk_forward
+        cfg = BacktestConfig(
+            tickers=["AAPL"], start_date="2023-01-01", end_date="2023-03-01",
+        )
+        with pytest.raises(ValueError):
+            rolling_walk_forward(cfg, is_days=252, oos_days=252, step_days=252)
+
+    def test_missing_dates_raise(self):
+        from backtest.engine import rolling_walk_forward
+        cfg = BacktestConfig(tickers=["AAPL"], start_date="", end_date="2024-01-01")
+        with pytest.raises(ValueError):
+            rolling_walk_forward(cfg)
+
+
+# ---------------------------------------------------------------------------
+# Plan 02-03 Task 2: walk-forward report — degradation + WFE<0.5 fail flag
+# ---------------------------------------------------------------------------
+
+def _fake_fold(index, is_ann, oos_ann, wfe, oos_trades):
+    """Minimal stand-in for a WalkForwardFold (display reads attrs only)."""
+    from types import SimpleNamespace
+    return SimpleNamespace(
+        index=index,
+        out_of_sample_start=date(2022, 1, 1),
+        out_of_sample_end=date(2022, 12, 31),
+        in_sample_metrics={"annualized_return_pct": is_ann, "sharpe_ratio": 1.0},
+        out_of_sample_metrics={
+            "annualized_return_pct": oos_ann, "sharpe_ratio": 0.5,
+            "num_trades": oos_trades,
+        },
+        degradation={"total_return_pct": oos_ann - is_ann},
+        wfe=wfe,
+    )
+
+
+def _fake_wf_result(agg_wfe, oos_trades_list, fold_wfes=(0.8,)):
+    """Stand-in for a RollingWalkForwardResult for display tests."""
+    from types import SimpleNamespace
+    folds = [_fake_fold(i, 20.0, 16.0, w, 30) for i, w in enumerate(fold_wfes)]
+    agg_metrics = {
+        "total_return_pct": 12.0, "annualized_return_pct": 10.0,
+        "sharpe_ratio": 0.9, "max_drawdown_pct": 8.0,
+        "win_rate_pct": 55.0, "num_trades": len(oos_trades_list),
+    }
+    return SimpleNamespace(
+        folds=folds,
+        aggregate_oos_trades=oos_trades_list,
+        aggregate_oos_equity=[],
+        aggregate_oos_metrics=agg_metrics,
+        aggregate_wfe=agg_wfe,
+        is_days=252, oos_days=252, step_days=252,
+    )
+
+
+class TestWalkForwardReport:
+    """display_walk_forward: WFE fail/pass flagging + pooled-OOS stats."""
+
+    def _trades(self, n):
+        # Varied pnls so the per-trade t-stat has non-degenerate variance.
+        return [_make_trade(5.0 + (i % 3), datetime(2022, 1, 1) + timedelta(days=i))
+                for i in range(n)]
+
+    def test_wfe_below_half_is_flagged_fail(self):
+        from backtest.report import display_walk_forward
+        result = _fake_wf_result(0.3, self._trades(35), fold_wfes=(0.3,))
+        status = display_walk_forward(result)
+        assert status["wfe_status"] == "FAIL"
+        assert status["wfe_pass"] is False
+
+    def test_wfe_above_robust_bar_is_pass(self):
+        from backtest.report import display_walk_forward
+        result = _fake_wf_result(0.8, self._trades(35), fold_wfes=(0.8,))
+        status = display_walk_forward(result)
+        assert status["wfe_pass"] is True
+        assert status["wfe_status"] == "ROBUST"
+
+    def test_wfe_mid_band_passes_but_not_robust(self):
+        from backtest.report import display_walk_forward
+        result = _fake_wf_result(0.6, self._trades(35), fold_wfes=(0.6,))
+        status = display_walk_forward(result)
+        assert status["wfe_status"] == "PASS"
+        assert status["wfe_pass"] is True
+
+    def test_undefined_wfe_is_not_a_pass(self):
+        from backtest.report import display_walk_forward
+        result = _fake_wf_result(None, self._trades(35), fold_wfes=(None,))
+        status = display_walk_forward(result)
+        assert status["wfe_status"] == "UNDEFINED"
+        assert status["wfe_pass"] is False
+
+    def test_trade_gate_and_tstat_surfaced(self):
+        from backtest.report import display_walk_forward
+        result = _fake_wf_result(0.8, self._trades(35), fold_wfes=(0.8, 0.9))
+        status = display_walk_forward(result)
+        assert status["num_oos_trades"] == 35
+        assert status["oos_trade_gate_pass"] is True      # >= 30 trades
+        assert status["num_folds"] == 2
+        assert isinstance(status["oos_per_trade_tstat"], float)
+
+    def test_thin_oos_sample_fails_trade_gate(self):
+        from backtest.report import display_walk_forward
+        result = _fake_wf_result(0.8, self._trades(6), fold_wfes=(0.8,))
+        status = display_walk_forward(result)
+        assert status["num_oos_trades"] == 6
+        assert status["oos_trade_gate_pass"] is False     # < 30 trades
+
+    def test_status_classifier_pure_function(self):
+        from backtest.report import walk_forward_wfe_status
+        assert walk_forward_wfe_status(0.3) == ("FAIL", False)
+        assert walk_forward_wfe_status(0.49) == ("FAIL", False)
+        assert walk_forward_wfe_status(0.5) == ("PASS", True)
+        assert walk_forward_wfe_status(0.7) == ("ROBUST", True)
+        assert walk_forward_wfe_status(None) == ("UNDEFINED", False)
+
+
+# ---------------------------------------------------------------------------
+# Plan 02-03 Task 3: --walk-forward CLI flag + run_walk_forward_mode dispatch
+# ---------------------------------------------------------------------------
+
+class TestWalkForwardCLI:
+    """parse_args accepts --walk-forward; backtest mode routes to it."""
+
+    def test_parse_args_accepts_walk_forward_flag(self, monkeypatch):
+        import sys
+        import main
+        monkeypatch.setattr(sys, "argv", [
+            "main.py", "--mode", "backtest", "--walk-forward",
+            "--backtest-tickers", "AAPL",
+        ])
+        args = main.parse_args()
+        assert args.walk_forward is True
+        assert args.mode == "backtest"
+
+    def test_wf_oos_days_default_is_9_to_12_months(self, monkeypatch):
+        """--wf-oos-days default must be ~250 trading days, not a 6-month window."""
+        import sys
+        import main
+        monkeypatch.setattr(sys, "argv", ["main.py", "--mode", "backtest"])
+        args = main.parse_args()
+        assert args.wf_oos_days >= 189          # >= ~9 months of trading days
+        assert args.wf_oos_days > 126 * 1.2     # not a 6-month window
+        assert args.wf_is_days >= 2 * 240       # ~2y in-sample
+
+    def test_run_walk_forward_mode_dispatches_to_rolling(self, monkeypatch):
+        """run_walk_forward_mode builds a config and calls rolling_walk_forward,
+        then renders via display_walk_forward."""
+        from types import SimpleNamespace
+        import main
+
+        captured = {}
+
+        def fake_rolling(config, is_days, oos_days, step_days):
+            captured["config"] = config
+            captured["is_days"] = is_days
+            captured["oos_days"] = oos_days
+            captured["step_days"] = step_days
+            return "RESULT"
+
+        def fake_display(result):
+            captured["displayed"] = result
+            return {}
+
+        monkeypatch.setattr("backtest.engine.rolling_walk_forward", fake_rolling)
+        monkeypatch.setattr("backtest.report.display_walk_forward", fake_display)
+
+        args = SimpleNamespace(
+            backtest_tickers=["AAPL", "MSFT"],
+            backtest_start="2021-06-01",
+            backtest_end="2025-06-01",
+            capital=20_000,
+            wf_is_days=504, wf_oos_days=252, wf_step_days=252,
+        )
+        main.run_walk_forward_mode(args)
+
+        assert captured["config"].tickers == ["AAPL", "MSFT"]
+        assert captured["config"].initial_capital == 20_000
+        assert captured["oos_days"] == 252
+        assert captured["displayed"] == "RESULT"
+
+    def test_backtest_mode_routes_to_walk_forward(self, monkeypatch):
+        """main() with --mode backtest --walk-forward dispatches to the WF path,
+        not the plain single-backtest path."""
+        from types import SimpleNamespace
+        import main
+
+        calls = {"wf": 0, "plain": 0}
+        monkeypatch.setattr(main, "parse_args", lambda: SimpleNamespace(
+            mode="backtest", walk_forward=True,
+        ))
+        monkeypatch.setattr(main, "setup_logging", lambda mode: None)
+        monkeypatch.setattr("config.settings.validate_settings", lambda: [])
+        monkeypatch.setattr(main, "init_db", lambda: None)
+        monkeypatch.setattr(main, "verify_db", lambda: None)
+        monkeypatch.setattr(main, "run_walk_forward_mode",
+                            lambda a: calls.__setitem__("wf", calls["wf"] + 1))
+        monkeypatch.setattr(main, "run_backtest_mode",
+                            lambda a: calls.__setitem__("plain", calls["plain"] + 1))
+
+        main.main()
+        assert calls == {"wf": 1, "plain": 0}
+
+
+# ---------------------------------------------------------------------------
+# Plan 02-06 Task 1: per-ticker Dow filter wired into the backtest (DOW-02)
+# ---------------------------------------------------------------------------
+
+class TestDowFilterBacktest:
+    """use_dow_filter on BacktestConfig flows into screen_stocks so the backtest
+    can run with-vs-without the per-ticker Dow filter. Default OFF preserves the
+    baseline run and live==backtest parity; ON drops non-UPTREND candidates
+    before they reach the risk manager. The keep/drop verdict is the
+    with-vs-without OOS comparison via rolling_walk_forward (see SUMMARY)."""
+
+    def test_config_defaults_dow_filter_off(self):
+        assert BacktestConfig(tickers=["AAPL"]).use_dow_filter is False
+
+    def test_config_accepts_dow_filter(self):
+        assert BacktestConfig(tickers=["AAPL"], use_dow_filter=True).use_dow_filter is True
+
+    def test_dow_filter_blocks_downtrend_baseline_enters(self, monkeypatch):
+        """With the filter ON a steep-downtrend ticker is never entered; with the
+        filter OFF (baseline) it can be.
+
+        The risk manager's MA-trend gate (MA5>MA10>MA20 for a BUY) would itself
+        reject a downtrend BUY, so to isolate the SCREENER-level Dow filter as
+        the sole differentiator we bypass risk with an approve-all evaluate. The
+        only thing that can drop the downtrending ticker is then config.use_dow_filter.
+        """
+        from unittest.mock import patch
+        from backtest.engine import run_backtest
+
+        # Synthetic full-history mock with no pre-holdout end_date below → unlock
+        # the holdout preflight for this mechanics-only test (scoped per-test).
+        monkeypatch.setenv("BORSA_HOLDOUT_UNLOCKED", "1")
+
+        n = 120
+        dates = pd.date_range("2021-01-01", periods=n, freq="D")
+        # Steep monotonic downtrend → RSI oversold fires a BUY in the screener,
+        # while dow_trend classifies the series DOWNTREND (dropped when ON).
+        down = _ohlc_frame([300.0 - i * 1.5 for i in range(n)], dates)
+
+        def _fake_yf(ticker, *args, **kwargs):
+            return {"DOWN": down}.get(ticker, pd.DataFrame())
+
+        def _approve_all(*args, **kwargs):
+            return RiskResult(approved=True, reasons=[], position_size=10)
+
+        def _run(use_dow: bool):
+            cfg = BacktestConfig(
+                tickers=["DOWN"], min_screener_score=0.1,
+                use_dow_filter=use_dow, end_date="2021-12-31",
+            )
+            with patch("backtest.engine.get_historical_data_yfinance", side_effect=_fake_yf), \
+                 patch("backtest.engine.evaluate", side_effect=_approve_all):
+                return run_backtest(cfg)
+
+        def _touched(p):
+            return {t.ticker for t in p.trades} | {pos.ticker for pos in p.positions}
+
+        baseline = _run(False)
+        filtered = _run(True)
+
+        assert "DOWN" in _touched(baseline), (
+            "Baseline (use_dow_filter=False) must be able to enter the downtrending ticker"
+        )
+        assert "DOWN" not in _touched(filtered), (
+            "use_dow_filter=True must drop the downtrending ticker before entry"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Plan 02-06 Task 2: SPY market-regime gate (DOW-03)
+# ---------------------------------------------------------------------------
+
+class TestMarketRegimeGate:
+    """A SPY market-regime gate that skips long entries on any bar where the
+    benchmark trend — dow_trend on the RAW full-history SPY close sliced
+    strictly BEFORE current_date — is not UPTREND ("don't buy into a falling
+    market"). Default OFF for parity; fed the raw benchmark_prices, never the
+    warmup-trimmed normalized benchmark_curve; look-ahead-safe."""
+
+    def test_config_defaults_regime_filter_off(self):
+        assert BacktestConfig(tickers=["AAPL"]).use_market_regime_filter is False
+
+    def test_config_accepts_regime_filter(self):
+        cfg = BacktestConfig(tickers=["AAPL"], use_market_regime_filter=True)
+        assert cfg.use_market_regime_filter is True
+
+    def _run_with_spy(self, monkeypatch, spy_closes, regime_on):
+        """Run a backtest where the ONLY long/short decision is a steady approved
+        BUY in 'STK', so the market-regime gate is the sole differentiator. The
+        screener and risk manager are stubbed; a real synthetic SPY frame flows
+        through the engine so portfolio.benchmark_prices is the genuine raw close.
+        """
+        from unittest.mock import patch
+        from backtest.engine import run_backtest
+
+        # Synthetic full-history mock with no pre-holdout end_date below → unlock
+        # the holdout preflight for this mechanics-only test (scoped per-test).
+        monkeypatch.setenv("BORSA_HOLDOUT_UNLOCKED", "1")
+
+        n = len(spy_closes)
+        dates = pd.date_range("2021-01-01", periods=n, freq="D")
+        stk = _ohlc_frame([100.0 + (i % 3) for i in range(n)], dates)
+        spy = _ohlc_frame(spy_closes, dates)
+
+        def _fake_yf(ticker, *args, **kwargs):
+            return {"STK": stk, "SPY": spy}.get(ticker, pd.DataFrame())
+
+        buy = _make_signal(
+            ticker="STK", action=Action.BUY, entry_price=100.0,
+            stop_loss=95.0, take_profit=115.0,
+        )
+
+        def _fake_screen(*args, **kwargs):
+            return [buy]
+
+        def _approve_all(*args, **kwargs):
+            return RiskResult(approved=True, reasons=[], position_size=10)
+
+        cfg = BacktestConfig(
+            tickers=["STK"], min_screener_score=0.1,
+            use_market_regime_filter=regime_on, end_date="2021-12-31",
+        )
+        with patch("backtest.engine.get_historical_data_yfinance", side_effect=_fake_yf), \
+             patch("backtest.engine.screen_stocks", side_effect=_fake_screen), \
+             patch("backtest.engine.evaluate", side_effect=_approve_all):
+            return run_backtest(cfg)
+
+    @staticmethod
+    def _touched(p):
+        return {t.ticker for t in p.trades} | {pos.ticker for pos in p.positions}
+
+    def test_downtrend_spy_blocks_longs(self, monkeypatch):
+        """With the gate ON and a raw SPY in a clear downtrend, no longs open."""
+        n = 140
+        spy_down = [400.0 - i * 1.5 for i in range(n)]   # DOWNTREND throughout
+        p = self._run_with_spy(monkeypatch, spy_down, regime_on=True)
+        assert "STK" not in self._touched(p), (
+            "Regime gate must skip every long while the SPY trend is not UPTREND"
+        )
+
+    def test_uptrend_spy_allows_longs(self, monkeypatch):
+        """With the gate ON and a raw SPY uptrend, long entries proceed."""
+        n = 140
+        spy_up = [400.0 + i * 1.5 for i in range(n)]     # UPTREND throughout
+        p = self._run_with_spy(monkeypatch, spy_up, regime_on=True)
+        assert "STK" in self._touched(p), (
+            "Longs must proceed while the SPY trend is UPTREND"
+        )
+
+    def test_gate_off_ignores_spy_downtrend(self, monkeypatch):
+        """Parity: with the gate OFF, a downtrend SPY does not block longs."""
+        n = 140
+        spy_down = [400.0 - i * 1.5 for i in range(n)]
+        p = self._run_with_spy(monkeypatch, spy_down, regime_on=False)
+        assert "STK" in self._touched(p), (
+            "With the gate OFF the baseline must enter regardless of SPY trend"
+        )
+
+    def test_gate_reads_raw_full_history_close(self, monkeypatch):
+        """The gate is fed the RAW full-history close (benchmark_prices), which
+        is longer than the warmup-trimmed benchmark_curve. A run on an uptrend
+        SPY attaches the raw series and lets longs through."""
+        n = 140
+        spy_up = [400.0 + i * 1.5 for i in range(n)]
+        p = self._run_with_spy(monkeypatch, spy_up, regime_on=True)
+        assert p.benchmark_prices is not None
+        assert len(p.benchmark_prices) == n
+        # Raw close is strictly longer than the warmup-trimmed aligned curve.
+        assert len(p.benchmark_prices) > len(p.benchmark_curve)
+
+    def test_regime_gate_slices_strictly_before_current_date(self):
+        """No look-ahead: the gate evaluates dow_trend on bars strictly BEFORE
+        current_date. A bearish break-of-structure bar that IS current_date is
+        excluded (still UPTREND); once it falls before current_date it flips the
+        verdict — proving `< current_date`, not `<=`."""
+        from backtest.engine import _market_regime_allows_long
+
+        # Zigzag uptrend (confirmed higher swing highs AND higher swing lows),
+        # then one final bar that craters below the last confirmed swing low →
+        # a break-of-structure that dow_trend flips to DOWNTREND.
+        pivots = [100, 112, 106, 124, 118, 136, 130, 148]
+        seg = 5
+        closes: list[float] = []
+        for a, b in zip(pivots, pivots[1:]):
+            closes.extend(a + (b - a) * k / seg for k in range(seg))
+        closes.append(float(pivots[-1]))
+        closes.append(80.0)  # break-of-structure crater (below last swing low)
+
+        dates = pd.date_range("2021-01-01", periods=len(closes), freq="D")
+        s = pd.Series(closes, index=dates)
+
+        crater_date = dates[-1].date()
+        # current_date == crater bar → strict `<` excludes it → pure uptrend → allow.
+        assert _market_regime_allows_long(s, crater_date) is True
+        # One day later the crater bar is now strictly before current_date →
+        # break-of-structure → not UPTREND → longs blocked.
+        after = (dates[-1] + pd.Timedelta(days=1)).date()
+        assert _market_regime_allows_long(s, after) is False
+
+    def test_gate_uses_raw_not_trimmed_series(self):
+        """WHY the raw series is mandatory: a long raw uptrend classifies as
+        UPTREND (longs allowed), but the short warmup-trimmed curve that exists at
+        an OOS-fold start is too short for dow_trend to confirm a trend (RANGE) and
+        would WRONGLY block longs. The gate must read benchmark_prices, not the
+        trimmed benchmark_curve."""
+        from backtest.engine import _market_regime_allows_long
+
+        n = 120
+        dates = pd.date_range("2021-01-01", periods=n, freq="D")
+        raw_up = pd.Series([400.0 + i for i in range(n)], index=dates)
+        cur = (dates[-1] + pd.Timedelta(days=1)).date()
+        assert _market_regime_allows_long(raw_up, cur) is True
+        # The trimmed-curve analogue (a handful of bars) cannot confirm an uptrend.
+        trimmed_like = raw_up.iloc[-5:]
+        assert _market_regime_allows_long(trimmed_like, cur) is False
+
+    def test_gate_fails_open_when_no_benchmark(self):
+        """A missing benchmark download must never silently disable the strategy:
+        with no series the gate fails OPEN (allows longs)."""
+        from backtest.engine import _market_regime_allows_long
+
+        assert _market_regime_allows_long(None, date(2021, 6, 1)) is True
+        assert _market_regime_allows_long(
+            pd.Series([], dtype=float), date(2021, 6, 1)
+        ) is True

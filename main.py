@@ -93,6 +93,45 @@ def parse_args() -> argparse.Namespace:
         default=100_000,
         help="Initial capital for backtest (default: 100000)",
     )
+    # Multi-fold rolling walk-forward (HRN-02). Window sizes are in TRADING days
+    # and mirror backtest.engine.DEFAULT_WF_* (2y IS, ~12-month OOS, stepped by
+    # the OOS length so OOS windows are adjacent and non-overlapping).
+    parser.add_argument(
+        "--walk-forward",
+        action="store_true",
+        help=(
+            "Run a multi-fold rolling walk-forward instead of a single backtest "
+            "(reports per-fold metrics, IS->OOS degradation, and Walk-Forward "
+            "Efficiency, flagging WFE < 0.5 as fail). Requires --mode backtest."
+        ),
+    )
+    parser.add_argument(
+        "--wf-is-days",
+        type=int,
+        default=504,
+        help="Walk-forward in-sample length in trading days (default: 504 ~= 2y)",
+    )
+    parser.add_argument(
+        "--wf-oos-days",
+        type=int,
+        default=252,
+        help=(
+            "Walk-forward out-of-sample length in trading days (default: 252 "
+            "~= 12 months). Kept at 9-12 months on purpose: each fold consumes a "
+            "fixed 60-bar indicator warmup before it can trade, so a short OOS "
+            "window (e.g. 6 months / ~125 bars) would leave only ~65 tradable "
+            "bars and starve the >=30-trade statistical gate."
+        ),
+    )
+    parser.add_argument(
+        "--wf-step-days",
+        type=int,
+        default=252,
+        help=(
+            "Trading days to advance the window between folds (default: 252 = one "
+            "OOS window, so OOS segments are adjacent and non-overlapping)"
+        ),
+    )
     return parser.parse_args()
 
 
@@ -176,6 +215,52 @@ def run_backtest_mode(args: argparse.Namespace) -> None:
     )
     console.print()
     display_metrics(metrics)
+
+
+def run_walk_forward_mode(args: argparse.Namespace) -> None:
+    """Run the multi-fold rolling walk-forward harness (HRN-02).
+
+    Mirrors run_backtest_mode's config construction (tickers / dates / capital,
+    honoring the 5y history_period default and sub-$25k capital) but dispatches
+    to the rolling walk-forward and its per-fold + WFE report instead of a single
+    backtest. The OOS windows default to ~12 months so each fold can clear the
+    >=30-trade gate after its 60-bar warmup is consumed.
+    """
+    from backtest.engine import rolling_walk_forward, BacktestConfig
+    from backtest.report import display_walk_forward
+
+    console.print("[yellow]Walk-forward mode — no IBKR connection needed[/yellow]")
+
+    tickers = args.backtest_tickers
+    if not tickers:
+        tickers = [
+            "AAPL", "MSFT", "GOOGL", "AMZN", "NVDA",
+            "TSLA", "META", "JPM", "UNH", "HD",
+        ]
+        console.print(f"Using default tickers: {', '.join(tickers)}")
+
+    config = BacktestConfig(
+        tickers=tickers,
+        market="US",
+        start_date=args.backtest_start,
+        end_date=args.backtest_end,
+        initial_capital=args.capital,
+    )
+
+    console.print(
+        f"\nRunning rolling walk-forward: {len(tickers)} tickers, "
+        f"${config.initial_capital:,.0f} capital, "
+        f"IS={args.wf_is_days}d / OOS={args.wf_oos_days}d / step={args.wf_step_days}d "
+        "(trading days)..."
+    )
+    result = rolling_walk_forward(
+        config,
+        is_days=args.wf_is_days,
+        oos_days=args.wf_oos_days,
+        step_days=args.wf_step_days,
+    )
+    console.print()
+    display_walk_forward(result)
 
 
 def run_watchdog_mode(args: argparse.Namespace, markets: list[str]) -> None:
@@ -327,9 +412,13 @@ def main() -> None:
     verify_db()
     logger.info("Portfolio database initialized")
 
-    # Backtest mode doesn't need IBKR connection
+    # Backtest mode doesn't need IBKR connection. The multi-fold rolling
+    # walk-forward is a backtest-mode variant — dispatch to it first.
     if args.mode == "backtest":
-        run_backtest_mode(args)
+        if getattr(args, "walk_forward", False):
+            run_walk_forward_mode(args)
+        else:
+            run_backtest_mode(args)
         return
 
     markets = _resolve_markets(args.market)
