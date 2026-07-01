@@ -1,15 +1,21 @@
-"""Tests for core/scheduler.py — streaming signal pipeline.
+"""Tests for core/scheduler.py — INVERTED pipeline (screen -> risk -> gate -> execute).
 
-Verifies that AI-approved signals are immediately sent to risk check
-via the on_signal callback, rather than waiting for all AI analysis
-to complete before starting risk checks.
+Verifies that mechanical risk runs FIRST over the screener candidates and the
+LLM gate runs LAST and can only SUBTRACT (veto/warn/abstain), off the asyncio
+loop via run_in_executor + ib.sleep(0.1). analyze_batch is gone from the live
+path (LLM-01, LLM-05).
 """
 
+import asyncio
+import time
 from unittest.mock import patch, MagicMock, call
 
 import pytest
 
+from ib_insync import util
+
 from core.risk import RiskResult
+from core.gate import GateResult, Verdict
 from tests.conftest import make_signal as _make_signal, make_position as _make_position
 
 
@@ -27,7 +33,12 @@ _PATCHES = [
     "core.scheduler.get_daily_pnl",
     "core.scheduler.update_portfolio_data",
     "core.scheduler.screen_stocks",
-    "core.scheduler.analyze_batch",
+    "core.scheduler.gate_signal",
+    "core.scheduler.get_earnings_date",
+    "core.scheduler.log_verdict",
+    "core.scheduler.notify_veto",
+    "core.scheduler.notify_warn",
+    "core.scheduler.notify_gate_halt",
     "core.scheduler.build_universe",
     "core.scheduler.get_tickers_for_market",
     "core.scheduler.update_status",
@@ -37,6 +48,47 @@ _PATCHES = [
     "core.scheduler.get_active_markets",
     "core.scheduler.get_pending_buy_reserve",
 ]
+
+
+def _ensure_event_loop():
+    """Return an open asyncio loop for this thread, recreating a closed one.
+
+    The scheduler's off-loop bridge uses ``asyncio.get_event_loop()``; the test
+    harness must hand it the SAME open loop that the pumping ``ib.sleep`` runs.
+    """
+    try:
+        loop = asyncio.get_event_loop_policy().get_event_loop()
+        if loop.is_closed():
+            raise RuntimeError
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    return loop
+
+
+def _make_ib():
+    """A mock IB whose ``.sleep`` PUMPS the event loop, mirroring real ib.sleep.
+
+    Real ``ib.sleep`` runs ``util.run(asyncio.sleep(...))`` which keeps the loop
+    live so ``run_in_executor`` futures resolve (fills/disconnects are serviced).
+    A plain ``MagicMock`` would no-op and the gate loop's ``while not fut.done():
+    ib.sleep(0.1)`` would spin forever. A pump budget converts any accidental
+    non-resolving future into a fast, clearly-labelled failure instead of a hang.
+    """
+    _ensure_event_loop()
+    ib = MagicMock()
+    state = {"pumps": 0}
+
+    def _sleep(_secs=0.0):
+        state["pumps"] += 1
+        if state["pumps"] > 4000:
+            raise RuntimeError(
+                "ib.sleep pump budget exceeded — off-loop gate future never resolved"
+            )
+        util.run(asyncio.sleep(0.005))
+
+    ib.sleep.side_effect = _sleep
+    return ib
 
 
 def _make_stock_data(tickers):
@@ -55,12 +107,12 @@ def _setup_mocks(
     sectors=None,
     is_exit_flags=None,
 ):
-    """Configure mocks for a standard pipeline run.
+    """Configure mocks for a standard INVERTED pipeline run.
 
-    The fake analyze_batch fires each signal via on_signal callback,
-    which is how the streaming pipeline processes them. The return
-    value is an empty list — risk checks must happen in the callback,
-    not a post-batch loop.
+    ``screen_stocks`` returns the candidate signals; the scheduler's risk loop
+    iterates them directly (no analyze_batch / on_signal callback anymore). The
+    gate runs LAST — by default it clears every entry (OK, live provider) so
+    risk-approved buys stand. Tests override ``gate_signal`` to veto/warn.
     """
     if risk_approved is None:
         risk_approved = [True] * len(signals)
@@ -87,16 +139,10 @@ def _setup_mocks(
     mocks["get_news"].return_value = []
     mocks["get_macro_news"].return_value = []
 
-    # analyze_batch fires signals via on_signal callback and returns
-    # an empty list. The streaming pipeline must rely on the callback
-    # for risk check + execution, not the return value.
-    def fake_analyze_batch(ai_input, on_signal=None, on_progress=None, macro_news=None):
-        for sig in signals:
-            if on_signal:
-                on_signal(sig)
-        return []
-
-    mocks["analyze_batch"].side_effect = fake_analyze_batch
+    # Gate defaults: clear every entry (OK from a live provider) so the buy
+    # stands; earnings unknown (D-05 abstain); verdict persistence is a no-op.
+    mocks["gate_signal"].return_value = GateResult(Verdict.OK, None, "", "gemini")
+    mocks["get_earnings_date"].return_value = None
 
     risk_results = []
     for approved, is_exit in zip(risk_approved, is_exit_flags):
@@ -125,7 +171,7 @@ def _run_cycle(mocks, account=None):
     """
     from core.scheduler import run_scan_cycle
 
-    ib = MagicMock()
+    ib = _make_ib()
     if account is None:
         account = {"NetLiquidation": 100_000, "TotalCashValue": 100_000}
 
@@ -152,20 +198,19 @@ class TestStreamingPipeline:
         for p in patchers.values():
             p.stop()
 
-    def test_analyze_batch_called_with_on_signal(self):
-        """analyze_batch must receive on_signal as a callable."""
+    def test_gate_invoked_for_risk_approved_entry(self):
+        """The LLM gate must run (LAST) on a risk-approved entry — analyze_batch
+        is gone; the gate replaces it as the only LLM call in the live path."""
         sig = _make_signal(ticker="TSLA")
-        _setup_mocks(self.m, [sig])
+        _setup_mocks(self.m, [sig], risk_approved=[True])
 
         _run_cycle(self.m)
 
-        self.m["analyze_batch"].assert_called_once()
-        kwargs = self.m["analyze_batch"].call_args[1]
-        assert "on_signal" in kwargs
-        assert callable(kwargs["on_signal"])
+        self.m["gate_signal"].assert_called_once()
 
-    def test_on_signal_triggers_risk_check(self):
-        """evaluate() must be called from the on_signal callback."""
+    def test_risk_runs_first_over_screener_candidates(self):
+        """evaluate() must be called directly over the screener candidates,
+        BEFORE (and independent of) the LLM gate."""
         sig = _make_signal(ticker="TSLA")
         _setup_mocks(self.m, [sig])
 
@@ -173,6 +218,58 @@ class TestStreamingPipeline:
 
         self.m["evaluate"].assert_called_once()
         assert self.m["evaluate"].call_args[0][0].ticker == "TSLA"
+
+    def test_gate_veto_removes_risk_approved_buy(self):
+        """A gate VETO must drop a risk-approved entry before execution (LLM-01)."""
+        sig = _make_signal(ticker="VETOED")
+        _setup_mocks(self.m, [sig], risk_approved=[True])
+        self.m["gate_signal"].return_value = GateResult(
+            Verdict.VETO, None, "confirmed earnings in hold window", "deterministic",
+        )
+
+        _run_cycle(self.m)
+
+        self.m["place_order"].assert_not_called()
+        self.m["notify_veto"].assert_called_once()
+
+    def test_gate_fail_closed_blocks_entry(self):
+        """provider=='none' (both providers exhausted) blocks the entry and
+        alerts — never a silent fail-open (D-02/D-07)."""
+        sig = _make_signal(ticker="NOGATE")
+        _setup_mocks(self.m, [sig], risk_approved=[True])
+        self.m["gate_signal"].return_value = GateResult(
+            Verdict.INSUFFICIENT_DATA, None, "gate unavailable — fail closed", "none",
+        )
+
+        _run_cycle(self.m)
+
+        self.m["place_order"].assert_not_called()
+        self.m["notify_gate_halt"].assert_called_once()
+
+    def test_gate_warn_lets_buy_stand(self):
+        """WARN is notify-only — the buy still stands (D-01)."""
+        sig = _make_signal(ticker="FLAGGED")
+        _setup_mocks(self.m, [sig], risk_approved=[True])
+        self.m["gate_signal"].return_value = GateResult(
+            Verdict.WARN, "some flagged headline", "flagged", "gemini",
+        )
+
+        _run_cycle(self.m)
+
+        self.m["place_order"].assert_called_once()
+        self.m["notify_warn"].assert_called_once()
+
+    def test_every_verdict_is_persisted(self):
+        """LLM-08: every gate verdict must be persisted via log_verdict."""
+        sig = _make_signal(ticker="LOGGED")
+        _setup_mocks(self.m, [sig], risk_approved=[True])
+
+        _run_cycle(self.m)
+
+        self.m["log_verdict"].assert_called_once()
+        kwargs = self.m["log_verdict"].call_args.kwargs
+        assert kwargs["ticker"] == "LOGGED"
+        assert kwargs["verdict"] == "OK"
 
     def test_risk_approved_signal_gets_order(self):
         sig = _make_signal(ticker="GOOG")
@@ -382,13 +479,14 @@ class TestStreamingPipeline:
         self.m["place_market_order"].assert_not_called()
 
 
-class TestNewsSkip:
-    """Candidates with zero headlines should be dropped before the LLM call.
+class TestNoNewsNotDropped:
+    """Post-inversion, a candidate lacking news must NOT be dropped before risk.
 
-    Rationale: Yahoo/yfinance doesn't index news for the micro-caps the
-    screener surfaces (SPAC units, tiny ETFs). When both Tavily and yfinance
-    return empty, the LLM has no external signal — burning 200+s per call
-    is wasted compute. Skip instead.
+    Dropping-on-no-news made sense when the AI was the ORIGINATOR (skip the
+    candidate the LLM couldn't reason about). Now the screener is the
+    originator and the LLM only vetoes — dropping a no-news candidate would
+    silently shrink the mechanical universe. "No news" routes to the gate as
+    INSUFFICIENT_DATA (buy stands, D-05 spirit), not a pre-risk drop.
     """
 
     @pytest.fixture(autouse=True)
@@ -401,48 +499,113 @@ class TestNewsSkip:
         for p in patchers.values():
             p.stop()
 
-    def test_candidate_with_empty_news_is_dropped_from_ai_input(self):
+    def test_no_news_candidate_still_reaches_risk_and_executes(self):
         sig = _make_signal(ticker="NONEWS")
-        _setup_mocks(self.m, [sig])
+        _setup_mocks(self.m, [sig], risk_approved=[True])
+        self.m["get_news"].return_value = []  # no headlines anywhere
+
+        _run_cycle(self.m)
+
+        # Not dropped: risk evaluated it and (gate OK) it was placed.
+        self.m["evaluate"].assert_called_once()
+        assert self.m["evaluate"].call_args[0][0].ticker == "NONEWS"
+        self.m["place_order"].assert_called_once()
+
+    def test_no_news_candidate_is_still_gated(self):
+        """The no-news candidate reaches the gate (which returns the empty
+        source_text) rather than being skipped before it."""
+        sig = _make_signal(ticker="NONEWS")
+        _setup_mocks(self.m, [sig], risk_approved=[True])
         self.m["get_news"].return_value = []
 
         _run_cycle(self.m)
 
-        self.m["analyze_batch"].assert_called_once()
-        ai_input = self.m["analyze_batch"].call_args[0][0]
-        assert ai_input == [], (
-            f"Expected empty ai_input when get_news returns [], got {ai_input}"
-        )
+        self.m["gate_signal"].assert_called_once()
 
-    def test_candidate_with_headlines_is_kept_in_ai_input(self):
-        sig = _make_signal(ticker="HASNEWS")
-        _setup_mocks(self.m, [sig])
-        self.m["get_news"].return_value = ["headline 1"]
-
-        _run_cycle(self.m)
-
-        self.m["analyze_batch"].assert_called_once()
-        ai_input = self.m["analyze_batch"].call_args[0][0]
-        assert len(ai_input) == 1
-        assert ai_input[0]["ticker"] == "HASNEWS"
-        assert ai_input[0]["news"] == ["headline 1"]
-
-    def test_mixed_news_drops_only_empty_candidates(self):
-        """With two candidates — one with news, one without — only the newsless is dropped."""
+    def test_mixed_news_keeps_both_candidates(self):
+        """Two candidates — one with news, one without — BOTH reach risk."""
         sig_news = _make_signal(ticker="HAS")
         sig_nonews = _make_signal(ticker="NONE")
-        _setup_mocks(self.m, [sig_news, sig_nonews])
+        _setup_mocks(
+            self.m, [sig_news, sig_nonews],
+            risk_approved=[True, True],
+            positions_sequence=[[], [], []],
+        )
 
-        # Return news for HAS, empty for NONE
         def news_by_ticker(ticker, market=None):
             return ["good headline"] if ticker == "HAS" else []
         self.m["get_news"].side_effect = news_by_ticker
 
         _run_cycle(self.m)
 
-        ai_input = self.m["analyze_batch"].call_args[0][0]
-        tickers_in_input = [item["ticker"] for item in ai_input]
-        assert tickers_in_input == ["HAS"]
+        evaluated = {c.args[0].ticker for c in self.m["evaluate"].call_args_list}
+        assert evaluated == {"HAS", "NONE"}
+
+
+class TestVetoOnlyInvariant:
+    """LLM-01 / ROADMAP crit 1 — the veto-only invariant.
+
+    Over a full scan cycle, the set of buys that reach execution
+    (``post_llm_buys``) must be a strict SUBSET of the risk-approved buys
+    (``pre_llm_buys``): the gate can only remove a buy, never originate one.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _patch_all(self):
+        patchers = {name.split(".")[-1]: patch(name) for name in _PATCHES}
+        self.m = {}
+        for key, p in patchers.items():
+            self.m[key] = p.start()
+        yield
+        for p in patchers.values():
+            p.stop()
+
+    def test_invariant_veto_yields_strict_subset_of_risk_approved(self):
+        sigs = [_make_signal(ticker=t) for t in ("AAA", "BBB", "CCC")]
+        _setup_mocks(
+            self.m, sigs,
+            risk_approved=[True, True, True],
+            positions_sequence=[[]] * 4,
+        )
+
+        # Gate vetoes exactly one ticker (BBB); clears the rest.
+        def fake_gate_signal(src, candidate, horizon, earnings_date=None):
+            if candidate["ticker"] == "BBB":
+                return GateResult(Verdict.VETO, None, "catalyst", "gemini")
+            return GateResult(Verdict.OK, None, "", "gemini")
+        self.m["gate_signal"].side_effect = fake_gate_signal
+
+        _run_cycle(self.m)
+
+        risk_approved = {"AAA", "BBB", "CCC"}  # every candidate risk-approved
+        executed = {c.args[1].ticker for c in self.m["place_order"].call_args_list}
+
+        assert executed <= risk_approved, "post_llm_buys must be a subset of pre_llm_buys"
+        assert "BBB" not in executed, "the VETO'd ticker must be removed"
+        assert executed == {"AAA", "CCC"}, "exactly the non-vetoed buys execute"
+        assert not (executed - risk_approved), "the gate must never add a ticker"
+
+    def test_invariant_gate_cannot_originate_a_noncandidate_buy(self):
+        """Even if the gate's output references a ghost ticker, it cannot inject
+        it — the gate output carries no buy and the loop only ever appends
+        signals drawn from pre_llm_buys."""
+        sigs = [_make_signal(ticker="AAA"), _make_signal(ticker="BBB")]
+        _setup_mocks(
+            self.m, sigs,
+            risk_approved=[True, True],
+            positions_sequence=[[]] * 3,
+        )
+
+        def fake_gate_signal(src, candidate, horizon, earnings_date=None):
+            # A "bullish" OK that name-drops a non-candidate ticker.
+            return GateResult(Verdict.OK, "GHOST is a strong buy", "", "gemini")
+        self.m["gate_signal"].side_effect = fake_gate_signal
+
+        _run_cycle(self.m)
+
+        executed = {c.args[1].ticker for c in self.m["place_order"].call_args_list}
+        assert "GHOST" not in executed, "the gate cannot originate a buy"
+        assert executed == {"AAA", "BBB"}
 
 
 # ---------------------------------------------------------------------------
@@ -873,7 +1036,7 @@ class TestPdtTradeWindow:
             return []
 
         from core.scheduler import run_scan_cycle
-        ib = MagicMock()
+        ib = _make_ib()
         with patch("core.scheduler._fetch_market_data") as mock_fetch, \
              patch("core.connection.get_account_summary", return_value={"NetLiquidation": 100_000}), \
              patch("core.scheduler.minutes_to_close", return_value=999), \
