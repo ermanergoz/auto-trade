@@ -111,6 +111,28 @@ _TABLES = [
         placed_at TEXT NOT NULL,
         confidence REAL
     )""",
+    # LLM-08: verdict-outcome log. Every gate verdict (VETO/WARN/OK/
+    # INSUFFICIENT_DATA) is persisted with its evidence + provenance so a
+    # later-realized outcome can be written back (feeds HRN-08 outcome
+    # analysis). Mirrors the `signals` table + `record_signal` pattern.
+    # quoted_evidence is the substring-verified snippet for LLM verdicts, or a
+    # synthesized string for the deterministic earnings veto; provider
+    # distinguishes the two ("deterministic" vs "gemini"/"ollama").
+    """CREATE TABLE IF NOT EXISTS gate_verdicts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        timestamp TEXT NOT NULL,
+        ticker TEXT NOT NULL,
+        verdict TEXT NOT NULL,
+        quoted_evidence TEXT,
+        reason TEXT DEFAULT '',
+        provider TEXT NOT NULL,
+        horizon_days INTEGER,
+        earnings_date TEXT,
+        source_text_hash TEXT,
+        realized_outcome TEXT,
+        outcome_recorded_at TEXT,
+        created_at TEXT DEFAULT (datetime('now'))
+    )""",
     # UNIQUE index enforces one-open-row-per-ticker at the DB level so that
     # concurrent inserts (fill handler thread vs scheduler) cannot both create
     # duplicate rows through the SELECT-then-INSERT check in add_position.
@@ -118,9 +140,14 @@ _TABLES = [
     "CREATE INDEX IF NOT EXISTS idx_trades_ticker ON trades(ticker)",
     "CREATE INDEX IF NOT EXISTS idx_trades_exit_time ON trades(exit_time)",
     "CREATE INDEX IF NOT EXISTS idx_signals_timestamp ON signals(timestamp)",
+    "CREATE INDEX IF NOT EXISTS idx_gate_verdicts_ticker ON gate_verdicts(ticker)",
+    "CREATE INDEX IF NOT EXISTS idx_gate_verdicts_timestamp ON gate_verdicts(timestamp)",
 ]
 
-_REQUIRED_TABLES = {"positions", "trades", "daily_summary", "signals", "pending_orders"}
+_REQUIRED_TABLES = {
+    "positions", "trades", "daily_summary", "signals", "pending_orders",
+    "gate_verdicts",
+}
 
 
 def init_db(db_path: Path = DB_PATH) -> None:
@@ -570,6 +597,77 @@ def record_signal(signal: Signal, db_path: Path = DB_PATH) -> int:
             ),
         )
         return cursor.lastrowid
+
+
+# ---------------------------------------------------------------------------
+# Gate verdicts (LLM-08 verdict-outcome log)
+# ---------------------------------------------------------------------------
+
+def log_verdict(
+    *,
+    ticker: str,
+    verdict: str,
+    quoted_evidence: Optional[str],
+    reason: str,
+    provider: str,
+    horizon_days: Optional[int],
+    earnings_date: Optional[str],
+    source_text_hash: Optional[str],
+    timestamp: str,
+    db_path: Path = DB_PATH,
+) -> int:
+    """Persist a single gate verdict for audit + later outcome analysis.
+
+    Accepts primitive fields (NOT a GateResult) so this writer stays decoupled
+    from core/gate.py and parallelizable with the gate build. Returns the row id.
+    Never logs provider key material; source_text_hash is a stdlib sha256 for
+    dedupe only, not a security control (T-3-05).
+    """
+    with _db_connection(db_path) as conn:
+        cursor = conn.execute(
+            """INSERT INTO gate_verdicts
+               (timestamp, ticker, verdict, quoted_evidence, reason, provider,
+                horizon_days, earnings_date, source_text_hash)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                timestamp, ticker, verdict, quoted_evidence, reason, provider,
+                horizon_days, earnings_date, source_text_hash,
+            ),
+        )
+        return cursor.lastrowid
+
+
+def update_verdict_outcome(
+    verdict_id: int, realized_outcome: str, db_path: Path = DB_PATH
+) -> None:
+    """Write back the later-realized outcome for a persisted verdict (HRN-08).
+
+    Sets realized_outcome and stamps outcome_recorded_at to now.
+    """
+    with _db_connection(db_path) as conn:
+        conn.execute(
+            """UPDATE gate_verdicts
+               SET realized_outcome = ?, outcome_recorded_at = datetime('now')
+               WHERE id = ?""",
+            (realized_outcome, verdict_id),
+        )
+
+
+def get_gate_verdicts(
+    ticker: Optional[str] = None, db_path: Path = DB_PATH
+) -> list[dict]:
+    """Read persisted gate verdicts, optionally filtered to a single ticker."""
+    with _db_connection(db_path) as conn:
+        if ticker is None:
+            rows = conn.execute(
+                "SELECT * FROM gate_verdicts ORDER BY id"
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM gate_verdicts WHERE ticker = ? ORDER BY id",
+                (ticker,),
+            ).fetchall()
+    return [dict(row) for row in rows]
 
 
 # ---------------------------------------------------------------------------
