@@ -17,11 +17,17 @@ from config.settings import (
     BACKTEST_SPREAD_BPS,
     DEFAULT_STOP_LOSS_PCT, DEFAULT_TAKE_PROFIT_PCT,
     MAX_EXTENSION_OVER_MA20_PCT,
+    MAX_SWING_HOLD_DAYS,
 )
 from core.models import Signal, Position, Trade, Action, TradeType
 from core.screener import screen_stocks, dow_trend, DowTrend
 from core.risk import evaluate, RiskResult, calculate_realized_volatility
 from core.data import get_historical_data_yfinance
+# The SAME pure veto gate the live scheduler calls (ROADMAP crit 4 / LLM-05).
+# Imported at module level (not function-local) so live==backtest share ONE
+# gate object — `backtest.engine.gate_signal is core.gate.gate_signal` — and no
+# second LLM prompting/parsing code path can exist in the backtest.
+from core.gate import gate_signal, Verdict
 from backtest.holdout import assert_range_excludes_holdout
 
 logger = logging.getLogger(__name__)
@@ -668,6 +674,34 @@ def run_backtest(config: BacktestConfig) -> SimulatedPortfolio:
             )
             if not result.approved:
                 continue
+
+            # use_ai wiring: call the SAME core.gate.gate_signal the live
+            # scheduler uses (ROADMAP crit 4 / LLM-05) — ONE shared gate, no
+            # second LLM prompting/parsing path in the backtest. The gate can
+            # only REMOVE a mechanical buy (VETO -> continue); it can never add
+            # one (structurally buy-incapable, Plan 01). Called directly, with no
+            # off-loop run_in_executor bridge — the backtest has no ib_insync
+            # event loop to protect. use_ai=False leaves this loop byte-for-byte
+            # unchanged (no gate call).
+            #
+            # Point-in-time safety: the gate's deterministic earnings portion is
+            # point-in-time-safe (pure date arithmetic on entry_date + horizon).
+            # The news portion is NOT point-in-time-safe on free historical data;
+            # its look-ahead labeling is Phase 4's concern — Phase 3 only makes
+            # the call site identical. The backtest has no historical news /
+            # earnings feed today, so source_text="" and earnings_date=None (the
+            # gate abstains -> INSUFFICIENT_DATA -> buy stands) until Phase 4
+            # wires a labeled historical source.
+            if config.use_ai:
+                gate = gate_signal(
+                    "",  # no point-in-time-safe historical news feed yet (Phase 4)
+                    signal.__dict__,
+                    MAX_SWING_HOLD_DAYS,
+                    earnings_date=None,  # no historical earnings feed yet (Phase 4)
+                    entry_date=current_date,
+                )
+                if gate.verdict is Verdict.VETO:
+                    continue
 
             portfolio.open_position(signal, result.position_size, fill_price, current_dt)
 

@@ -12,7 +12,7 @@ from core.models import (
 from core.portfolio import (
     init_db, add_position, close_position, get_open_positions,
     get_trades, get_daily_pnl, record_signal, record_daily_summary,
-    get_daily_summary,
+    get_daily_summary, log_verdict, update_verdict_outcome, get_gate_verdicts,
 )
 
 
@@ -690,3 +690,75 @@ class TestPendingOrdersMigration:
         path = tmp_path / "fresh.db"
         init_db(path)
         init_db(path)  # would raise 'duplicate column name: confidence' without the PRAGMA guard
+
+
+class TestGateVerdicts:
+    """LLM-08 verdict-outcome logging: gate_verdicts table + writers + read helper."""
+
+    def test_gate_verdicts_table_created_by_init_db(self, db_path):
+        """A fresh init_db must create the gate_verdicts table and register it."""
+        from core.portfolio import _REQUIRED_TABLES, _db_connection
+        assert "gate_verdicts" in _REQUIRED_TABLES
+        with _db_connection(db_path) as conn:
+            row = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='gate_verdicts'"
+            ).fetchone()
+        assert row is not None, "gate_verdicts table should exist after init_db"
+
+    def test_gate_verdict_round_trip(self, db_path):
+        """log_verdict returns a row id; get_gate_verdicts reads it back."""
+        row_id = log_verdict(
+            ticker="AAPL",
+            verdict="VETO",
+            quoted_evidence="earnings 2026-07-15 within 10d hold",
+            reason="confirmed earnings in hold window",
+            provider="deterministic",
+            horizon_days=10,
+            earnings_date="2026-07-15",
+            source_text_hash=None,
+            timestamp="2026-07-01T10:00:00",
+            db_path=db_path,
+        )
+        assert isinstance(row_id, int) and row_id >= 1
+
+        rows = get_gate_verdicts("AAPL", db_path=db_path)
+        assert len(rows) == 1
+        row = rows[0]
+        assert row["ticker"] == "AAPL"
+        assert row["verdict"] == "VETO"
+        assert row["quoted_evidence"] == "earnings 2026-07-15 within 10d hold"
+        assert row["reason"] == "confirmed earnings in hold window"
+        assert row["provider"] == "deterministic"
+        assert row["horizon_days"] == 10
+        assert row["earnings_date"] == "2026-07-15"
+        assert row["realized_outcome"] is None
+
+    def test_get_gate_verdicts_ticker_filter(self, db_path):
+        """The optional ticker filter narrows results; None returns all."""
+        log_verdict(
+            ticker="AAPL", verdict="OK", quoted_evidence=None, reason="",
+            provider="gemini", horizon_days=None, earnings_date=None,
+            source_text_hash=None, timestamp="2026-07-01T10:00:00", db_path=db_path,
+        )
+        log_verdict(
+            ticker="MSFT", verdict="WARN", quoted_evidence="lawsuit filed",
+            reason="litigation flag", provider="gemini", horizon_days=5,
+            earnings_date=None, source_text_hash="abc123",
+            timestamp="2026-07-01T10:05:00", db_path=db_path,
+        )
+        assert len(get_gate_verdicts(db_path=db_path)) == 2
+        msft = get_gate_verdicts("MSFT", db_path=db_path)
+        assert len(msft) == 1 and msft[0]["verdict"] == "WARN"
+
+    def test_update_verdict_outcome_writes_back(self, db_path):
+        """update_verdict_outcome sets realized_outcome + non-null outcome_recorded_at."""
+        row_id = log_verdict(
+            ticker="NVDA", verdict="VETO", quoted_evidence="e", reason="r",
+            provider="deterministic", horizon_days=10, earnings_date="2026-07-20",
+            source_text_hash=None, timestamp="2026-07-01T10:00:00", db_path=db_path,
+        )
+        update_verdict_outcome(row_id, "gapped_down_12pct", db_path=db_path)
+
+        row = get_gate_verdicts("NVDA", db_path=db_path)[0]
+        assert row["realized_outcome"] == "gapped_down_12pct"
+        assert row["outcome_recorded_at"] is not None

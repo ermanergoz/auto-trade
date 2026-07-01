@@ -191,6 +191,16 @@ CLOSE_DAY_TRADES_BEFORE_MARKET_CLOSE = True
 CLOSE_MINUTES_BEFORE = 15
 
 # ---------------------------------------------------------------------------
+# Swing Hold Horizon (LLM veto gate — D-06)
+# ---------------------------------------------------------------------------
+# Maximum expected swing-trade hold horizon, in TRADING days. Used by the LLM
+# veto gate (core.gate.gate_signal) as the fallback earnings-blackout window:
+# a CONFIRMED earnings date landing within the per-trade hold horizon vetoes a
+# fresh entry (a swing position must not ride a binary earnings gap). Grounded in
+# a ~2-week swing hold; ATR-scaled per-trade horizons are a future refinement.
+MAX_SWING_HOLD_DAYS = 10
+
+# ---------------------------------------------------------------------------
 # Screening Thresholds
 # ---------------------------------------------------------------------------
 RSI_OVERSOLD = 30
@@ -317,6 +327,9 @@ def validate_settings() -> list[str]:
 
     if DEFAULT_TAKE_PROFIT_PCT <= 0:
         errors.append(f"DEFAULT_TAKE_PROFIT_PCT must be positive, got {DEFAULT_TAKE_PROFIT_PCT}")
+
+    if MAX_SWING_HOLD_DAYS <= 0:
+        errors.append(f"MAX_SWING_HOLD_DAYS must be positive, got {MAX_SWING_HOLD_DAYS}")
 
     if CIRCUIT_BREAKER_LOSSES < 0:
         errors.append(f"CIRCUIT_BREAKER_LOSSES must be non-negative, got {CIRCUIT_BREAKER_LOSSES}")

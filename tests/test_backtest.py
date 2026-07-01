@@ -2336,3 +2336,112 @@ class TestMarketRegimeGate:
         assert _market_regime_allows_long(
             pd.Series([], dtype=float), date(2021, 6, 1)
         ) is True
+
+
+class TestUseAiGateReuse:
+    """LLM-05 / ROADMAP crit 4: the backtester's `use_ai` flag calls the SAME
+    `core.gate.gate_signal` the live scheduler uses — one shared gate, no second
+    LLM prompting/parsing path. A VETO removes a buy under use_ai=True; the same
+    buy stands under use_ai=False (the gate is not consulted). Fully offline: the
+    real gate is monkeypatched with a fake, so no provider key is required."""
+
+    VETO_TICKER = "VETOD"
+    OK_TICKER = "OKAY"
+
+    @staticmethod
+    def _make_ohlc():
+        """~80 business days of flat synthetic OHLC (screener is patched, so the
+        indicator content is irrelevant — only bar 'open' prices are consumed)."""
+        dates = pd.bdate_range(end="2024-06-28", periods=80)
+        return pd.DataFrame(
+            {
+                "open": 100.0, "high": 101.0, "low": 99.0,
+                "close": 100.0, "volume": 1_000_000.0,
+            },
+            index=dates,
+        )
+
+    def _run(self, monkeypatch, *, use_ai):
+        from unittest.mock import patch
+        import backtest.engine as engine
+        from backtest.engine import run_backtest
+        from core.gate import Verdict, GateResult
+        from core.risk import RiskResult
+
+        # Synthetic (non-holdout-dated) data → unlock the holdout preflight for
+        # this mechanics-only test (scoped to this run via monkeypatch).
+        monkeypatch.setenv("BORSA_HOLDOUT_UNLOCKED", "1")
+
+        df = self._make_ohlc()
+
+        def _fake_yf(ticker, *args, **kwargs):
+            if ticker in (self.VETO_TICKER, self.OK_TICKER):
+                return df.copy()
+            return pd.DataFrame()  # empty benchmark → regime gate fails open
+
+        # Screener yields both candidates every bar; risk always approves 1 share.
+        # This isolates the evaluate→gate→open_position seam under test.
+        def _fake_screen(*args, **kwargs):
+            return [
+                _make_signal(ticker=self.VETO_TICKER, action=Action.BUY,
+                             entry_price=100.0, source="screener"),
+                _make_signal(ticker=self.OK_TICKER, action=Action.BUY,
+                             entry_price=100.0, source="screener"),
+            ]
+
+        def _fake_evaluate(*args, **kwargs):
+            return RiskResult(approved=True, reasons=[], position_size=1)
+
+        # The fake gate: VETO the chosen ticker, OK otherwise. Monkeypatched onto
+        # backtest.engine.gate_signal (the module-level import the seam calls).
+        calls = []
+
+        def _fake_gate(source_text, candidate, horizon_days, **kwargs):
+            calls.append(candidate.get("ticker"))
+            if candidate.get("ticker") == self.VETO_TICKER:
+                return GateResult(Verdict.VETO, None, "fake veto", "deterministic")
+            return GateResult(Verdict.OK, None, "fake ok", "deterministic")
+
+        monkeypatch.setattr(engine, "screen_stocks", _fake_screen)
+        monkeypatch.setattr(engine, "evaluate", _fake_evaluate)
+        monkeypatch.setattr(engine, "gate_signal", _fake_gate)
+
+        config = BacktestConfig(
+            tickers=[self.VETO_TICKER, self.OK_TICKER],
+            use_ai=use_ai,
+            end_date="2024-06-28",
+        )
+        with patch("backtest.engine.get_historical_data_yfinance", side_effect=_fake_yf):
+            portfolio = run_backtest(config)
+        return portfolio, calls
+
+    def test_use_ai_gate_veto_removes_the_buy(self, monkeypatch):
+        """use_ai=True: the VETO'd ticker never opens a position; OK tickers do."""
+        portfolio, calls = self._run(monkeypatch, use_ai=True)
+
+        traded = {t.ticker for t in portfolio.trades}
+        assert self.VETO_TICKER not in traded, (
+            "gate VETO must remove the buy — VETO'd ticker opened a position"
+        )
+        assert self.OK_TICKER in traded, "OK ticker should still open a position"
+        # The gate was actually consulted for the VETO'd candidate.
+        assert self.VETO_TICKER in calls
+
+    def test_use_ai_gate_off_leaves_the_buy_standing(self, monkeypatch):
+        """use_ai=False: the gate is NOT consulted, so the same buy stands —
+        proving the flag (not some other filter) gates the behavior."""
+        portfolio, calls = self._run(monkeypatch, use_ai=False)
+
+        traded = {t.ticker for t in portfolio.trades}
+        assert self.VETO_TICKER in traded, (
+            "use_ai=False must not consult the gate — the buy should stand"
+        )
+        assert calls == [], "gate_signal must never be called when use_ai=False"
+
+    def test_use_ai_gate_is_the_same_core_gate_object(self):
+        """Identity guard (T-3-11): the backtest imports the SAME gate_signal as
+        core.gate — structurally impossible to have a second LLM code path."""
+        import backtest.engine as engine
+        import core.gate
+
+        assert engine.gate_signal is core.gate.gate_signal

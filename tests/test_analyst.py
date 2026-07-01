@@ -428,8 +428,8 @@ class TestOllamaTimeout:
     """Verify Ollama timeout is reasonable (not 600s)."""
 
     @patch("core.analyst.urllib.request.urlopen")
-    def test_timeout_is_1800s(self, mock_urlopen):
-        """Ollama timeout must be 1800s to allow slow local models to complete."""
+    def test_timeout_is_2400s(self, mock_urlopen):
+        """Ollama timeout must be the 2400s (40-min) D-04 budget for slow local models."""
         mock_response = MagicMock()
         mock_response.read.return_value = json.dumps({
             "response": '{"action": "hold", "confidence": 50}',
@@ -443,8 +443,8 @@ class TestOllamaTimeout:
         _call_ollama("test prompt")
 
         _, kwargs = mock_urlopen.call_args
-        assert kwargs.get("timeout") == 1800, (
-            f"Ollama timeout should be 1800s, got {kwargs.get('timeout')}"
+        assert kwargs.get("timeout") == 2400, (
+            f"Ollama timeout should be 2400s, got {kwargs.get('timeout')}"
         )
 
 

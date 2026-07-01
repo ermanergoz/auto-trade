@@ -4,7 +4,7 @@ import logging
 import threading
 import time
 import xml.etree.ElementTree as ET
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import Callable, Optional
 
 import pandas as pd
@@ -563,6 +563,131 @@ def get_analyst_recommendation(ticker: str) -> dict | None:
     except Exception as e:
         logger.warning("Failed to fetch analyst recommendation for %s: %s", ticker, e)
         return None
+
+
+# ---------------------------------------------------------------------------
+# Earnings date (yfinance) — LLM-04 infra for the deterministic earnings veto
+# ---------------------------------------------------------------------------
+
+_EARNINGS_TTL = 86400  # 24 hours — the next scheduled report changes infrequently
+# Sentinel cached in place of a real date so a resolved "no date" is remembered
+# for the TTL window (a bare None would be indistinguishable from a cache miss).
+_EARNINGS_NONE_SENTINEL = "__no_earnings_date__"
+
+
+def _normalize_to_date(value: object) -> Optional[date]:
+    """Coerce a yfinance date-ish value to a plain ``datetime.date`` or None.
+
+    Handles ``date``, ``datetime``/``pandas.Timestamp`` (Timestamp subclasses
+    datetime), and UNIX-timestamp int/float variants (yfinance issue #2559).
+    Returns None for anything unparseable — never raises.
+    """
+    if value is None:
+        return None
+    # pandas Timestamp and datetime both satisfy isinstance(datetime); a plain
+    # date does not, so check the datetime branch first.
+    if isinstance(value, datetime):
+        try:
+            return value.date()
+        except Exception:
+            return None
+    if isinstance(value, date):
+        return value
+    if isinstance(value, bool):  # bool is an int subclass — reject explicitly
+        return None
+    if isinstance(value, (int, float)):
+        try:
+            return datetime.fromtimestamp(value, tz=timezone.utc).date()
+        except (OverflowError, OSError, ValueError):
+            return None
+    return None
+
+
+def _earliest_future_date(values, today: date) -> Optional[date]:
+    """Return the earliest normalized date >= today from an iterable, or None."""
+    future = []
+    for raw in values:
+        d = _normalize_to_date(raw)
+        if d is not None and d >= today:
+            future.append(d)
+    return min(future) if future else None
+
+
+def _extract_earnings_from_df(earnings_df, today: date) -> Optional[date]:
+    """Pull the next future earnings date from a get_earnings_dates() DataFrame."""
+    if earnings_df is None or getattr(earnings_df, "empty", True):
+        return None
+    return _earliest_future_date(list(earnings_df.index), today)
+
+
+def _extract_earnings_from_calendar(calendar, today: date) -> Optional[date]:
+    """Pull the next future earnings date from a Ticker.calendar payload.
+
+    Newer yfinance returns a dict ({"Earnings Date": [date, ...]}); older
+    returns a DataFrame indexed by field name. Both are handled defensively.
+    """
+    if not calendar:
+        return None
+    try:
+        if isinstance(calendar, dict):
+            dates = calendar.get("Earnings Date")
+        else:  # DataFrame form: fields on the index, dates across a row
+            index = getattr(calendar, "index", [])
+            if "Earnings Date" not in index:
+                return None
+            dates = list(calendar.loc["Earnings Date"])
+        if dates is None:
+            return None
+        if not isinstance(dates, (list, tuple)):
+            dates = [dates]
+        return _earliest_future_date(dates, today)
+    except Exception:
+        return None
+
+
+def get_earnings_date(ticker: str, market: str = "US") -> Optional[date]:
+    """Fetch the next upcoming earnings date via yfinance — fail-safe.
+
+    Returns a ``datetime.date`` when a confirmed *future* report date is found,
+    otherwise ``None``. yfinance earnings data is documented-unreliable (missing
+    future dates, ``KeyError: 'Earnings Date'``, UNIX-timestamp drift), so any
+    missing column, empty result, historical-only data, or parse failure yields
+    ``None`` — this is intentional per D-05 (unknown date → mechanical buy
+    STANDS; do NOT fail-conservative), not a bug to fix. Never raises.
+
+    Fetched UPSTREAM (here) and the resulting ``date | None`` is passed into the
+    pure ``gate_signal`` — the gate never fetches (pure-function contract).
+    """
+    cache_key = f"earnings:{ticker}:{market}"
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return None if cached == _EARNINGS_NONE_SENTINEL else cached
+
+    today = datetime.now(timezone.utc).date()
+    result: Optional[date] = None
+    try:
+        tkr = yf.Ticker(_to_yfinance_ticker(ticker))
+        result = _extract_earnings_from_df(tkr.get_earnings_dates(), today)
+        if result is None:
+            result = _extract_earnings_from_calendar(
+                getattr(tkr, "calendar", None), today
+            )
+    except Exception as e:
+        # KeyError('Earnings Date'), network, parse — all resolve to None (D-05).
+        logger.debug("Earnings date for %s unavailable (%s) -> None", ticker, e)
+        result = None
+
+    if result is None:
+        logger.debug(
+            "No usable future earnings date for %s -> None (buy stands, D-05)",
+            ticker,
+        )
+        _cache_set(cache_key, _EARNINGS_NONE_SENTINEL, ttl=_EARNINGS_TTL)
+        return None
+
+    logger.info("Earnings date for %s: %s", ticker, result.isoformat())
+    _cache_set(cache_key, result, ttl=_EARNINGS_TTL)
+    return result
 
 
 # ---------------------------------------------------------------------------
