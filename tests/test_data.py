@@ -1,5 +1,7 @@
 """Tests for core/data.py (unit tests that don't require IBKR)."""
 
+from datetime import date, datetime, timedelta
+
 import pandas as pd
 import pytest
 from unittest.mock import patch, MagicMock
@@ -9,6 +11,7 @@ from core.data import (
     get_news,
     get_macro_news,
     get_analyst_recommendation,
+    get_earnings_date,
     clear_cache,
     _cache_set,
     _cache_get,
@@ -1238,3 +1241,96 @@ class TestRoundTripDetectAndAdjust:
         assert all(abs(p) < 0.2 for p in daily_pct), (
             f"Adjusted series still has large gaps: {daily_pct}"
         )
+
+
+class TestEarningsDate:
+    """get_earnings_date() — TTL-cached, fail-safe upstream fetch (LLM-04/D-05)."""
+
+    @patch("yfinance.Ticker")
+    def test_returns_future_date_from_earnings_dates(self, mock_ticker):
+        """A valid future date in get_earnings_dates() yields a datetime.date."""
+        future = date.today() + timedelta(days=14)
+        df = pd.DataFrame(
+            {"EPS Estimate": [None]},
+            index=pd.DatetimeIndex([pd.Timestamp(future)]),
+        )
+        mock_ticker.return_value.get_earnings_dates.return_value = df
+        mock_ticker.return_value.calendar = {}
+
+        result = get_earnings_date("AAPL")
+        assert result == future
+        assert isinstance(result, date) and not isinstance(result, datetime)
+
+    @patch("yfinance.Ticker")
+    def test_returns_earliest_future_ignoring_history(self, mock_ticker):
+        """Historical dates are skipped; the earliest future date is returned."""
+        past = date.today() - timedelta(days=90)
+        soon = date.today() + timedelta(days=7)
+        later = date.today() + timedelta(days=120)
+        df = pd.DataFrame(
+            {"EPS Estimate": [None, None, None]},
+            index=pd.DatetimeIndex(
+                [pd.Timestamp(later), pd.Timestamp(past), pd.Timestamp(soon)]
+            ),
+        )
+        mock_ticker.return_value.get_earnings_dates.return_value = df
+        mock_ticker.return_value.calendar = {}
+
+        assert get_earnings_date("MSFT") == soon
+
+    @patch("yfinance.Ticker")
+    def test_returns_none_on_key_error(self, mock_ticker):
+        """KeyError('Earnings Date') from yfinance -> None (no exception)."""
+        mock_ticker.return_value.get_earnings_dates.side_effect = KeyError(
+            "Earnings Date"
+        )
+        assert get_earnings_date("FAIL") is None
+
+    @patch("yfinance.Ticker")
+    def test_returns_none_on_empty(self, mock_ticker):
+        """Empty DataFrame + empty calendar -> None."""
+        mock_ticker.return_value.get_earnings_dates.return_value = pd.DataFrame()
+        mock_ticker.return_value.calendar = {}
+        assert get_earnings_date("EMPTY") is None
+
+    @patch("yfinance.Ticker")
+    def test_returns_none_on_history_only(self, mock_ticker):
+        """Only historical dates -> None (the date we need is absent)."""
+        past1 = date.today() - timedelta(days=30)
+        past2 = date.today() - timedelta(days=120)
+        df = pd.DataFrame(
+            {"EPS Estimate": [None, None]},
+            index=pd.DatetimeIndex([pd.Timestamp(past1), pd.Timestamp(past2)]),
+        )
+        mock_ticker.return_value.get_earnings_dates.return_value = df
+        mock_ticker.return_value.calendar = {}
+        assert get_earnings_date("OLD") is None
+
+    @patch("yfinance.Ticker")
+    def test_falls_back_to_calendar_dict(self, mock_ticker):
+        """When get_earnings_dates yields nothing, the calendar dict is used."""
+        future = date.today() + timedelta(days=21)
+        mock_ticker.return_value.get_earnings_dates.return_value = pd.DataFrame()
+        mock_ticker.return_value.calendar = {"Earnings Date": [future]}
+        assert get_earnings_date("CAL") == future
+
+    @patch("yfinance.Ticker")
+    def test_never_raises_on_constructor_error(self, mock_ticker):
+        """Any exception (e.g. network in Ticker) -> None, never propagates."""
+        mock_ticker.side_effect = Exception("network down")
+        assert get_earnings_date("BOOM") is None
+
+    @patch("yfinance.Ticker")
+    def test_result_is_cached(self, mock_ticker):
+        """A resolved date is TTL-cached; upstream is hit only once."""
+        future = date.today() + timedelta(days=10)
+        df = pd.DataFrame(
+            {"EPS Estimate": [None]},
+            index=pd.DatetimeIndex([pd.Timestamp(future)]),
+        )
+        mock_ticker.return_value.get_earnings_dates.return_value = df
+        mock_ticker.return_value.calendar = {}
+
+        get_earnings_date("CACHED")
+        get_earnings_date("CACHED")
+        assert mock_ticker.call_count == 1
