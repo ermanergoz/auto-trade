@@ -96,7 +96,7 @@ def place_order(
         if parent_order.permId:
             save_pending_order(
                 parent_order.permId, signal.ticker,
-                confidence=signal.confidence,
+                confidence=signal.confidence, db_path=DB_PATH,
             )
         else:
             logger.warning(
@@ -125,7 +125,7 @@ def place_order(
             except Exception as cancel_err:
                 logger.error("Failed to cancel orphaned order: %s", cancel_err)
         if parent_order.permId:
-            remove_pending_order(parent_order.permId)
+            remove_pending_order(parent_order.permId, db_path=DB_PATH)
         return None
 
 
@@ -192,7 +192,7 @@ def cancel_order(ib: IB, trade: IBTrade) -> None:
         ib.cancelOrder(trade.order)
         logger.info("Cancelled order %s for %s", trade.order.orderId, trade.contract.symbol)
         if trade.order.permId:
-            remove_pending_order(trade.order.permId)
+            remove_pending_order(trade.order.permId, db_path=DB_PATH)
     except Exception as e:
         logger.error("Failed to cancel order: %s", e)
 
@@ -218,7 +218,7 @@ def get_stale_orders(ib: IB, stale_minutes: int = 1440) -> list[dict]:
         submitted_at = None
         ticker = trade.contract.symbol
         if order.permId:
-            db_time = get_pending_order_time(order.permId)
+            db_time = get_pending_order_time(order.permId, db_path=DB_PATH)
             if db_time:
                 submitted_at = db_time if db_time.tzinfo else db_time.replace(tzinfo=timezone.utc)
                 logger.debug("Order %s (%s): using DB timestamp %s", order.permId, ticker, submitted_at)
@@ -347,7 +347,7 @@ def cancel_bracket_order(ib: IB, trade: IBTrade) -> bool:
         ib.cancelOrder(trade.order)
         logger.info("Cancelled stale bracket order %s for %s", order_id, ticker)
         if trade.order.permId:
-            remove_pending_order(trade.order.permId)
+            remove_pending_order(trade.order.permId, db_path=DB_PATH)
         return True
     except Exception as e:
         logger.error("Failed to cancel stale order %s for %s: %s", order_id, ticker, e)
@@ -534,7 +534,7 @@ def setup_fill_handler(
             )
         handle_fill(signal, filled_qty, fill_price)
         if trade.order.permId:
-            remove_pending_order(trade.order.permId)
+            remove_pending_order(trade.order.permId, db_path=DB_PATH)
         if on_fill:
             on_fill(signal, filled_qty, fill_price)
 
