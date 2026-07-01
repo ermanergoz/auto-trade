@@ -608,6 +608,61 @@ class TestVetoOnlyInvariant:
         assert executed == {"AAA", "BBB"}
 
 
+class TestLoopLiveness:
+    """LLM-05 / ROADMAP crit 4 — the off-loop bridge keeps the event loop live.
+
+    A loop callback (standing in for a fill/disconnect) must be serviced WHILE
+    a blocking gate call is in flight, because the gate runs in a worker thread
+    (run_in_executor) while ib.sleep(0.1) pumps the loop. The Phase-4 paper
+    clock may start only after this is green.
+    """
+
+    def test_loop_liveness_callback_fires_during_inflight_gate(self):
+        loop = _ensure_event_loop()
+        flag = {"fired": False}
+
+        def blocking_gate(*args, **kwargs):
+            time.sleep(1.0)  # blocks the WORKER thread ~1s
+            return GateResult(Verdict.OK, None, "", "gemini")
+
+        ib = _make_ib()
+        # Schedule a loop callback BEFORE entering the pump loop.
+        loop.call_later(0.2, lambda: flag.__setitem__("fired", True))
+
+        fut = loop.run_in_executor(None, blocking_gate, "src", {}, 10)
+        fired_while_inflight = None
+        while not fut.done():
+            ib.sleep(0.1)  # the SAME bridge run_scan_cycle uses
+            if flag["fired"] and fired_while_inflight is None:
+                fired_while_inflight = not fut.done()
+        fut.result()
+
+        assert flag["fired"] is True
+        assert fired_while_inflight is True, (
+            "the loop callback must fire WHILE the ~1s gate is still in flight — "
+            "proving fills/disconnects are serviced off-loop"
+        )
+
+    def test_loop_liveness_negative_control_mainthread_block_freezes_loop(self):
+        """Negative control: blocking the MAIN thread (time.sleep) instead of
+        the executor bridge freezes the loop — the callback does NOT fire until
+        the loop is pumped. Proves the positive test actually discriminates."""
+        loop = _ensure_event_loop()
+        flag = {"fired": False}
+        loop.call_later(0.2, lambda: flag.__setitem__("fired", True))
+
+        time.sleep(1.0)  # blocks the MAIN thread — the loop cannot advance
+        fired_during_block = flag["fired"]
+
+        util.run(asyncio.sleep(0.3))  # now pump — the overdue callback fires
+
+        assert fired_during_block is False, (
+            "a main-thread time.sleep must FREEZE the loop (no callback) — this "
+            "is exactly what the off-loop bridge avoids"
+        )
+        assert flag["fired"] is True, "after pumping, the overdue callback fires"
+
+
 # ---------------------------------------------------------------------------
 # Feature 3: Nightly reconciliation
 # ---------------------------------------------------------------------------
