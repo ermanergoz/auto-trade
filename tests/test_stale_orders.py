@@ -108,7 +108,7 @@ class TestGetStaleOrders:
 
         # Patch to use our test DB path for the actual lookup
         with patch("core.executor.get_pending_order_time",
-                    side_effect=lambda pid: get_pending_order_time(pid, db_path)):
+                    side_effect=lambda pid, **kwargs: get_pending_order_time(pid, db_path)):
             stale = get_stale_orders(ib, stale_minutes=1440)
 
         assert len(stale) == 1
@@ -193,7 +193,8 @@ class TestCancelCleansDB:
         with patch("core.executor.remove_pending_order") as mock_remove:
             cancel_bracket_order(ib, mock_trade)
 
-        mock_remove.assert_called_once_with(333)
+        assert mock_remove.call_count == 1
+        assert mock_remove.call_args.args[0] == 333
         ib.cancelOrder.assert_called_once_with(mock_trade.order)
 
     def test_cancel_failure_does_not_remove_db_record(self):
@@ -220,7 +221,8 @@ class TestCancelCleansDB:
         with patch("core.executor.remove_pending_order") as mock_remove:
             cancel_order(ib, mock_trade)
 
-        mock_remove.assert_called_once_with(444)
+        assert mock_remove.call_count == 1
+        assert mock_remove.call_args.args[0] == 444
 
 
 class TestFillCleansDB:
@@ -269,4 +271,5 @@ class TestFillCleansDB:
              patch("core.executor.remove_pending_order") as mock_remove:
             on_order_status(filled_trade)
 
-        mock_remove.assert_called_once_with(555)
+        assert mock_remove.call_count == 1
+        assert mock_remove.call_args.args[0] == 555

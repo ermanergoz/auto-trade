@@ -351,10 +351,11 @@ class TestNotifyRiskResults:
 class TestStatusRefreshesBeforeResponse:
     """When user asks for /status, data must be refreshed from DB first."""
 
+    @patch("core.portfolio.get_trades", return_value=[])
     @patch("notifications.telegram.refresh_positions_cache")
     @patch("notifications.telegram._send_sync")
     @patch("notifications.telegram._get_updates_sync")
-    def test_status_command_triggers_refresh(self, mock_updates, mock_send, mock_refresh):
+    def test_status_command_triggers_refresh(self, mock_updates, mock_send, mock_refresh, mock_trades):
         """Receiving 'status' must call refresh_positions_cache before responding."""
         from notifications.telegram import _poll_loop, _stop_event, _system_status
 

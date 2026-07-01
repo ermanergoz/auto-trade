@@ -322,7 +322,7 @@ class TestReattachExitHandlers:
 class TestCloseAllDayTrades:
     """close_all_day_trades must cancel bracket orders and close DB positions."""
 
-    def test_cancels_bracket_orders_for_day_trades(self):
+    def test_cancels_bracket_orders_for_day_trades(self, db_path):
         """After closing via market order, bracket TP/SL orders must be cancelled."""
         from core.executor import close_all_day_trades
 
@@ -344,7 +344,9 @@ class TestCloseAllDayTrades:
         mock_trade.orderStatus.avgFillPrice = 155.0
         mock_trade.order.orderId = 999
 
-        with patch("core.executor.place_market_order", return_value=mock_trade):
+        with patch("core.executor.place_market_order", return_value=mock_trade), \
+             patch("core.executor.db_close_position"), \
+             patch("core.executor.DB_PATH", db_path):
             close_all_day_trades(ib, [pos], dry_run=False)
 
         # TP/SL children should have been cancelled (not just unfilled parents)
@@ -626,7 +628,8 @@ class TestSetupFillHandlerRace:
         parent_trade.orderStatus.avgFillPrice = 150.5
         parent_trade.orderStatus.filled = 10
 
-        with patch("core.executor.handle_fill") as mock_handle:
+        with patch("core.executor.handle_fill") as mock_handle, \
+             patch("core.executor.DB_PATH", db_path):
             setup_fill_handler(
                 ib, sig, quantity=10,
                 parent_order=parent_order,
@@ -700,7 +703,8 @@ class TestSetupFillHandlerRace:
         parent_trade.orderStatus.avgFillPrice = 150.5
         parent_trade.orderStatus.filled = 10
 
-        with patch("core.executor.handle_fill") as mock_handle:
+        with patch("core.executor.handle_fill") as mock_handle, \
+             patch("core.executor.DB_PATH", db_path):
             setup_fill_handler(
                 ib, sig, quantity=10,
                 parent_order=parent_order,
